@@ -20,7 +20,7 @@ Same affinity, same aversion (`BULL_TREND`), same rotator variants of each other
 
 `short_research.py` already tested the **inverse of the best long rule** (`short_rally_downtrend`: `Close < SMA200` and RSI &gt; 60) and the short specialists’ docstrings quote that table. **No agent fires it.**
 
-**Claim:** a fade-rally-below-200 short that is **PROMOTED** when **VolatilityAgent** or **MoversAgent** is **BENCHED** (those keys have **no variants today** — B’s clean on-ramps). Second on **TechnicalAgent** after A. **Does not** list OptionsFlowAgent — A owns that parent as the long-regime replacement. Not a third always-on PROTECTED clone. Silent in bull. Improver cannot apply this. Friday learn does not retune it.
+**Claim:** a fade-rally-below-200 short that is **PROMOTED** when **VolatilityAgent** or **MoversAgent** is **BENCHED**, **if** those lists are empty or B-first. Ops PR #3 may fill them with MeanReversion / Momentum / Breakout — then B must be listed **FIRST** on those parents (ahead of those names) or fall back to Technical’s second slot. Second on **TechnicalAgent** after A. **Does not** list OptionsFlowAgent — A owns that parent as the long-regime replacement. Not a third always-on PROTECTED clone. Silent in bull. Improver cannot apply this. Friday learn does not retune it.
 
 If SPEC-A is also in the roster, A is long-only while live; **this name owns fade-rally shorts**.
 
@@ -61,14 +61,26 @@ PROTECTED shorts (**BearishPatternAgent**, **ShortMomentumAgent**) are **never B
 
 **PROMOTED in** when rotator **BENCHED** a listed parent. `_find_replacement` takes the **first inactive** variant only — B must not share a first slot with A.
 
+**Prefer Volatility / Movers** if Ops leaves those keys empty **or** lists B first.
+
 | Bleeder **BENCHED** | Ordered `AGENT_VARIANTS` | Role |
 |---|---|---|
-| VolatilityAgent | **ShortMeanReversionAgent (B)** — **new key** (empty today) | **B clean on-ramp** |
-| MoversAgent | **ShortMeanReversionAgent (B)** — **new key** (empty today) | **B clean on-ramp** |
-| TechnicalAgent | RegimeEquityAgent **(A) first**, **then ShortMeanReversionAgent (B)**, then Momentum / Breakout | B only if A is already active or A is not in the roster |
+| VolatilityAgent | **Prefer:** `[ShortMeanReversionAgent]` (empty key or B-only). **If Ops PR #3 keeps MeanReversion:** `[ShortMeanReversionAgent, MeanReversionAgent]` — **B first** | Preferred B on-ramp |
+| MoversAgent | **Prefer:** `[ShortMeanReversionAgent]`. **If Ops PR #3 keeps Momentum / Breakout:** `[ShortMeanReversionAgent, MomentumAgent, BreakoutAgent]` — **B first** | Preferred B on-ramp |
+| TechnicalAgent | RegimeEquityAgent **(A) first**, **then ShortMeanReversionAgent (B)**, then Momentum / Breakout | Unchanged. B if A is already active or A is not in the roster |
 | OptionsFlowAgent | **Not B.** A owns this parent | Do **not** put B on this list |
 
 Do **not** list PROTECTED shorts (BearishPattern / ShortMomentum) as B’s promote parents — they are never **BENCHED**.
+
+**Contingency (Ops PR #3 occupancy):** that branch already has `VolatilityAgent → MeanReversionAgent` and `MoversAgent → MomentumAgent, BreakoutAgent`. MeanReversion is a **long** dip sleeve; Momentum / Breakout are continuation longs. If they remain **first** and are missing or inactive, they are **PROMOTED** instead of B. Learning Loop requires **B-first** so the short on-ramp does not depend on those longs staying active.
+
+Options if Ops keeps those names on the lists:
+
+1. **B-first (required if these stay B’s parents).** Same two keys; B ahead of MeanReversion / Momentum / Breakout. This is the intended contingency.
+2. **Drop Vol/Movers as B parents** and use **Technical second slot only** (A then B). B then waits until Technical is **BENCHED** and A is already live.
+3. **Not allowed:** OptionsFlow (A only); Breakout / SectorRotation first slots (A); PROTECTED shorts; Intermarket → Macro.
+
+B **second** behind MeanReversion / Momentum / Breakout is **not** sufficient.
 
 After **REACTIVATED** of that bleeder (3d), B may still be active beside the returned parent. That is **expected**, not a reject. “Replace bleeders” lasts 3 days unless **FLAG** fires again. PROTECTED shorts stay on; MetaAgent may downweight them if 20d P&amp;L is bad.
 
@@ -100,7 +112,7 @@ Do **not** add options-manager rules here.
 - `regime_aversion = ["BULL_TREND"]`
 - `MIN_CONFIDENCE = 0.55`
 - Not PROTECTED.
-- `DEFAULT_WEIGHTS` key; `AGENT_VARIANTS` as in the PROMOTED table. **Do not** put B on OptionsFlow. **Do not** put B first on Technical if A ships. **Do not** put Technical first on B’s own variant list.
+- `DEFAULT_WEIGHTS` key; `AGENT_VARIANTS` as in the PROMOTED table. **Do not** put B on OptionsFlow. **Do not** put B first on Technical if A ships. **Do not** put Technical first on B’s own variant list. If Ops fills Volatility / Movers, **B must be first** on those lists (ahead of MeanReversion / Momentum / Breakout) or B uses Technical-second only.
 - **Do not** emit `direction: long`.
 - **Do not** implement new put spreads while Ops D is paused.
 
@@ -148,6 +160,7 @@ Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 - No new options until Ops D is lifted.
 - Do not assume Friday learner retunes B.
 - Do not list OptionsFlowAgent as a B parent.
+- Prefer Volatility / Movers as B parents only if empty or B-first; do not sit second behind MeanReversion / Momentum / Breakout.
 - Do not change `SOLO_SHORT_CONFIDENCE` except via existing auto_tune.
 
 ---

@@ -50,9 +50,9 @@ Pipeline every RTH tick (`market_scheduler.py` → `ensemble.run_cycle`):
 | PremarketAgent | L/S | Gap-and-go / fade | **Silent after 9:45 ET**; gap ±1.5% | variant SectorRotation; Ops: ghost/bad opens | Affinity BULL/BEAR/HIGH_VOL/BREAKOUT/NEUTRAL |
 | SectorRotationAgent | L leaders, S laggards | 11 sector ETFs vs SPY 1m/3m | Ops: rotation-guide bleeder | variant Premarket | Affinity BULL/BEAR/NEUTRAL — **not HIGH_VOL** |
 | OptionsFlowAgent | L/S | yfinance P/C, IV rank, skew **proxy** | chronic bleeder; paper **calls in book** | variants News/Sentiment | Affinity BULL/BEAR/HIGH_VOL/NEUTRAL |
-| VolatilityAgent | L/S | BB/RSI extreme **if decelerating** | — | **not in AGENT_VARIANTS** | **None** |
-| IntermarketAgent | **Long only** | Intraday WTI/gold/copper/10Y → names | longs only by design | **not in AGENT_VARIANTS** | Affinity BULL/BEAR/HIGH_VOL/NEUTRAL |
-| MoversAgent | L gainers, S losers | Yahoo day_gainers/losers, ≥5% | $5 / 500k vol | **not in AGENT_VARIANTS** | Affinity BULL/BEAR/HIGH_VOL |
+| VolatilityAgent | L/S | BB/RSI extreme **if decelerating** | — | **not in AGENT_VARIANTS** on this HOLD branch; Ops PR #3 may add MeanReversion | **None** |
+| IntermarketAgent | **Long only** | Intraday WTI/gold/copper/10Y → names | longs only by design | **not in AGENT_VARIANTS** on this HOLD branch; Ops PR #3 may add Macro | Affinity BULL/BEAR/HIGH_VOL/NEUTRAL |
+| MoversAgent | L gainers, S losers | Yahoo day_gainers/losers, ≥5% | $5 / 500k vol | **not in AGENT_VARIANTS** on this HOLD branch; Ops PR #3 may add Momentum/Breakout | Affinity BULL/BEAR/HIGH_VOL |
 | MeanReversionAgent | **Long** | Dip **above SMA200** (BB / RSI / pullback) | max 3/tick; RSI floor 20 | **In agents list only** — missing `DEFAULT_WEIGHTS` and `AGENT_VARIANTS` | Affinity BULL/NEUTRAL/HIGH_VOL |
 
 ### 1.2 Not roster agents
@@ -91,14 +91,14 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 | # | Gap | Why this repo, not generic finance | Spec |
 |---|---|---|---|
 | **A** | Regime-aware **equity** L/S **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is **BENCHED** | Technical has **no** regime tags and is a named bleeder; OptionsFlow is a proxy bleeder with paper calls (**A owns this parent**; B does not share it). Breakout / SectorRotation sit on bleeder↔bleeder `AGENT_VARIANTS`. MeanReversion is half-wired. Book ~−18% vs SPY | [SPEC-A](SPEC-A-regime-equity.md) |
-| **B** | Short/downside **PROMOTED** from **VolatilityAgent / MoversAgent** (no variants today); **second** on Technical after A; **not** on OptionsFlow; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). `_find_replacement` promotes only the first inactive variant — A and B cannot both claim first slot | [SPEC-B](SPEC-B-bear-shorts.md) |
+| **B** | Short/downside **PROMOTED** from **VolatilityAgent / MoversAgent** if empty or **B-first**; **second** on Technical after A; **not** on OptionsFlow; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). Ops PR #3 may map Vol → MeanReversion and Movers → Momentum/Breakout — B must be first on those lists or fall back to Technical-second. `_find_replacement` promotes only the first inactive variant | [SPEC-B](SPEC-B-bear-shorts.md) |
 | **C** | Premarket **strict** PROMOTED when Premarket is BENCHED; News quality in-place (PROTECTED → FLAG cannot BENCH) | Ghosts: Technical + News + Premarket. News keyword RSS; Premarket ±1.5% gaps. Catalyst boost rewards News+Premarket together | [SPEC-C](SPEC-C-news-premarket-quality.md) |
 
 **Paused (Ops D):** any new options product. Existing XLE/SBUX/F calls are exits/scorecard. Future options variants would use FLAG/BENCHED/PROMOTED — not specified here.
 
 **Forbidden (Ops E):** crypto edges; wiring CryptoAgent into the equity ensemble.
 
-**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First inactive variant only — A owns OptionsFlow; Technical is A then B; B’s clean on-ramps are Volatility + Movers. Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First inactive variant only — A owns OptionsFlow; Technical is A then B; B prefers Volatility + Movers **empty or B-first** (Ops PR #3 contingency: MeanReversion / Momentum / Breakout occupy those keys unless B is listed first). Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
@@ -107,7 +107,7 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS`. New sleeves: both, start `active: false`.
 2. `get_agent_adjustment()` has no callers. Specs must not depend on Friday conf deltas.
 3. `performance_logger.ENSEMBLE_AGENTS` still five names — evaluator is ledger-backed.
-4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. Volatility / Movers have **no** keys. A and B **must not** both claim first slot: Technical → A then B; OptionsFlow → **A only**; B’s clean on-ramps = Volatility + Movers. Map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. Volatility / Movers have **no** keys **on this HOLD branch**. Ops PR #3 may add `VolatilityAgent → MeanReversionAgent` and `MoversAgent → Momentum/Breakout`. A and B **must not** both claim first slot: Technical → A then B; OptionsFlow → **A only**; B prefers Volatility + Movers **empty or B-first** (else B-first ahead of those Ops names, or Technical-second only). Map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 5. `BENCH_DAYS = 3` then **REACTIVATED**. “Replace bleeders” is a **3-day window** unless **FLAG** fires again. Expected rotator behavior, not a reject. No permanent-off event.
 6. Improver writes `analysis/recommendations_*.md` only. Not a promotion path.
 

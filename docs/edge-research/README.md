@@ -8,7 +8,7 @@ This folder holds **research and specs**, not live trading code.
 
 **Ops lock (2026-09-11):** inventory and gap order below are authoritative. Do not add crypto edges. Do not add new options ideas until equity exits + scorecard are green.
 
-**Learning Loop lock:** A/B/C are **cold** sleeves **PROMOTED** only when a bleeder is **BENCHED**. Rotator words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. One first-slot owner per parent (A owns OptionsFlow; B’s clean on-ramps are Volatility and Movers; Technical is A then B). 3-day **REACTIVATED** is expected. Improver cannot auto-apply. Friday learn does not retune until `get_agent_adjustment` is wired. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop lock:** A/B/C are **cold** sleeves **PROMOTED** only when a bleeder is **BENCHED**. Rotator words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. One first-slot owner per parent (A owns OptionsFlow; Technical is A then B). B prefers Volatility / Movers **if empty or B-first**; Ops PR #3 may occupy those with MeanReversion / Momentum / Breakout — then B must be listed first or use Technical-second only. 3-day **REACTIVATED** is expected. Improver cannot auto-apply. Friday learn does not retune until `get_agent_adjustment` is wired. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ## Contents
 
@@ -17,7 +17,7 @@ This folder holds **research and specs**, not live trading code.
 | [SURVEY.md](SURVEY.md) | — | Confirmed roster vs `ensemble.py`, measurement loop, Ops book notes |
 | [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md) | — | FLAG → BENCHED → PROMOTED / REACTIVATED; exclusive A/B `AGENT_VARIANTS` parents |
 | [SPEC-A-regime-equity.md](SPEC-A-regime-equity.md) | **A** | Regime-aware equity L/S **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is BENCHED (A first on Technical; sole new name on OptionsFlow) |
-| [SPEC-B-bear-shorts.md](SPEC-B-bear-shorts.md) | **B** | Fade-rally short, **BEAR/HIGH_VOL only**; **PROMOTED** from Volatility / Movers (clean); second on Technical after A; not on OptionsFlow |
+| [SPEC-B-bear-shorts.md](SPEC-B-bear-shorts.md) | **B** | Fade-rally short, **BEAR/HIGH_VOL only**; prefers Volatility / Movers **B-first**; second on Technical after A; not on OptionsFlow |
 | [SPEC-C-news-premarket-quality.md](SPEC-C-news-premarket-quality.md) | **C** | Premarket strict **PROMOTED** when Premarket is BENCHED; News in-place (PROTECTED) |
 
 ## Explicitly out of scope

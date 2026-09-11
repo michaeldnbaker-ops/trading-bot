@@ -85,28 +85,52 @@ Win rate is not a FLAG input for these specs (4% stop cap → low WR can still h
 
 ## Proposed `AGENT_VARIANTS` ownership (A and B must not collide)
 
-Today’s map still points bleeders at other bleeders. VolatilityAgent and MoversAgent have **no** `AGENT_VARIANTS` keys — `_find_replacement` returns `None`. An implementation PR (not this HOLD) must write **one** ordered list per parent. A and B **must not** both claim first slot on the same parent.
+This HOLD branch’s `agent_rotator.py` still has **empty** Volatility / Movers keys (`_find_replacement` → `None`). Ops **PR #3** (`cursor/learn-rotate-daily-email-4aed`) **may** (and on that branch already does) occupy them:
 
-**Locked proposal:**
+```
+"VolatilityAgent": ["MeanReversionAgent"],
+"MoversAgent":     ["MomentumAgent", "BreakoutAgent"],
+```
+
+Those names are **already-active longs / continuation**, not Spec B. If they sit **first** and are missing or `active: false`, they are **PROMOTED** instead of B. Learning Loop still requires **B-first** on those parents so the short on-ramp does not depend on MeanReversion / Momentum / Breakout remaining active. An implementation PR (not this HOLD) must write **one** ordered list per parent. A and B **must not** both claim first slot on the same parent.
+
+**Locked proposal (unchanged single-owners):**
 
 | Parent **BENCHED** | Ordered variants (first inactive is **PROMOTED**) | Owner |
 |---|---|---|
-| `TechnicalAgent` | **`RegimeEquityAgent` (A), then `ShortMeanReversionAgent` (B)**, then existing Momentum / Breakout | A first, B second |
+| `TechnicalAgent` | **`RegimeEquityAgent` (A), then `ShortMeanReversionAgent` (B)**, then existing Momentum / Breakout | A first, B second. **Do not reorder.** |
 | `OptionsFlowAgent` | **`RegimeEquityAgent` (A) only** as the new name, then existing News / Sentiment | **A.** B does **not** share OptionsFlow |
 | `BreakoutAgent` | **`RegimeEquityAgent` (A)**, then existing Momentum / Technical | A |
 | `SectorRotationAgent` | **`RegimeEquityAgent` (A)**, then existing Premarket | A |
-| `VolatilityAgent` | **`ShortMeanReversionAgent` (B)** — **new key** (none today) | **B clean on-ramp** |
-| `MoversAgent` | **`ShortMeanReversionAgent` (B)** — **new key** (none today) | **B clean on-ramp** |
 | `PremarketAgent` | **`PremarketAgent_strict` (C)** | C (SPEC-C) |
+
+**B on-ramps — prefer Volatility / Movers, with a PR #3 contingency:**
+
+| Parent **BENCHED** | Prefer (empty **or** B-first) | If Ops keeps MeanReversion / Momentum / Breakout |
+|---|---|---|
+| `VolatilityAgent` | `["ShortMeanReversionAgent"]` only, or B **first** | **Required:** `["ShortMeanReversionAgent", "MeanReversionAgent"]` — B **ahead of** MeanReversion |
+| `MoversAgent` | `["ShortMeanReversionAgent"]` only, or B **first** | **Required:** `["ShortMeanReversionAgent", "MomentumAgent", "BreakoutAgent"]` — B **ahead of** Momentum / Breakout |
+
+**Prefer** those two parents if Ops leaves the keys empty **or** lists B first. MeanReversion is a **long** dip-above-200 sleeve; promoting it when Volatility is **BENCHED** does not fill the fade-rally **short** hole.
+
+### Contingency if Ops will not put B first on Vol / Movers
+
+Pick **one** (still no OptionsFlow; still Technical = A then B):
+
+1. **Same parents, reorder (preferred contingency).** B first on Volatility / Movers, Ops names second. Rotator then **PROMOTED** B while B is cold (`active: false`), even if MeanReversion / Momentum / Breakout stay on the list.
+2. **Technical second slot only.** B promotes only when Technical is **BENCHED** *and* A is already `active: true` (or A is not in the roster). Slow on-ramp; no Vol/Movers path.
+3. **Do not** take OptionsFlow (A), Breakout/SectorRotation first slots (A), or PROTECTED shorts (never **BENCHED**). Intermarket → Macro (PR #3) is longs-only — not a B parent.
+
+Listing B **second** behind MeanReversion / Momentum / Breakout is **not** a valid on-ramp: those siblings are typically already active, and if any of them is inactive/missing they win the first slot instead of B.
 
 Why this split:
 
 - Rotator **cannot** promote two cold sleeves from one **BENCHED** parent in the same cycle.
 - OptionsFlow is the long-regime / proxy-flow bleeder → **A** replaces that equity decision. B is a fade-rally short; it does **not** list OptionsFlow.
 - Technical is L/S with no regime tags → **A first**. If A is already `active: true` when Technical is **BENCHED** again, the first inactive is **B**.
-- Volatility and Movers have empty variant lists today and already short without SMA200 / as same-day continuation → **B’s** on-ramps that do not fight A.
+- Volatility and Movers already short without SMA200 / as same-day continuation → **B’s preferred** on-ramps that do not fight A, **if** B is first (or the key is still empty).
 
-If A is not in the roster at all, B may sit first on Technical. If both ship, the order above is required.
+If A is not in the roster at all, B may sit first on Technical. If both ship, Technical order above is required.
 
 **REACTIVATED (expected, not a reject):** `BENCH_DAYS = 3` then the bleeder is **REACTIVATED**. A/B/C staying live beside a returned bleeder is correct. “Replace bleeders” lasts those 3 days unless the bleeder **FLAG**s again.
 

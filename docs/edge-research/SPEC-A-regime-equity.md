@@ -61,7 +61,7 @@ Shared lifecycle and exclusive parent map: [ROTATION-CONTRACT.md](ROTATION-CONTR
 | BreakoutAgent | **RegimeEquityAgent (A)**, then Momentum / Technical |
 | SectorRotationAgent | **RegimeEquityAgent (A)**, then Premarket |
 
-Do **not** list Technical or OptionsFlow as substitutes *of* RegimeEquityAgent (v1.4 resurrection). PROTECTED agents are never BENCHED to make room for A. Do **not** take VolatilityAgent or MoversAgent — those are **B’s** clean on-ramps.
+Do **not** list Technical or OptionsFlow as substitutes *of* RegimeEquityAgent (v1.4 resurrection). PROTECTED agents are never BENCHED to make room for A. Do **not** take VolatilityAgent or MoversAgent first slots — those remain **B’s preferred** on-ramps (B-first if Ops PR #3 fills them with MeanReversion / Momentum / Breakout).
 
 After `BENCH_DAYS` the bleeder is **REACTIVATED**. A may stay active; both can run. That 3-day “replace” is **expected rotator behavior**, not a failed replacement. Permanent off requires another **FLAG** (then **BENCHED** again). If Technical **FLAG**s again while A is already active, the first inactive variant is **B**.
 
@@ -144,7 +144,7 @@ Do not treat “ensemble got quieter” as success vs SPY.
 - No live client. No crypto. No new options. **No strategy code in this PR.**
 - Do not raise `DAILY_TRADE_CAP`.
 - Do not list Technical as A’s first variant (REACTIVATED resurrection).
-- Do not take VolatilityAgent / MoversAgent first slots (B’s on-ramps).
+- Do not take VolatilityAgent / MoversAgent first slots (B’s preferred on-ramps; B-first if Ops fills them).
 - Do not assume Friday learner retunes A.
 
 ---
