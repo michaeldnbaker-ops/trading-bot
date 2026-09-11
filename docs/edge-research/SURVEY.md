@@ -91,20 +91,20 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 | # | Gap | Why this repo, not generic finance | Spec |
 |---|---|---|---|
 | **A** | Regime-aware **equity** L/S **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is **BENCHED** | Technical has **no** regime tags and is a named bleeder; OptionsFlow is a proxy bleeder with paper calls (**A owns this parent**; B does not share it). Breakout / SectorRotation sit on bleeder↔bleeder `AGENT_VARIANTS`. MeanReversion is half-wired. Book ~−18% vs SPY | [SPEC-A](SPEC-A-regime-equity.md) |
-| **B** | Short/downside **PROMOTED** from **VolatilityAgent / MoversAgent** (empty slots reserved; do not reassign); **second** on Technical after A; **not** on OptionsFlow; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). `_find_replacement` promotes only the first inactive variant — A and B cannot both claim first slot | [SPEC-B](SPEC-B-bear-shorts.md) |
+| **B** | Short/downside **PROMOTED** from **VolatilityAgent / MoversAgent** (empty slots reserved; do not reassign); **second** on Technical after A; **not** on OptionsFlow; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). `_find_replacement` (Ops PR #3) promotes only the first seeded `active: false` variant — missing-from-summary is not a promote | [SPEC-B](SPEC-B-bear-shorts.md) |
 | **C** | Premarket **strict** PROMOTED when Premarket is BENCHED; News quality in-place (PROTECTED → FLAG cannot BENCH) | Ghosts: Technical + News + Premarket. News keyword RSS; Premarket ±1.5% gaps. Catalyst boost rewards News+Premarket together | [SPEC-C](SPEC-C-news-premarket-quality.md) |
 
 **Paused (Ops D):** any new options product. Existing XLE/SBUX/F calls are exits/scorecard. Future options variants would use FLAG/BENCHED/PROMOTED — not specified here.
 
 **Forbidden (Ops E):** crypto edges; wiring CryptoAgent into the equity ensemble.
 
-**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First inactive variant only — A owns OptionsFlow; Technical is A then B; B on-ramps = Volatility + Movers (empty reserved; Ops PR #3 will not steal them). Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First seeded `{ "active": false }` variant only — missing-from-summary is **not** a promote (Ops PR #3). A owns OptionsFlow; Technical is A then B; B on-ramps = Volatility + Movers (empty reserved; Ops PR #3 will not steal them). Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
 ## 4. Plumbing holes (do not spec a second control plane)
 
-1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS`. New sleeves: both, start `active: false`.
+1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS`. New sleeves: both, **seed** `agent_summary.json` `{ "active": false }`. Ops PR #3: absent from summary ≠ **PROMOTED**.
 2. `get_agent_adjustment()` has no callers. Specs must not depend on Friday conf deltas.
 3. `performance_logger.ENSEMBLE_AGENTS` still five names — evaluator is ledger-backed.
 4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. Volatility / Movers have **no** keys — **reserved for Spec B**. Ops PR #3 leaves them empty. A and B **must not** both claim first slot: Technical → A then B; OptionsFlow → **A only**; B on-ramps = Volatility + Movers. Do not reassign B’s parents. Map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
@@ -121,4 +121,4 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 - Do not touch `crypto_scheduler.py` / `CryptoAgent` except to keep them **out** of the equity bot.
 - Vs SPY: `report_data` 20d `edge`. Qualitative FLAG/promote rules in SPEC-A/B/C; **numeric kill TODOs** pending scorecard.
 - Vs existing agents: overlap vs the **BENCHED** sibling.
-- New names ship `active: false`. This PR is **docs only**.
+- New names **must be seeded** in `agent_summary.json` `{ "active": false }` or they never **PROMOTE** (Ops PR #3). This PR is **docs only**.

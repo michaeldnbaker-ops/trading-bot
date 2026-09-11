@@ -55,11 +55,11 @@ Paper “put” language: if Ops later lifts D, a put **variant** would use the 
 
 ## MetaAgent / rotator — FLAG / BENCHED / PROMOTED / REACTIVATED
 
-**Default: cold.** `active: false`. No day-one shorts beside the two PROTECTED continuation agents.
+**Default: cold.** **Must seed** `agent_summary.json` `{ "active": false }`. Missing-from-summary is **not** a promote (Ops PR #3). No day-one shorts beside the two PROTECTED continuation agents.
 
 PROTECTED shorts (**BearishPatternAgent**, **ShortMomentumAgent**) are **never BENCHED**. FLAG on them → rotator log “reducing weight instead of benching.” Listing B only as their variant would **never PROMOTE** B.
 
-**PROMOTED in** when rotator **BENCHED** a listed parent. `_find_replacement` takes the **first inactive** variant only — B must not share a first slot with A. **Do not reassign B’s parent list.**
+**PROMOTED in** when rotator **BENCHED** a listed parent. `_find_replacement` takes the **first seeded `active: false`** variant only — B must not share a first slot with A. **Do not reassign B’s parent list.** Unseeded B never **PROMOTE**s.
 
 | Bleeder **BENCHED** | Ordered `AGENT_VARIANTS` | Role |
 |---|---|---|
@@ -151,6 +151,7 @@ Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 - Do not assume Friday learner retunes B.
 - Do not list OptionsFlowAgent as a B parent.
 - Do not reassign B’s parents off Volatility / Movers.
+- Must seed `agent_summary.json` `{ "active": false }` (Ops PR #3: missing-from-summary never **PROMOTE**s).
 - Do not change `SOLO_SHORT_CONFIDENCE` except via existing auto_tune.
 
 ---

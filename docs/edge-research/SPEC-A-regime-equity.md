@@ -50,11 +50,11 @@ Shared lifecycle and exclusive parent map: [ROTATION-CONTRACT.md](ROTATION-CONTR
 
 ## MetaAgent / rotator — FLAG / BENCHED / PROMOTED / REACTIVATED
 
-**Default: cold.** `RegimeEquityAgent` is in `Ensemble.agents` and `DEFAULT_WEIGHTS` but `agent_summary.json` ships `{ "active": false }`. Ensemble skips it until **PROMOTED**.
+**Default: cold.** `RegimeEquityAgent` is in `Ensemble.agents` and `DEFAULT_WEIGHTS`. **Must seed** `agent_summary.json` `{ "active": false }`. Missing-from-summary is **not** a promote (Ops PR #3 `_find_replacement`). Ensemble skips it until **PROMOTED**.
 
-**PROMOTED in** — only `agent_rotator`, same cycle as **BENCHED** on a non-PROTECTED bleeder. `_find_replacement` **PROMOTED** only the **first inactive** name in the parent’s list. A and B must not both sit first on the same parent (see contract ownership table).
+**PROMOTED in** — only `agent_rotator`, same cycle as **BENCHED** on a non-PROTECTED bleeder. `_find_replacement` **PROMOTED** only the **first seeded `active: false`** name in the parent’s list. A and B must not both sit first on the same parent (see contract ownership table).
 
-| Bleeder **BENCHED** (after evaluator **FLAG**) | Ordered `AGENT_VARIANTS` (first inactive is **PROMOTED**) |
+| Bleeder **BENCHED** (after evaluator **FLAG**) | Ordered `AGENT_VARIANTS` (first seeded `active: false` is **PROMOTED**) |
 |---|---|
 | TechnicalAgent | **RegimeEquityAgent (A), then ShortMeanReversionAgent (B)**, then Momentum / Breakout |
 | OptionsFlowAgent | **RegimeEquityAgent (A) only** as the new sleeve, then News / Sentiment. **B is not on this list.** |
@@ -63,7 +63,7 @@ Shared lifecycle and exclusive parent map: [ROTATION-CONTRACT.md](ROTATION-CONTR
 
 Do **not** list Technical or OptionsFlow as substitutes *of* RegimeEquityAgent (v1.4 resurrection). PROTECTED agents are never BENCHED to make room for A. Do **not** take VolatilityAgent or MoversAgent — those are **B’s** reserved empty on-ramps.
 
-After `BENCH_DAYS` the bleeder is **REACTIVATED**. A may stay active; both can run. That 3-day “replace” is **expected rotator behavior**, not a failed replacement. Permanent off requires another **FLAG** (then **BENCHED** again). If Technical **FLAG**s again while A is already active, the first inactive variant is **B**.
+After `BENCH_DAYS` the bleeder is **REACTIVATED**. A may stay active; both can run. That 3-day “replace” is **expected rotator behavior**, not a failed replacement. Permanent off requires another **FLAG** (then **BENCHED** again). If Technical **FLAG**s again while A is already `active: true`, the first seeded `active: false` variant is **B** (B must already be in `agent_summary.json`).
 
 **Regime while live (MetaAgent, every tick):**
 
@@ -102,7 +102,7 @@ No new options exit rules. No share fallback from a failed option (this agent ne
 - Dedup one position/symbol.
 - Bridge: equity sizing (`RISK_PER_TRADE_PCT` 0.5%), not the options contract sizer.
 - **Not PROTECTED.**
-- `DEFAULT_WEIGHTS` key for attribution. `AGENT_VARIANTS` as in the PROMOTED table (A first on Technical and sole new name on OptionsFlow).
+- `DEFAULT_WEIGHTS` key for attribution. `AGENT_VARIANTS` as in the PROMOTED table (A first on Technical and sole new name on OptionsFlow). **Seed** `agent_summary.json` `{ "active": false }`.
 
 ---
 
@@ -146,6 +146,7 @@ Do not treat “ensemble got quieter” as success vs SPY.
 - Do not list Technical as A’s first variant (REACTIVATED resurrection).
 - Do not take VolatilityAgent / MoversAgent (B’s reserved on-ramps).
 - Do not assume Friday learner retunes A.
+- Must seed `agent_summary.json` `{ "active": false }` (Ops PR #3: missing-from-summary never **PROMOTE**s).
 
 ---
 

@@ -22,7 +22,8 @@
 |---|---|
 | **Roster name** | `PremarketAgent_strict` |
 | **`AGENT_VARIANTS` parent** | `"PremarketAgent": ["PremarketAgent_strict"]` |
-| **Promote-in** | When `PremarketAgent` is **BENCHED** |
+| **Seed** | `agent_summary.json` `{ "active": false }` — required. Missing-from-summary is **not** a promote (Ops PR #3) |
+| **Promote-in** | When `PremarketAgent` is **BENCHED** and this name is already seeded `active: false` |
 | **After 3 days** | Parent **REACTIVATED**. Both may run. Expected 3-day window, not a permanent replace. |
 | **`PROTECTED_AGENTS`** | **No** |
 
@@ -99,7 +100,7 @@ Still **PROTECTED**. Still **FLAG**-able. Still **cannot** be BENCHED.
 ```
 FLAG PremarketAgent (evaluator)
   → BENCHED 3 days
-  → PROMOTED PremarketAgent_strict (first inactive AGENT_VARIANTS child)
+  → PROMOTED PremarketAgent_strict (first seeded active: false AGENT_VARIANTS child; must already be in agent_summary.json)
   → after BENCH_DAYS: PremarketAgent REACTIVATED
   (expected: parent returns; strict sleeve may stay active unless FLAG fires again)
 ```
@@ -112,7 +113,7 @@ News: **no** this path.
 
 Do **not** add `PremarketAgent_strict`, `AGENT_VARIANTS` row, or News patches in this PR.
 
-**Ship order (later):** (1) `PremarketAgent_strict` + variants row — **PROMOTED** only after Premarket **BENCHED**. (2) News in-place — Ops + PROTECTED review. (3) Do **not** wait on Improver or unused `get_agent_adjustment`.
+**Ship order (later):** (1) `PremarketAgent_strict` + variants row + **seed** `agent_summary.json` `{ "active": false }` — **PROMOTED** only after Premarket **BENCHED**. Missing-from-summary never promotes (Ops PR #3). (2) News in-place — Ops + PROTECTED review. (3) Do **not** wait on Improver or unused `get_agent_adjustment`.
 
 ---
 
