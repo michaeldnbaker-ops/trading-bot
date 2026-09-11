@@ -134,16 +134,16 @@ Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 
 **Vs SPY:** only score sessions tagged BEAR/HIGH_VOL. `report_data` full-period edge is context, not the pass/fail for this sleeve. **Numeric** hedge-edge vs SPY = **TODO** (not locked from Day-1). Qualitative: shorts should not be another long-book dump in a down tape.
 
-**Vs existing agents:**
+**Vs existing agents (qualitative FLAG vs stay-active):** fade vs continuation; names below SMA200; not 5m RSI / options clones. **Numeric overlap / SMA200 % are not Day-1 FLAG cutoffs.**
 
-| Sibling | Pass | Fail |
+| Sibling | Future replay test (not FLAG math) | Qualitative fail |
 |---|---|---|
-| ShortMomentum / BearishPattern | Fade vs continuation; overlap &lt; 50% | Same names, same day, RSI &lt; 40 breakdowns |
-| VolatilityAgent shorts | ≥90% of trades have `px < sma200` | Shorting overbought names still above the 200-day |
+| ShortMomentum / BearishPattern | Replay later: overlap &lt; 50% vs continuation names/days | Same names, same day, RSI &lt; 40 breakdowns |
+| VolatilityAgent shorts | Replay later: ≥90% of trades have `px < sma200` | Shorting overbought names still above the 200-day |
 | Technical shorts | Technical **REACTIVATED** after 3d (expected); B must not be 5m RSI clones while both run | Same 5m RSI shorts |
 | OptionsFlow / paper puts | No new options tickets from this `name` while D is paused | XLE/SBUX/F-style calls/puts attributed here |
 
-**Replay:** `short_research.py` `short_rally_downtrend` with production stop + **bear gate on**. Survivorship bias runs against shorts — a small positive is stronger evidence than the same number on longs.
+**Replay (later, not Day-1):** `short_research.py` `short_rally_downtrend` with production stop + **bear gate on**, including the overlap / `px < sma200` checks above. Survivorship bias runs against shorts — a small positive is stronger evidence than the same number on longs.
 
 ---
 

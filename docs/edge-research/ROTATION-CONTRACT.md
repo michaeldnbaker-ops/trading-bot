@@ -107,7 +107,7 @@ Win rate is not a FLAG input for these specs (4% stop cap → low WR can still h
 
 ## Proposed `AGENT_VARIANTS` ownership (A and B must not collide)
 
-VolatilityAgent and MoversAgent have **no** `AGENT_VARIANTS` keys today (`_find_replacement` → `None`). **Ops confirmed (PR #3):** those two keys stay **empty** — reserved for Spec B. Do **not** reassign B’s parent list.
+Ops PR #3: `VolatilityAgent` and `MoversAgent` are **keys with empty lists `[]`** (not missing keys). `_find_replacement` on `[]` still returns `None` — same promote behavior; slots reserved for Spec B. Do **not** reassign B’s parent list.
 
 An implementation PR (not this HOLD) must write **one** ordered list per parent. A and B **must not** both claim first slot on the same parent.
 
@@ -128,7 +128,7 @@ Why this split:
 - Rotator **cannot** promote two cold sleeves from one **BENCHED** parent in the same cycle.
 - OptionsFlow is the long-regime / proxy-flow bleeder → **A** replaces that equity decision. B is a fade-rally short; it does **not** list OptionsFlow.
 - Technical is L/S with no regime tags → **A first**. If A is already `active: true` when Technical is **BENCHED** again, the first seeded `active: false` is **B** (B must already be in summary).
-- Volatility and Movers already short without SMA200 / as same-day continuation → **B’s** on-ramps. Keys stay empty until B ships.
+- Volatility and Movers already short without SMA200 / as same-day continuation → **B’s** on-ramps. Lists stay `[]` until B ships.
 
 If A is not in the roster at all, B may sit first on Technical. If both ship, Technical order above is required.
 

@@ -50,9 +50,9 @@ Pipeline every RTH tick (`market_scheduler.py` → `ensemble.run_cycle`):
 | PremarketAgent | L/S | Gap-and-go / fade | **Silent after 9:45 ET**; gap ±1.5% | variant SectorRotation; Ops: ghost/bad opens | Affinity BULL/BEAR/HIGH_VOL/BREAKOUT/NEUTRAL |
 | SectorRotationAgent | L leaders, S laggards | 11 sector ETFs vs SPY 1m/3m | Ops: rotation-guide bleeder | variant Premarket | Affinity BULL/BEAR/NEUTRAL — **not HIGH_VOL** |
 | OptionsFlowAgent | L/S | yfinance P/C, IV rank, skew **proxy** | chronic bleeder; paper **calls in book** | variants News/Sentiment | Affinity BULL/BEAR/HIGH_VOL/NEUTRAL |
-| VolatilityAgent | L/S | BB/RSI extreme **if decelerating** | — | **not in AGENT_VARIANTS** (empty slot reserved for Spec B) | **None** |
+| VolatilityAgent | L/S | BB/RSI extreme **if decelerating** | — | Ops PR #3: key with `[]` (reserved for Spec B) | **None** |
 | IntermarketAgent | **Long only** | Intraday WTI/gold/copper/10Y → names | longs only by design | **not in AGENT_VARIANTS** | Affinity BULL/BEAR/HIGH_VOL/NEUTRAL |
-| MoversAgent | L gainers, S losers | Yahoo day_gainers/losers, ≥5% | $5 / 500k vol | **not in AGENT_VARIANTS** (empty slot reserved for Spec B) | Affinity BULL/BEAR/HIGH_VOL |
+| MoversAgent | L gainers, S losers | Yahoo day_gainers/losers, ≥5% | $5 / 500k vol | Ops PR #3: key with `[]` (reserved for Spec B) | Affinity BULL/BEAR/HIGH_VOL |
 | MeanReversionAgent | **Long** | Dip **above SMA200** (BB / RSI / pullback) | max 3/tick; RSI floor 20 | **In agents list only** — missing `DEFAULT_WEIGHTS` and `AGENT_VARIANTS` | Affinity BULL/NEUTRAL/HIGH_VOL |
 
 ### 1.2 Not roster agents
@@ -107,7 +107,7 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS`. New sleeves: both, **seed** `agent_summary.json` `{ "active": false }`. Ops PR #3: absent from summary ≠ **PROMOTED**.
 2. `get_agent_adjustment()` has no callers. Specs must not depend on Friday conf deltas.
 3. `performance_logger.ENSEMBLE_AGENTS` still five names — evaluator is ledger-backed.
-4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. Volatility / Movers have **no** keys — **reserved for Spec B**. Ops PR #3 leaves them empty. A and B **must not** both claim first slot: Technical → A then B; OptionsFlow → **A only**; B on-ramps = Volatility + Movers. Do not reassign B’s parents. Map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. Ops PR #3: Volatility / Movers are **keys with empty lists `[]`** (not missing keys) — same promote behavior (`None` until B is listed); reserved for Spec B. A and B **must not** both claim first slot: Technical → A then B; OptionsFlow → **A only**. Do not reassign B’s parents. Map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 5. `BENCH_DAYS = 3` then **REACTIVATED**. “Replace bleeders” is a **3-day window** unless **FLAG** fires again. Expected rotator behavior, not a reject. No permanent-off event.
 6. Improver writes `analysis/recommendations_*.md` only. Not a promotion path.
 
