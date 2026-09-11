@@ -17,9 +17,11 @@ Repo facts that match that diagnosis:
 - `SectorRotationAgent` longs leaders / shorts laggards with **no HIGH_VOL** affinity; its shorts are then crushed by the ensemble bear-gate or leak as lagging-sector longs in the wrong tape.
 - `MeanReversionAgent` is the one measured long add (PF ~1.67–1.68, 19/22 years) and is **half-wired** (not in `DEFAULT_WEIGHTS`).
 
-**Claim:** one **equity** regime switcher — long only the rules that already won in-repo *in bull/neutral*, short only the rules that won in-repo *in BEAR/HIGH_VOL* — can replace Technical + OptionsFlow as a decision source, compete for the daily cap of 3, and be **killed** if it does not beat SPY on a stated clock.
+**Claim:** one **equity** regime switcher — long only the rules that already won in-repo *in bull/neutral*, short only the rules that won in-repo *in BEAR/HIGH_VOL* — can **rotate in** after Technical / OptionsFlow / Breakout / SectorRotation are benched, compete for the daily cap of 3, and be **KEEP / BENCH / DISABLE**’d vs SPY on a stated clock.
 
-This is a **replacement**, not a 17th overlapping voice. Implementation must bench or hard-mute Technical and OptionsFlow while the replacement is on (rotator already knows how; OptionsFlow is not PROTECTED).
+This is a **variant**, not a 17th always-on equal-weight voice. Shared lifecycle: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Assume learn/rotate/weight work after Ops PR `bc-652b78ab`.
+
+**If both A and B ship:** A is **long-only** while live; B owns fade-rally shorts (see SPEC-B). Do not double-fire the same short rule.
 
 ---
 
@@ -42,13 +44,45 @@ This is a **replacement**, not a 17th overlapping voice. Implementation must ben
 
 **Confidence:** 0.64–0.80, same band as MeanReversion so MetaAgent can merge with PROTECTED shorts in bear (for shorts) or with Momentum in bull (for longs) without always solo-scraping.
 
-**Caps:** max 2 signals/tick from this agent (daily cap is already 3 ensemble-wide).
+**Caps:** max 2 signals/tick **when live** (daily cap is already 3 ensemble-wide).
 
-**While this agent is live on paper:**
+---
 
-- Bench **TechnicalAgent** and **OptionsFlowAgent** (`agent_summary.json` `active: false`). They are the bleeders this replaces. Do not leave them firing “for diversity.”
-- Do **not** bench PROTECTED agents.
-- Breakout / SectorRotation: leave rotator to flag them; do not also clone their signals here.
+## MetaAgent / rotator — activate and deactivate
+
+**Default: cold.** `RegimeEquityAgent` is in `Ensemble.agents` and `DEFAULT_WEIGHTS` but `agent_summary.json` ships `{ "active": false }`. Ensemble skips it every tick until promotion. MetaAgent must **not** treat a never-traded key as weight 1.0 — unproven live weight = `MIN_AGENT_WEIGHT` until 10 closed attributed trades (then ledger power curve).
+
+**Activate (rotate in)** — rotator PROMOTES this name when it benches a sibling. First-choice mappings (replace today’s bleeder↔bleeder lists):
+
+| Failing sleeve (benched) | `AGENT_VARIANTS` first substitute |
+|---|---|
+| TechnicalAgent | **RegimeEquityAgent** (then MomentumAgent) |
+| OptionsFlowAgent | **RegimeEquityAgent** (then SentimentAgent — not News as a trade source) |
+| BreakoutAgent | **RegimeEquityAgent** (then MeanReversionAgent) |
+| SectorRotationAgent | **RegimeEquityAgent** |
+
+Do **not** list Technical or OptionsFlow as substitutes *of* RegimeEquityAgent (avoids v1.4-style resurrection).
+
+**Regime while live (MetaAgent, every tick):**
+
+| Detector set | MetaAgent | Agent emit |
+|---|---|---|
+| BULL_TREND or NEUTRAL, not HIGH_VOL | Affinity boost on **longs** | Longs only |
+| BEAR_TREND or HIGH_VOL | Affinity boost on **shorts** if A still owns shorts; else silent on shorts (SPEC-B) | No bull-tape shorts |
+| Intersection with `regime_aversion` | Weight × (1 − REGIME_PENALTY), floor 0.20 | Prefer `[]` rather than fighting the penalty |
+| Benched `active: false` | No signals, no slot | Skip |
+
+**Deactivate:**
+
+| Path | Trigger | State |
+|---|---|---|
+| BENCH | Evaluator 20d flag (negative and >20% worse than ensemble avg, ≥10 trades) | `active: false`, `benched_at=now`, eligible to return after `BENCH_DAYS` |
+| DISABLE | Kill table below | `benched_at=2099-01-01` (Improver). **Not** a `_find_replacement` candidate. Ops re-enables |
+| Weight mute | 20d closed P&L ≤ 0 after 10 trades | Stay active but `MIN_AGENT_WEIGHT` — not equal say |
+
+Friday learner may nudge this name’s `confidence_threshold_delta` only. It must not set `active: true` or lift `block_shorts`.
+
+PROTECTED agents are never benched to make room for A.
 
 ---
 
@@ -73,29 +107,23 @@ No new options exit rules. No share fallback from a failed option (this agent ne
 - Longs blocked by existing net-long 100% / gross 2.0× / $20k BP / daily cap.
 - Dedup one position/symbol.
 - Bridge: equity sizing (`RISK_PER_TRADE_PCT` 0.5%), not the options contract sizer.
-- Not PROTECTED in v1. Variants: `["MeanReversionAgent", "MomentumAgent"]` for longs conceptually; shorts conceptually `["BearishPatternAgent", "ShortMomentumAgent"]` — rotator dict is one list; use `["MeanReversionAgent", "ShortMomentumAgent"]` and document.
-- Add `RegimeEquityAgent` to `DEFAULT_WEIGHTS`. If MeanReversion stays, **also** add MeanReversion to `DEFAULT_WEIGHTS` (plumbing, not a new edge).
+- **Not PROTECTED.** Do not add to `PROTECTED_AGENTS`.
+- `DEFAULT_WEIGHTS["RegimeEquityAgent"] = 1.0` is only the **dict key** (so P&L is counted). Live weight starts at `MIN_AGENT_WEIGHT`. Also add `MeanReversionAgent` to `DEFAULT_WEIGHTS` if it stays (plumbing).
+- `AGENT_VARIANTS` as in the activate table above.
 
 ---
 
-## Kill criteria (required)
+## KEEP / BENCH / DISABLE
 
-Clock starts on first **paper fill** attributed to this agent. Use broker equity for money, ledger for attribution (`report_data` rule).
+Clock starts on first **paper fill** after promotion. Broker = money, ledger = attribution. Not win rate.
 
-**Kill the agent (bench + stop new entries) if any:**
+| Verdict | Vs SPY (`report_data` 20d `edge`, and sleeve $ vs SPY $ on the same 0.5% risk budget) | Vs existing agents | Action |
+|---|---|---|---|
+| **KEEP** | 20d edge ≥ 0 while SPY 20d ≥ 0, **or** sleeve $ > 0 in a window where SPY 20d &lt; 0 | 20d P&amp;L **better** than the benched sibling(s) (Technical and/or OptionsFlow and/or Breakout) over the same dates; trade-day overlap with those siblings’ *would-have* signals &lt; 60% | Stay `active: true` |
+| **BENCH** | Evaluator flag: 20d P&amp;L negative and &gt;20% worse than ensemble avg, ≥10 trades | Worse than ensemble avg but not worse than the benched bleeder (inconclusive replace) | 3-day rest; may rotate in again |
+| **DISABLE** | 20d sleeve edge &lt; 0 **and** SPY 20d &gt; 0 after ≥10 closed trades (same “SPY up, we down” as the −18% book) | 20d P&amp;L **worse** than benched Technical+OptionsFlow combined, **or** ≥60% symbol-session overlap with them (rename, not replace), **or** any bull-tape short fill, **or** stop/risk cap violated | `benched_at=2099-01-01`; not a replacement candidate until Ops |
 
-1. **20 trading days** with ≥10 closed attributed trades and 20d sleeve `edge` vs SPY (`bot` window on those days, or sleeve $ vs SPY $ on the same notional) **&lt; 0** *and* SPY 20d **&gt; 0** — i.e. it is the same “SPY up, we down” failure as the current book.
-2. **20d P&amp;L** worse than the benched Technical+OptionsFlow combined 20d (you made the bleeders quieter and the replacement is worse).
-3. **Overlap fail:** ≥60% of this agent’s (symbol, session) longs also appear as Technical or OptionsFlow would have (replay their `generate_signals` offline if benched). Then it is a rename, not a replace.
-4. **Bull-tape shorts:** any fill with `direction=short` while regimes were not `BEAR_TREND`/`HIGH_VOL`. Gate bug — kill and fix; do not “tune.”
-5. **Gross violation** of 4% stop cap or 0.5% risk on a fill.
-
-**Survive (keep running) if:**
-
-- 20d `report_data` **ensemble** edge vs SPY improves vs the −18% baseline **and** this agent’s attributed PF ≥ 1.15 on ≥10 closed trades, **or**
-- In a BEAR/HIGH_VOL window, attributed shorts are net positive while SPY 20d is negative (hedge doing the job), even if full-period CAGR still trails a roaring bull SPY.
-
-Do **not** use win rate as the kill metric (ensemble already knows tight stops → low WR can still have expectancy).
+Do **not** KEEP solely because the ensemble got quieter. Must beat SPY **or** beat the replaced bleeder — preferably both.
 
 ---
 
@@ -115,7 +143,8 @@ Do **not** use win rate as the kill metric (ensemble already knows tight stops �
 
 - No live client. No crypto. No new options.
 - Do not raise `DAILY_TRADE_CAP` to give this agent room.
-- Do not un-bench Technical/OptionsFlow without a new Ops decision if kill criteria fire.
+- DISABLE does not auto-lift after 3 days. Do not re-promote Technical as A’s substitute.
+- Later **options** variants of this sleeve (Ops D) stay cold until D is lifted; same rotate-in contract.
 
 ---
 
@@ -124,4 +153,5 @@ Do **not** use win rate as the kill metric (ensemble already knows tight stops �
 - CryptoAgent
 - New options structures / putting XLE-SBUX-F “right”
 - Lifting short gate
+- Always-on ship at weight 1.0
 - PROTECTING this agent on day one

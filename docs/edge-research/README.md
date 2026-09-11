@@ -8,14 +8,17 @@ This folder holds **research and specs**, not live trading code.
 
 **Ops lock (2026-09-11):** inventory and gap order below are authoritative. Do not add crypto edges. Do not add new options ideas until equity exits + scorecard are green.
 
+**Learning Loop lock:** A/B/C are **cold rotatable sleeves** (and in-place filters), not always-on equal-weight agents. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Assume learn/rotate/weight work after Ops PR `bc-652b78ab`.
+
 ## Contents
 
 | File | Ops gap | What it is |
 |---|---|---|
 | [SURVEY.md](SURVEY.md) | — | Confirmed roster vs `ensemble.py`, measurement loop, Ops book notes |
-| [SPEC-A-regime-equity.md](SPEC-A-regime-equity.md) | **A** | Regime-aware equity long/short to **replace bleeders**, with kill criteria vs SPY |
-| [SPEC-B-bear-shorts.md](SPEC-B-bear-shorts.md) | **B** | Additional short/downside edge, **BEAR/HIGH_VOL only** (gates already restrict shorts) |
-| [SPEC-C-news-premarket-quality.md](SPEC-C-news-premarket-quality.md) | **C** | Premarket/News (and Technical) quality filter — fewer garbage opens / ghosts |
+| [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md) | — | Cold → promote on bench → KEEP/BENCH/DISABLE; MetaAgent + rotator hooks |
+| [SPEC-A-regime-equity.md](SPEC-A-regime-equity.md) | **A** | Regime-aware equity L/S **rotated in** when bleeders are benched |
+| [SPEC-B-bear-shorts.md](SPEC-B-bear-shorts.md) | **B** | Fade-rally short, **BEAR/HIGH_VOL only**, rotated in — not a third always-on short |
+| [SPEC-C-news-premarket-quality.md](SPEC-C-news-premarket-quality.md) | **C** | Premarket strict **variant** + News in-place filter (News is PROTECTED) |
 
 ## Explicitly out of scope
 

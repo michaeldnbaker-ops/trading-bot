@@ -20,9 +20,13 @@ Same affinity, same aversion (`BULL_TREND`), same rotator variants of each other
 
 `short_research.py` already tested the **inverse of the best long rule** (`short_rally_downtrend`: `Close < SMA200` and RSI &gt; 60) and the short specialists’ docstrings quote that table. **No agent fires it.**
 
-**Claim:** a third short *style* (fade a bounce **below** the 200-day), silent in bull, improves bear-tape P&amp;L vs SPY without recreating always-on shorts. If SPEC-A already includes this rule inside `RegimeEquityAgent`, this spec is the **standalone / kill-isolated** short sleeve so Ops can keep A’s longs if A’s shorts fail (or vice versa).
+**Claim:** a third short *style* (fade a bounce **below** the 200-day) that **rotates in** when a non-PROTECTED short-capable bleeder is benched — not a third always-on PROTECTED clone. Silent in bull. Improves bear-tape P&amp;L vs SPY without recreating always-on shorts.
 
-Paper “put” language: if Ops later lifts D, the **same** entry may route through the existing 0.70 paper put path. Until then, **equity short only** so scorecard/exits stay on shares.
+If SPEC-A is also in the roster, A is long-only while live; **this name owns fade-rally shorts** so kill/KEEP is isolated.
+
+Shared lifecycle: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Assume learn/rotate/weight work after Ops PR `bc-652b78ab`.
+
+Paper “put” language: if Ops later lifts D, the **same** entry may rotate in as a paper-put **variant** under this contract. Until then, **equity short only**.
 
 ---
 
@@ -45,7 +49,34 @@ Paper “put” language: if Ops later lifts D, the **same** entry may route thr
 
 **Universe:** MeanReversion list plus ShortMomentum’s high-beta names (TSLA, ARKK, COIN, …). No crypto. No dynamic IPO screen for v1.
 
-**Max 3 signals/tick.**
+**Max 3 signals/tick when live.**
+
+---
+
+## MetaAgent / rotator — activate and deactivate
+
+**Default: cold.** In `Ensemble.agents` + `DEFAULT_WEIGHTS` key, `active: false`. No day-one shorts beside the two PROTECTED continuation agents. Unproven live weight = `MIN_AGENT_WEIGHT` until 10 closed trades.
+
+PROTECTED shorts (**BearishPatternAgent**, **ShortMomentumAgent**) are **never** benched to make room for B. B rotates in when a **non-PROTECTED** short-capable bleeder is benched:
+
+| Failing sleeve (benched) | `AGENT_VARIANTS` first substitute |
+|---|---|
+| OptionsFlowAgent | **ShortMeanReversionAgent** (then RegimeEquityAgent if A is long-only) |
+| TechnicalAgent | **ShortMeanReversionAgent** for the short side of that hole; A still first for longs |
+| VolatilityAgent | **ShortMeanReversionAgent** |
+| MoversAgent | **ShortMeanReversionAgent** (loser-continuation vs fade-rally) |
+
+Do not list B as a variant *of* the PROTECTED pair (rotator cannot bench them; listing B there never promotes). After B is live, PROTECTED shorts stay on; MetaAgent **downweights** them if 20d P&amp;L ≤ 0 (`MIN_AGENT_WEIGHT`) instead of disabling the short book.
+
+**Regime while live:**
+
+| Detector | MetaAgent | Agent |
+|---|---|---|
+| BEAR_TREND or HIGH_VOL | Affinity boost | May emit shorts |
+| BULL_TREND (no HIGH_VOL) | Aversion penalty | `generate_signals` returns `[]` |
+| `active: false` | — | Skip |
+
+**Deactivate:** BENCH on evaluator flag; DISABLE on kill table; weight mute at `MIN_AGENT_WEIGHT` if 20d P&amp;L ≤ 0 after 10 trades. Friday learner: conf delta only — never `active: true` in a bull tape, never lift `block_shorts`.
 
 ---
 
@@ -64,31 +95,26 @@ Do **not** add options-manager rules here.
 - `regime_affinity = ["BEAR_TREND", "HIGH_VOL"]`
 - `regime_aversion = ["BULL_TREND"]`
 - `MIN_CONFIDENCE = 0.55`
-- Not PROTECTED in v1 (PROTECTED shorts already exist; this one earns it).
-- `AGENT_VARIANTS`: `["BearishPatternAgent", "ShortMomentumAgent"]` both directions.
-- Add to `DEFAULT_WEIGHTS`.
+- Not PROTECTED in v1.
+- `DEFAULT_WEIGHTS` **key** only; live weight starts at `MIN_AGENT_WEIGHT`.
+- `AGENT_VARIANTS` as in the activate table. Do **not** put Technical first on B’s own variant list.
 - Daily cap / BP / gross / dedup unchanged.
 - **Do not** emit `direction: long`.
-- **Do not** implement new put spreads, naked puts, or inverse-ETF-as-alpha (exposure.py already maps inverse ETFs; not this edge).
-
-If SPEC-A is also live: **one** of (A’s short rule, this agent) should own fade-rally shorts so they do not double-fire. Prefer this dedicated name for attribution/kill, and keep A long-only if both ship.
+- **Do not** implement new put spreads while Ops D is paused.
 
 ---
 
-## Kill criteria
+## KEEP / BENCH / DISABLE
 
-Start clock on first paper short fill.
+Clock: first paper short fill after promotion. Score **only BEAR/HIGH_VOL sessions** vs SPY. Do not require beating SPY CAGR over a bull year.
 
-**Kill if:**
+| Verdict | Vs SPY | Vs existing agents | Action |
+|---|---|---|---|
+| **KEEP** | Sleeve $ > 0 while SPY 20d ≤ 0 (or SPY down ≥ 3% on the window) | Overlap with ShortMomentum+BearishPattern &lt; 50%; 20d $ **not worse** than those two **in the same bear window**; ≥90% of trades have `px < sma200` | Stay active |
+| **BENCH** | Evaluator 20d flag, ≥10 trades | Inconclusive vs PROTECTED shorts | 3-day rest |
+| **DISABLE** | Any short fill outside BEAR/HIGH_VOL; **or** sleeve $ &lt; 0 while SPY is down ≥ 3% (failed hedge) | PF &lt; 1.0 and **worse** than ShortMomentum+BearishPattern in the same window after ≥10 trades; **or** overlap ≥ 70% (clone); **or** new options tickets while D is paused | `benched_at=2099-01-01` |
 
-1. Any short fill while regimes were **not** BEAR/HIGH_VOL.
-2. 10+ closed trades in BEAR/HIGH_VOL and PF &lt; 1.0 **and** worse than ShortMomentum+BearishPattern in the **same** window (no diversification, just another loser).
-3. Symbol-day overlap with those two PROTECTED shorts ≥ 70% — clone; kill.
-4. Sleeve loses money in a window where SPY is **down** ≥ 3% (failed hedge). Losing in a bull tape with **zero fills** is a pass on this criterion.
-
-**Keep if:** BEAR/HIGH_VOL attributed $ &gt; 0 while SPY 20d ≤ 0, overlap &lt; 50%, and no bull-tape fills.
-
-Do not require beating SPY CAGR over a bull year. That requirement is how always-on shorts got into the book.
+Zero fills in a bull tape = **not** DISABLE. That is the gate working.
 
 ---
 
@@ -112,8 +138,9 @@ Do not require beating SPY CAGR over a bull year. That requirement is how always
 ## Paper-only constraints
 
 - Equity shorts on paper Alpaca. No live. No crypto.
-- No new options until Ops D is lifted. If D lifts later, reuse this **entry** and existing put router; new spec, not a silent add.
-- Do not change `SOLO_SHORT_CONFIDENCE` / bear solo easing except as auto_tune already allows.
+- No new options until Ops D is lifted. A later put **variant** of this sleeve ships **cold** and rotates in under the same contract — not a silent always-on add.
+- DISABLE does not auto-clear after `BENCH_DAYS`.
+- Do not change `SOLO_SHORT_CONFIDENCE` except via auto_tune as today.
 
 ---
 
@@ -121,5 +148,6 @@ Do not require beating SPY CAGR over a bull year. That requirement is how always
 
 - Lifting `block_shorts`
 - Crypto
+- Always-on third short at weight 1.0
+- Replacing PROTECTED shorts (they stay; MetaAgent may downweight)
 - Inverse ETF overlay as the product
-- Replacing PROTECTED shorts (they stay; this diversifies them)

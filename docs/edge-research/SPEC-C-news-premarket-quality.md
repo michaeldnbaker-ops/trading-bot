@@ -1,9 +1,15 @@
 # SPEC-C — Premarket / News quality filter (garbage opens & ghosts)
 
 **Ops gap C (after A and B).** Paper Alpaca only. **Do not implement in this PR.**  
-This is a **filter / hardening spec**, not a new signal agent and not crypto/options research.
+**No crypto. No new options.** Shared lifecycle: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Assume learn/rotate/weight work after Ops PR `bc-652b78ab`.
 
-Ops: ghost and bad opens cluster on **TechnicalAgent + NewsAgent + PremarketAgent**. News is **PROTECTED** (rotation cannot bench it). Premarket is not. Technical is a named bleeder (SPEC-A benches it; this spec still hardens it if it stays on).
+This spec is **not** a 17th always-on equal-weight agent.
+
+- **Premarket:** ship `PremarketAgent_strict` **cold**; rotator promotes it when Premarket (or SectorRotation) is benched.
+- **News:** **PROTECTED** — rotator cannot bench it. Quality rules patch **in place** on `name = "NewsAgent"`. MetaAgent **downweights** (does not DISABLE to zero news). Optional `NewsAgent_strict` is **not** auto-promoted (PROTECTED parent never benches). If Ops later allows a protected-swap, it still must not run both News voices at weight 1.0.
+- **Technical:** ghosts/bad opens → SPEC-A `RegimeEquityAgent` rotate-in, not another Technical clone. C3 knobs apply only if Technical is still `active`.
+
+Ops: ghost and bad opens cluster on **TechnicalAgent + NewsAgent + PremarketAgent**.
 
 ---
 
@@ -14,7 +20,7 @@ Garbage opens here are two different bugs that look like “the agent stinks”:
 1. **Bad signal:** keyword news and tiny gaps fire without price/volume confirmation, then MetaAgent **boosts** `NewsAgent` + `PremarketAgent` / Surge / Momentum as “catalyst alignment” (`meta_agent.py`). Post-mortem already blamed NewsAgent for **−$4,793 WRONG_DIRECTION** and **−$1,873 GAP_LOSS** (2026-07-31). `REQUIRE_CORROBORATION` only blocks *solo* News; Premarket+News together **satisfy** corroboration.
 2. **Ghosts:** `invariants.py` `no_ghost_positions` — ledger row `open`, broker does not hold the name. These three agents emit on **yfinance** last price, often with `instrument_type: options` and 2% stops, so the ledger can book a PAPER TRADE / entry that never fills (or fills then immediately disappears) while reports show an open.
 
-**Claim:** tightening News and Premarket *quality gates* (and not logging an open until the paper broker acknowledges a fill) cuts ghost count and WRONG_DIRECTION without removing PROTECTED News as a **catalyst co-signer**. That is higher leverage than adding a 17th agent while these three still spray.
+**Claim:** a **rotatable** Premarket strict variant plus an in-place News quality gate (News stays PROTECTED) cuts ghost count and WRONG_DIRECTION. That is higher leverage than an always-on News_v2 at weight 1.0 beside the old NewsAgent.
 
 ---
 
@@ -40,7 +46,7 @@ Garbage opens here are two different bugs that look like “the agent stinks”:
 **TechnicalAgent** (ghost/bad-open co-accused)
 
 - 5m RSI stack, **no regime tags**, 3x ETFs on the watchlist
-- SPEC-A says bench it; if A is delayed, apply the Technical bullets below anyway
+- SPEC-A rotates `RegimeEquityAgent` in when Technical is benched; C3 only if Technical is still `active`
 
 **Ghost definition (code):** ledger open symbols − broker symbols. Fixing agents without fixing “ledger open on intended fill” will not clear the invariant.
 
@@ -60,7 +66,7 @@ Emit **only if all** are true:
 6. `regime_aversion`: News **shorts** inherit ensemble bear-gate (no bull-tape shorts from a “plunge” headline).
 7. Still never solo at Meta.
 
-### C2 — PremarketAgent
+### C2 — PremarketAgent_strict (rules live on the **variant**, not always-on old Premarket)
 
 1. Gap threshold **±2.5%** (was ±1.5%). 1.5% is ordinary overnight noise vs a 4% stop cap.
 2. **Require** early volume ≥ 1.5× (today it only adds confidence).
@@ -89,6 +95,34 @@ This is plumbing, still **paper-only**, still not a live switch.
 
 ---
 
+## MetaAgent / rotator — activate and deactivate
+
+**PremarketAgent_strict (rotatable)**
+
+- Ship in `Ensemble.agents`, `DEFAULT_WEIGHTS` key, `active: false`. Live weight starts at `MIN_AGENT_WEIGHT`.
+- First substitute when rotator benches:
+
+| Failing sleeve | Promote |
+|---|---|
+| PremarketAgent | **PremarketAgent_strict** |
+| SectorRotationAgent | PremarketAgent_strict (second to SPEC-A if both listed; A wins if that cycle benched SectorRotation for P&amp;L) |
+
+- **Regime while live:** same detector as Premarket; fade-shorts only if BEAR/HIGH_VOL (C2.4). MetaAgent aversion on bull-tape shorts. After 9:45 ET the module returns `[]` (time mute, not a bench).
+- **Deactivate:** BENCH on evaluator flag; DISABLE if ghost count rises or bull-tape Premarket shorts fill. Do not auto-reactivate the **old** PremarketAgent as this variant’s substitute (do not list PremarketAgent first on strict’s `AGENT_VARIANTS`).
+
+**NewsAgent (PROTECTED — weight, don’t bench)**
+
+- In-place C1 filter always applies once the implementation PR lands (that is a gate, not a new voice).
+- MetaAgent: 20d closed News P&amp;L ≤ 0 → `MIN_AGENT_WEIGHT`; keep `REQUIRE_CORROBORATION`. Catalyst boost **only** if C1 passed.
+- Rotator: **PROTECTED** — never `active: false`. DISABLE on News means “Ops reverts C1,” not bench-to-zero (that recreates 2026-07-29 structurally-no-catalyst).
+- Friday learner may raise News conf threshold; must not clear C1 price confirmation.
+
+**TechnicalAgent:** if still active, C3 + SPEC-A promotion. If A already benched Technical, C3 is N/A.
+
+**Ledger C4** is always-on plumbing (not a sleeve). No MetaAgent weight.
+
+---
+
 ## Exit
 
 No new exit geometry. Existing trails / halt / options manager (for **legacy** XLE/SBUX/F calls — Ops D: manage those; don’t add new ones).
@@ -107,34 +141,29 @@ If a Premarket fade was the entry, same 4% ATR cap as everyone else (today Prema
 
 ---
 
-## Kill / success criteria
+## KEEP / BENCH / DISABLE
 
-Clock: 10 trading days after filters land (need enough opens to see ghosts go to zero).
+Clock: 10 trading days after **PremarketAgent_strict is promoted** (or after C1 lands, for News). Ghost metric is invariants `no_ghost_positions` on names these agents opened.
 
-**Pass (keep filters):**
+| Verdict | Vs SPY | Vs existing agents | Action |
+|---|---|---|---|
+| **KEEP** | 20d ensemble `edge` vs SPY does **not** worsen by &gt; 2pp **because the bot went silent**; preferably gap vs the −18% baseline **narrows** | Ghosts = 0 on ≥8/10 days for News/Premarket/Technical; News+Premarket **new** opens down ≥50% vs prior 10d **and** News WRONG_DIRECTION $ / trade better than the 2026-07-31 class; Premarket shorts in BULL without HIGH_VOL = 0 fills | Strict stays active; C1 stays |
+| **BENCH** | Inconclusive 20d (strict has &lt;10 trades) | Ghosts down but WRONG_DIRECTION flat | 3-day rest on **strict** only |
+| **DISABLE strict** | Ensemble edge **worse** by &gt; 2pp and the only change was fewer first-hour trades that had been winning vs SPY | Ghosts **increase**; or overlap ≥70% with old Premarket would-have signals (filter did nothing) | `PremarketAgent_strict` `benched_at=2099-01-01`. Do **not** auto-promote old Premarket |
+| **Revert C1 (Ops)** | Real tickered catalysts + ≥0.5% prints in watchlist and News emitted **zero** for 5 sessions | Movers/Surge still garbage-open — C silenced News instead of cleaning it | Loosen C1.3 to 0.3% or add a second **per-ticker** feed. Do not restore MarketWatch-on-every-symbol. Do not bench PROTECTED News |
 
-1. Ghost count (`invariants` WARN `no_ghost_positions` for equities attributed to News/Premarket/Technical) **= 0** on 8/10 days (reconciling known broker/ledger races is OK if those symbols are not these agents).
-2. News+Premarket attributed **new** equity opens down ≥50% vs the prior 10 days, **and** WRONG_DIRECTION $ for News (post-mortem classifier) better than the −$4.8k-class outcome on a per-trade basis (not “zero trades forever”).
-3. 20d ensemble `edge` vs SPY does not **worsen** by more than 2 percentage points solely because the bot stopped trading (if A/B are not live, a quieter bad book is still a win).
-4. Premarket shorts in BULL_TREND with no HIGH_VOL = **0 fills**.
+**Vs SPY:** C is not an alpha sleeve. KEEP is “fewer losing opens / zero ghosts” helping the −18% gap. Do not KEEP a mute-the-bot outcome that trails SPY more.
 
-**Kill / revert filters if:**
-
-1. Ghosts **increase** (filter made more rejected orders that still hit the ledger).
-2. News emits **zero** signals for 5 full sessions **and** real catalysts (earnings, clearly tickered headlines + 1%+ prints) were in the watchlist — filter too tight; loosen C1.3 to 0.3% or restore a second feed, don’t go back to MarketWatch-on-every-symbol.
-3. Protected News is effectively muted so MetaAgent catalyst path never fires, while Movers/Surge still garbage-open — then C failed its job (quality, not silence).
-
-**Vs SPY:** this spec is not an alpha sleeve. Success is **fewer losing opens** and **zero ghosts**, which should **reduce** the −18% gap, not print a standalone CAGR. Report: News/Premarket 20d P&amp;L and ghost count, plus `report_data` 20d edge as context.
-
-**Vs existing agents:** compare News/Premarket trade counts and $ before vs after, not vs Momentum. Technical should already be benched under A; if not, include it in the before/after table.
+**Vs existing agents:** before/after News and Premarket counts and $, not vs Momentum. Technical belongs in the table only if still `active`.
 
 ---
 
 ## Paper-only constraints
 
-- Filters only; no live brokerage flag changes.
-- Do not add Unusual Whales / paid news. Keyword RSS + Alpaca paper quotes are enough.
-- Do not implement a new NewsAgent_v2 **module** unless filters in-place are unreadable; Ops asked for a quality filter, not another voice. If a v2 file is cleaner, it must keep `name = "NewsAgent"` so PROTECTED + ledger attribution stay stable — **or** explicitly migrate PROTECTED to the new name in the same PR.
+- Filters + one **cold** Premarket variant; no live brokerage flag changes.
+- Do not add Unusual Whales / paid news.
+- Do not run `NewsAgent` and `NewsAgent_strict` both `active` at weight 1.0.
+- DISABLE on strict does not auto-lift after 3 days.
 
 ---
 
@@ -142,6 +171,6 @@ Clock: 10 trading days after filters land (need enough opens to see ghosts go to
 
 - New options ideas (D)
 - Crypto (E)
-- Replacing SPEC-A/B
-- Removing News protection
+- Always-on Premarket_strict beside old Premarket
+- Removing News from `PROTECTED_AGENTS`
 - Using this spec to raise daily cap “because we filter more”
