@@ -20,13 +20,13 @@ Same affinity, same aversion (`BULL_TREND`), same rotator variants of each other
 
 `short_research.py` already tested the **inverse of the best long rule** (`short_rally_downtrend`: `Close < SMA200` and RSI &gt; 60) and the short specialists’ docstrings quote that table. **No agent fires it.**
 
-**Claim:** a third short *style* (fade a bounce **below** the 200-day) that **rotates in** when a non-PROTECTED short-capable bleeder is benched — not a third always-on PROTECTED clone. Silent in bull. Improves bear-tape P&amp;L vs SPY without recreating always-on shorts.
+**Claim:** a fade-rally-below-200 short that is **PROMOTED** when a **non-PROTECTED** short-capable bleeder is **BENCHED** — not a third always-on PROTECTED clone. Silent in bull. Improver cannot apply this. Friday learn does not retune it.
 
-If SPEC-A is also in the roster, A is long-only while live; **this name owns fade-rally shorts** so kill/KEEP is isolated.
+If SPEC-A is also in the roster, A is long-only while live; **this name owns fade-rally shorts**.
 
-Shared lifecycle: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Assume learn/rotate/weight work after Ops PR `bc-652b78ab`.
+Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
-Paper “put” language: if Ops later lifts D, the **same** entry may rotate in as a paper-put **variant** under this contract. Until then, **equity short only**.
+Paper “put” language: if Ops later lifts D, a put **variant** would use the same FLAG/BENCHED/PROMOTED path. Until then, **equity short only**.
 
 ---
 
@@ -53,20 +53,22 @@ Paper “put” language: if Ops later lifts D, the **same** entry may rotate in
 
 ---
 
-## MetaAgent / rotator — activate and deactivate
+## MetaAgent / rotator — FLAG / BENCHED / PROMOTED / REACTIVATED
 
-**Default: cold.** In `Ensemble.agents` + `DEFAULT_WEIGHTS` key, `active: false`. No day-one shorts beside the two PROTECTED continuation agents. Unproven live weight = `MIN_AGENT_WEIGHT` until 10 closed trades.
+**Default: cold.** `active: false`. No day-one shorts beside the two PROTECTED continuation agents.
 
-PROTECTED shorts (**BearishPatternAgent**, **ShortMomentumAgent**) are **never** benched to make room for B. B rotates in when a **non-PROTECTED** short-capable bleeder is benched:
+PROTECTED shorts (**BearishPatternAgent**, **ShortMomentumAgent**) are **never BENCHED**. FLAG on them → rotator log “reducing weight instead of benching.” Listing B only as their variant would **never PROMOTE** B.
 
-| Failing sleeve (benched) | `AGENT_VARIANTS` first substitute |
+**PROMOTED in** when rotator **BENCHED** a non-PROTECTED short-capable bleeder:
+
+| Bleeder **BENCHED** | **PROMOTED** |
 |---|---|
-| OptionsFlowAgent | **ShortMeanReversionAgent** (then RegimeEquityAgent if A is long-only) |
-| TechnicalAgent | **ShortMeanReversionAgent** for the short side of that hole; A still first for longs |
+| OptionsFlowAgent | **ShortMeanReversionAgent** |
+| TechnicalAgent | **ShortMeanReversionAgent** for the short hole (A is first for longs if both listed — put B **first** on Technical only if A is not shipping, else A first / B second) |
 | VolatilityAgent | **ShortMeanReversionAgent** |
-| MoversAgent | **ShortMeanReversionAgent** (loser-continuation vs fade-rally) |
+| MoversAgent | **ShortMeanReversionAgent** |
 
-Do not list B as a variant *of* the PROTECTED pair (rotator cannot bench them; listing B there never promotes). After B is live, PROTECTED shorts stay on; MetaAgent **downweights** them if 20d P&amp;L ≤ 0 (`MIN_AGENT_WEIGHT`) instead of disabling the short book.
+After **REACTIVATED** of that bleeder (3d), B may still be active. PROTECTED shorts stay on; MetaAgent may downweight them if 20d P&amp;L is bad.
 
 **Regime while live:**
 
@@ -74,9 +76,9 @@ Do not list B as a variant *of* the PROTECTED pair (rotator cannot bench them; l
 |---|---|---|
 | BEAR_TREND or HIGH_VOL | Affinity boost | May emit shorts |
 | BULL_TREND (no HIGH_VOL) | Aversion penalty | `generate_signals` returns `[]` |
-| `active: false` | — | Skip |
+| BENCHED | — | Skip |
 
-**Deactivate:** BENCH on evaluator flag; DISABLE on kill table; weight mute at `MIN_AGENT_WEIGHT` if 20d P&amp;L ≤ 0 after 10 trades. Friday learner: conf delta only — never `active: true` in a bull tape, never lift `block_shorts`.
+If B is FLAG'd → **BENCHED** 3d → **REACTIVATED**. No Improver off-switch. Friday learn does not retune B.
 
 ---
 
@@ -95,26 +97,29 @@ Do **not** add options-manager rules here.
 - `regime_affinity = ["BEAR_TREND", "HIGH_VOL"]`
 - `regime_aversion = ["BULL_TREND"]`
 - `MIN_CONFIDENCE = 0.55`
-- Not PROTECTED in v1.
-- `DEFAULT_WEIGHTS` **key** only; live weight starts at `MIN_AGENT_WEIGHT`.
-- `AGENT_VARIANTS` as in the activate table. Do **not** put Technical first on B’s own variant list.
-- Daily cap / BP / gross / dedup unchanged.
+- Not PROTECTED.
+- `DEFAULT_WEIGHTS` key; `AGENT_VARIANTS` as in the PROMOTED table. Do **not** put Technical first on B’s own variant list.
 - **Do not** emit `direction: long`.
 - **Do not** implement new put spreads while Ops D is paused.
 
 ---
 
-## KEEP / BENCH / DISABLE
+## FLAG vs remain-active (qualitative; numbers TODO)
 
-Clock: first paper short fill after promotion. Score **only BEAR/HIGH_VOL sessions** vs SPY. Do not require beating SPY CAGR over a bull year.
+Clock: first paper short fill after **PROMOTED**. Score **BEAR/HIGH_VOL sessions** vs SPY. Do not require beating SPY CAGR over a bull year. **Numeric thresholds = TODO pending Ops daily scorecard.**
 
-| Verdict | Vs SPY | Vs existing agents | Action |
-|---|---|---|---|
-| **KEEP** | Sleeve $ > 0 while SPY 20d ≤ 0 (or SPY down ≥ 3% on the window) | Overlap with ShortMomentum+BearishPattern &lt; 50%; 20d $ **not worse** than those two **in the same bear window**; ≥90% of trades have `px < sma200` | Stay active |
-| **BENCH** | Evaluator 20d flag, ≥10 trades | Inconclusive vs PROTECTED shorts | 3-day rest |
-| **DISABLE** | Any short fill outside BEAR/HIGH_VOL; **or** sleeve $ &lt; 0 while SPY is down ≥ 3% (failed hedge) | PF &lt; 1.0 and **worse** than ShortMomentum+BearishPattern in the same window after ≥10 trades; **or** overlap ≥ 70% (clone); **or** new options tickets while D is paused | `benched_at=2099-01-01` |
+**Remain active when, qualitatively:**
 
-Zero fills in a bull tape = **not** DISABLE. That is the gate working.
+- Vs **SPY:** in BEAR/HIGH_VOL, sleeve $ should not be another long-book dump; shorts should hedge a down tape, not fight an up tape (and they should have **no fills** in pure BULL).
+- Vs **agents:** fade vs continuation (not the same names/days as ShortMomentum/BearishPattern breakdowns); names below SMA200, not Volatility overbought-above-200.
+
+**FLAG (then rotator BENCHED → REACTIVATED) when, qualitatively:**
+
+- Vs **regime:** any short fill outside BEAR/HIGH_VOL.
+- Vs **SPY:** shorts lose while SPY is already down (failed hedge), or they are the only activity in a roaring bull (gate leak).
+- Vs **agents:** clone of PROTECTED shorts, or new options tickets while D is paused.
+
+Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 
 ---
 
@@ -137,10 +142,10 @@ Zero fills in a bull tape = **not** DISABLE. That is the gate working.
 
 ## Paper-only constraints
 
-- Equity shorts on paper Alpaca. No live. No crypto.
-- No new options until Ops D is lifted. A later put **variant** of this sleeve ships **cold** and rotates in under the same contract — not a silent always-on add.
-- DISABLE does not auto-clear after `BENCH_DAYS`.
-- Do not change `SOLO_SHORT_CONFIDENCE` except via auto_tune as today.
+- Equity shorts on paper Alpaca. No live. No crypto. **No strategy code in this PR.**
+- No new options until Ops D is lifted.
+- Do not assume Friday learner retunes B.
+- Do not change `SOLO_SHORT_CONFIDENCE` except via existing auto_tune.
 
 ---
 
@@ -148,6 +153,7 @@ Zero fills in a bull tape = **not** DISABLE. That is the gate working.
 
 - Lifting `block_shorts`
 - Crypto
-- Always-on third short at weight 1.0
-- Replacing PROTECTED shorts (they stay; MetaAgent may downweight)
+- Always-on third short
+- Replacing PROTECTED shorts
+- Improver auto-apply
 - Inverse ETF overlay as the product

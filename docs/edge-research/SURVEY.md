@@ -90,35 +90,35 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 
 | # | Gap | Why this repo, not generic finance | Spec |
 |---|---|---|---|
-| **A** | Regime-aware **equity** L/S that can beat SPY, with **kill criteria** | Technical has **no** regime tags and is a named bleeder; OptionsFlow is a proxy bleeder with live paper calls; Breakout is averse to HIGH_VOL in code but still a rotation bleeder; SectorRotation shorts laggards with no HIGH_VOL affinity. MeanReversion is the only measured long add and is **half-wired** (no DEFAULT_WEIGHTS). Book is −18% vs SPY | [SPEC-A](SPEC-A-regime-equity.md) |
-| **B** | Short/downside edges **only** in BEAR/HIGH_VOL | Gates already block bull-tape shorts (measured: always-on shorts CAGR 1.2% vs bear-only 9.0%). Dedicated shorts are two **correlated continuation** PROTECTED agents. `short_research.py` inverse of the best long rule is unimplemented | [SPEC-B](SPEC-B-bear-shorts.md) |
-| **C** | Premarket / News **quality filter** (ghosts / garbage opens) | Ops names Technical + News + Premarket. News is keyword RSS with no price gate (PROTECTED, so rotation cannot save you). Premarket gap ±1.5% before 9:45 with optional volume. Catalyst boost **rewards** News+Premarket together. Ledger ghosts = open in CSV, missing at broker | [SPEC-C](SPEC-C-news-premarket-quality.md) |
+| **A** | Regime-aware **equity** L/S **PROMOTED** when a bleeder is **BENCHED** | Technical has **no** regime tags and is a named bleeder; OptionsFlow is a proxy bleeder with paper calls; Breakout / SectorRotation sit on bleeder↔bleeder `AGENT_VARIANTS`. MeanReversion is half-wired. Book ~−18% vs SPY | [SPEC-A](SPEC-A-regime-equity.md) |
+| **B** | Short/downside **PROMOTED** only after a non-PROTECTED short-capable bleeder is **BENCHED**; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). `short_research.py` inverse of the best long rule is unimplemented | [SPEC-B](SPEC-B-bear-shorts.md) |
+| **C** | Premarket **strict** PROMOTED when Premarket is BENCHED; News quality in-place (PROTECTED → FLAG cannot BENCH) | Ghosts: Technical + News + Premarket. News keyword RSS; Premarket ±1.5% gaps. Catalyst boost rewards News+Premarket together | [SPEC-C](SPEC-C-news-premarket-quality.md) |
 
-**Paused (Ops D):** any new options product (IV crush, new put structures, etc.). Existing XLE/SBUX/F calls are an exits/scorecard item. Future options variants must use the same [rotation contract](ROTATION-CONTRACT.md) (cold → promote on bench) — not specified in this PR.
+**Paused (Ops D):** any new options product. Existing XLE/SBUX/F calls are exits/scorecard. Future options variants would use FLAG/BENCHED/PROMOTED — not specified here.
 
 **Forbidden (Ops E):** crypto edges; wiring CryptoAgent into the equity ensemble.
 
-**Learning Loop:** A/B/C are **not** always-on equal-weight adds. They ship **cold** (`agent_summary.json` `active: false`) and rotate in when a bleeder is benched. KEEP/DISABLE vs SPY is in each spec. Shared rules: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Specs **assume** ensemble honors benches, MetaAgent ledger-weights, Friday params load, and Improver can DISABLE — as of Ops PR `bc-652b78ab`. Do not redesign A/B/C around the old blinds (ignored `agent_summary.json`, weights stuck at 1.0, human-only Improver, unread `learned_params.json`).
+**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
-## 4. Plumbing holes (Ops PR owns the loop; do not re-break)
+## 4. Plumbing holes (do not spec a second control plane)
 
-1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS` (half-wired always-on). New sleeves must be in **both**, start **inactive**.
-2. Friday learner JSON historically unused (`get_agent_adjustment` had no callers). Post-Ops: consume conf deltas only; never let the learner flip `active` or lift `block_shorts`.
-3. `performance_logger.ENSEMBLE_AGENTS` still five names — evaluator is ledger-backed; don’t revive that list as the roster.
-4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders** (Technical ↔ Breakout ↔ Momentum; OptionsFlow ↔ News; Premarket ↔ SectorRotation). A/B/C must **replace those mappings** as first-choice substitutes.
-5. `BENCH_DAYS = 3` auto-reactivates. DISABLE (kill) must not use that path.
-6. Improver was advisory markdown only. DISABLE in A/B/C is a **state** change post-Ops, not a Slack ping.
+1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS`. New sleeves: both, start `active: false`.
+2. `get_agent_adjustment()` has no callers. Specs must not depend on Friday conf deltas.
+3. `performance_logger.ENSEMBLE_AGENTS` still five names — evaluator is ledger-backed.
+4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. A/B/C must be **first** substitute of a non-PROTECTED bleeder.
+5. `BENCH_DAYS = 3` then **REACTIVATED**. There is no permanent-off event in the rotator.
+6. Improver writes `analysis/recommendations_*.md` only. Not a promotion path.
 
 ---
 
-## 5. Paper-only contract for follow-up PRs
+## 5. Paper-only contract (research HOLD)
 
 - `PAPER_TRADING=true`. No live Alpaca trading client.
 - Do not lift `block_shorts`.
 - Do not add options strategies until Ops D is lifted.
 - Do not touch `crypto_scheduler.py` / `CryptoAgent` except to keep them **out** of the equity bot.
-- Success vs SPY: `report_data` 20d and since-start `edge`. KEEP/DISABLE tables live in SPEC-A/B/C.
-- Success vs existing agents: 20d ledger P&L and overlap vs the **benched** sibling, not vs a generic factor.
-- New names ship `active: false`. Never ship at MetaAgent weight 1.0 with no trades.
+- Vs SPY: `report_data` 20d `edge`. Qualitative FLAG/promote rules in SPEC-A/B/C; **numeric kill TODOs** pending scorecard.
+- Vs existing agents: overlap vs the **BENCHED** sibling.
+- New names ship `active: false`. This PR is **docs only**.

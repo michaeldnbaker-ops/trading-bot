@@ -1,66 +1,84 @@
 # Rotation contract (Learning Loop)
 
-**Applies to specs A, B, and C.** Paper Alpaca only. No crypto. Later options variants (Ops D, paused) must use this same contract — they are **not** specified here.
+**Applies to specs A, B, and C.** Docs-only / research HOLD. Paper Alpaca only. No crypto. No strategy implementation.
 
-Assume **learn / rotate / weight work** after Ops PR `bc-652b78ab`. Do not design A/B/C around the historical blinds. Do not add another always-on equal-weight voice.
+Rotator vocabulary is the **only** state language these specs use: **FLAG** → **BENCHED** → **PROMOTED** / **REACTIVATED**. Do not use KEEP / DISABLE.
 
 ---
 
-## Historical blinds (why this contract exists)
+## What the code actually does (`agent_rotator.py`)
 
-| Blind | What happened | Spec assumption **after** Ops PR |
-|---|---|---|
-| Ensemble ignored benches | Rotator wrote `logs/agent_summary.json` `active: false`; ticks still called every agent | Ensemble **skips** `active: false` every tick (`_load_benched_agent_names`) |
-| MetaAgent weights stuck at 1.0 | Weights read an empty PerformanceLogger → `DEFAULT_WEIGHTS` | Weights from **ledger 20d closed P&L**; new sleeves **not** born at 1.0 |
-| Improver human-only | Markdown recs, no state change | Improver/rotator can **DISABLE** (not only 3-day bench) when kill criteria fire |
-| Friday `learned_params.json` not loaded | `get_agent_adjustment()` had no callers; avoid-list was rebuilt from ledger | Ensemble **consumes** per-agent conf deltas and this spec’s KEEP/DISABLE flags. Avoid-list still ledger-capped (max 8). Learner must **not** move the short hard-gate or net-long cap |
+Twice daily (`market_scheduler` 10:00 and 15:30 ET):
+
+1. `AgentEvaluator.evaluate()` may **FLAG** an agent (20d P&amp;L negative and &gt;20% worse than ensemble avg, ≥10 trades).
+2. For each FLAG, if the name is not in `PROTECTED_AGENTS` and active count &gt; `MIN_ACTIVE_AGENTS` (2): rotator writes `active: false` and logs **BENCHED**.
+3. `_find_replacement` walks `AGENT_VARIANTS[benched_name]` and **PROMOTED** the first variant that is missing from summary or `active: false`.
+4. After `BENCH_DAYS` (3), a benched name is **REACTIVATED** (`active: true`, `benched_at: null`).
+
+`improver_agent.py` is **not** on the scheduler. It writes markdown recs only. It **cannot** auto-apply these specs, retire a sleeve, or skip REACTIVATED.
+
+`StrategyLearner.get_agent_adjustment()` has **no callers**. Friday `learned_params.json` confidence deltas **do not** retune a new sleeve until Ops wires that hook. Specs must not assume Friday learn will raise/lower a new agent’s bar.
+
+---
+
+## Historical blinds (inventory, not a second loop)
+
+| Blind | Code today |
+|---|---|
+| Ensemble ignored benches | `ensemble._load_benched_agent_names` skips `active: false` — assume this holds |
+| MetaAgent weights stuck at 1.0 | Weights from ledger 20d closed P&amp;L when enough trades exist; else `DEFAULT_WEIGHTS` |
+| Improver human-only | Still true. Promotion path = **rotator only** |
+| Friday params unused | Still true. Do not spec learner-driven retune |
 
 ---
 
 ## Sleeve lifecycle (not always-on)
 
 ```
-cold (active: false)  →  rotator PROMOTES when a failing
-                         sibling is BENCHED
-                      →  live (generate_signals runs)
-                      →  MetaAgent weights from ledger
-                         + regime boost/penalty
-                      →  KEEP | BENCH (3d rest) | DISABLE (until Ops)
+ship cold (active: false)
+    → FLAG on a bleeder (evaluator)
+    → BENCHED bleeder (rotator)
+    → PROMOTED this sleeve (AGENT_VARIANTS first hit)
+    → live: generate_signals + MetaAgent weight/regime
+    → if this sleeve is later FLAG'd: BENCHED (3d) then REACTIVATED
 ```
 
-1. **Ship cold.** New `name` is instantiated in `Ensemble.agents` so promotion does not require a code deploy, but `agent_summary.json` starts `active: false`. It must **not** emit on day one beside Technical/OptionsFlow at weight 1.0.
-2. **Rotate in** only when the rotator benches a listed sibling (`AGENT_VARIANTS`). That is the “failing sleeve” trigger.
-3. **Regime mute** even while live: `regime_affinity` / `regime_aversion` on every signal. MetaAgent boosts intersection with `RegimeDetector`, multiplies weight by `(1 - REGIME_PENALTY)` on aversion. Wrong-regime → no fills, not “equal say.”
-4. **Performance mute:** after `MIN_TRADES_TO_EVALUATE` (10) closed attributed trades, evaluator flags → rotator BENCH or Improver DISABLE per that spec’s table. Unproven sleeves stay at `MIN_AGENT_WEIGHT` (not 1.0) until 10 closed trades.
-5. **DISABLE ≠ 3-day bench.** Today `BENCH_DAYS = 3` then auto-REACTIVATE. Kill/DISABLE must set a non-expiring bench (Improver already documents `benched_at: "2099-01-01T00:00:00+00:00"`) so the sleeve cannot sneak back as equal-weight.
+1. **Ship cold.** Name is in `Ensemble.agents` so a promote does not need a second deploy, but `agent_summary.json` starts `active: false` so ticks skip it. Not equal-weight on day one.
+2. **PROMOTED only** when rotator **BENCHED** a listed sibling. That is the only on-ramp.
+3. **Regime while live:** `regime_affinity` / `regime_aversion` on every signal. MetaAgent boosts intersection with `RegimeDetector`, applies `REGIME_PENALTY` on aversion. Wrong regime → mute via weight/empty signals, not a fake rotator event.
+4. **After 3 days** the **BENCHED bleeder is REACTIVATED**. Both may then run unless the bleeder is FLAG'd again. Specs must not invent a permanent-off flag; that is not in the rotator.
+5. **PROTECTED** names are never BENCHED. FLAG on them logs “reducing weight instead of benching.” A sleeve that only lists a PROTECTED parent in `AGENT_VARIANTS` will **never** be PROMOTED.
 
 ---
 
-## KEEP / BENCH / DISABLE (shared language)
+## FLAG / BENCHED / PROMOTED / REACTIVATED
 
-Use **broker** for money, **ledger** for attribution (`report_data.py`). Windows match evaluator: 5d / 20d.
-
-| Verdict | Who writes state | Meaning |
+| Event | Who | Meaning for A/B/C |
 |---|---|---|
-| **KEEP** | none (stay `active: true`) | Sleeve beat SPY **and** beat the replaced sibling on the spec’s clock |
-| **BENCH** | `agent_rotator` (3 days) | Underperform flag, rest, then eligible to rotate in again |
-| **DISABLE** | Improver / explicit summary flag | Kill criteria hit. Not a candidate in `_find_replacement`. Ops must re-enable |
+| **FLAG** | `agent_evaluator` | Underperform vs ensemble 20d. Numeric FLAG math is existing code; **new-sleeve kill numbers vs SPY are TODO** until Ops daily scorecard |
+| **BENCHED** | `agent_rotator` | `active: false` for 3 days. If this was the bleeder, replacement may be PROMOTED in the same cycle |
+| **PROMOTED** | `agent_rotator` | Cold sleeve `active: true`. First inactive `AGENT_VARIANTS` entry |
+| **REACTIVATED** | `agent_rotator` | Bench expired. Bleeder or sleeve returns to the tick |
 
-Win rate is **not** a KEEP/DISABLE input (tight 4% stops → low WR can still have expectancy).
+Qualitative stay-active vs FLAG (no KEEP/DISABLE): see each spec vs **SPY** and **regime**. Numeric thresholds = **TODO (Ops daily scorecard)**.
+
+Win rate is not a FLAG input for these specs (4% stop cap → low WR can still have expectancy). Evaluator already uses P&amp;L.
 
 ---
 
-## MetaAgent / rotator wiring (all new names)
+## Wiring every new name (when an implementation PR exists — not this HOLD PR)
 
 | Hook | Required |
 |---|---|
-| `Ensemble.agents` | Present but **cold** |
+| `Ensemble.agents` | Present, **cold** |
 | `agent_summary.json` | `{ "active": false }` at ship |
-| `AGENT_VARIANTS` | Listed as **replacement** of a bleeder, not as a peer that is always preferred |
-| `DEFAULT_WEIGHTS` | Key exists so ledger P&L is counted; **initial live weight = MIN_AGENT_WEIGHT** until 10 closed trades |
-| `PROTECTED_AGENTS` | **Do not** add A/B/C names |
-| `regime_affinity` / `regime_aversion` | Required on every signal |
-| Friday learner | May nudge `confidence_threshold_delta` only; **must not** enable the sleeve, lift `block_shorts`, or raise daily cap |
-| Options variants (later) | Same cold → promote → KEEP/DISABLE. Not in A/B/C |
+| `AGENT_VARIANTS` | **First** substitute of a **non-PROTECTED** bleeder |
+| `DEFAULT_WEIGHTS` | Key so ledger P&amp;L can attribute; do not count on 1.0 forever |
+| `PROTECTED_AGENTS` | Do **not** add A/B/C names |
+| `regime_affinity` / `aversion` | On every signal |
+| Friday learner | **Unused** for retune until `get_agent_adjustment` is wired |
+| Improver | Advisory markdown only — not a promotion path |
 
-`_find_replacement` already prefers variants with `active: false`. That is the promotion path. Do **not** list bleeders as variants *of* the new sleeve in a way that a later bench of A re-promotes Technical (rotator v1.4 newly_benched guard helps; still do not put Technical first on A’s variant list).
+`_find_replacement` prefers variants with `active: false`. Do not list the bleeder as first variant **of** the new sleeve (v1.4 `newly_benched` helps; still don’t resurrect Technical as A’s substitute).
+
+Later options variants (Ops D, paused) would use this same FLAG/BENCHED/PROMOTED path. Not specified here.
