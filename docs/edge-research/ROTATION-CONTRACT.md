@@ -64,15 +64,23 @@ Qualitative stay-active vs FLAG (no KEEP/DISABLE): see each spec vs **SPY**, vs 
 
 ### Day-1 scorecard footnote (2026-09-11) — NOT LOCKED
 
-Ops authorized citing the first paper scorecard as **context only**. **Do not lock** A/B/C kill math until several more market days (Learning Loop: revisit after ≥5 sessions). **Do not** derive FLAG / BENCHED / PROMOTE thresholds from this print.
+Ops first paper scorecard, **context only**. **Do not lock** A/B/C kill math until several more market days (revisit after ≥5 sessions). **Do not** derive FLAG / BENCHED / PROMOTE thresholds from this print.
+
+**Book (footnote, not FLAG math):** equity **$82,288**, day **+0.78%**. Naked **0**, ghosts **0**.
+
+**Bot vs SPY (footnote, not FLAG math):** 1d edge **−0.07%** | 5d **−1.83% vs −1.15%** | 20d **−6.92% vs −1.75%** | since **−17.71% vs +3.30%**.
+
+**Today’s rotator events:** FLAG / BENCHED / PROMOTED / REACTIVATED = **all none**. `MomentumAgent` is already `status=benched` in the roster — **not a today event**. Do **not** use that as an A/B/C kill or promote parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation.
+
+**Agents (weight / P&L) — $0 is not a kill sample:** Technical 1.00 $0 | News 0.40 $0 | Sentiment 0.40 $0 | Momentum benched 0.40 $0 | Breakout 0.40 $0 | BearishPattern 0.40 $0 | ShortMomentum 0.40 $0 | Earnings 0.40 $0 | Macro 0.40 $0 | Premarket 1.15 $0 | SectorRotation 0.40 $0 | OptionsFlow 0.40 $0 | Volatility 0.40 $0 | Intermarket 0.40 $0 | Movers 1.00 $0 | MeanReversion 0.40 $0 | CryptoAgent active@0.40 **gated off** (no crypto edges) | AlpacaSurgeDetector 1.00 **−$41**.
 
 | Day-1 fact | What it is **not** |
 |---|---|
-| Book vs SPY: since-start edge **−21.02%**, 20d **−5.17%**, 1d **−0.07%**; equity ~$82,288 (+0.78% day); naked 0 / ghosts 0 | **Not** A/B/C FLAG math. Ensemble context footnote only. Session was 71 ticks, Entries 0, almost all agent P&L $0 — too thin to set 20d-edge or drawdown cutoffs |
-| `MomentumAgent` **BENCHED** (Ops); FLAG/BENCHED/PROMOTED/REACTIVATED otherwise mostly empty | **Not** an A/B/C kill or promote parent. Rotator **persistence evidence** only. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation |
-| `PremarketAgent` weight **1.15**, Entries **0** | **Not** Spec C evidence. Weight↑ with zero fills is not a quality FLAG yet |
-| `BearishPatternAgent` + `ShortMomentumAgent` still active @ **0.40**; no FLAG on shorts | **Not** Spec B kill math. Day-1 had **no short FLAGs** |
-| `VolatilityAgent` + `MoversAgent` on roster | **Not** a B promote. Roster presence only; B still ships cold, seeded `{ "active": false }` |
+| Thin session: ticks **71/~390**, sys err **0**, fetch/404 **126**, entries **0**, peak raw **115** | Too thin to set 20d-edge or drawdown cutoffs |
+| Many `MetaAgent(…)` compound rows weight 1.00 / $0 | **Attribution gap**, not A/B/C FLAG math |
+| Premarket **1.15 / $0**, entries **0** | **Not** Spec C evidence (not a quality FLAG, not a promote) |
+| Volatility **0.40** + Movers **1.00** on roster, both $0 | **Not** a B **PROMOTE**. Roster presence only; B still ships cold, seeded `{ "active": false }` |
+| BearishPattern + ShortMomentum **0.40 / $0**; today short FLAGs = none | **Not** Spec B kill math |
 
 Paper-only. No crypto edges.
 

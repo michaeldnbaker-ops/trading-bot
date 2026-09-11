@@ -126,7 +126,7 @@ Clock: first paper short fill after **PROMOTED**. Score **BEAR/HIGH_VOL sessions
 
 Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 
-> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** No short **FLAG**s yet. `BearishPatternAgent` + `ShortMomentumAgent` still active @ 0.40 is **not** B kill math. `VolatilityAgent` + `MoversAgent` on the roster is **presence only**, not a B **PROMOTE**. B still ships cold, seeded `{ "active": false }`. Book vs SPY (−21.02% / −5.17% 20d) is ensemble context, not a short-sleeve cutoff. `MomentumAgent` **BENCHED** is not a B parent or kill. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Today short FLAGs = **none**. BearishPattern + ShortMomentum **0.40 / $0** is **not** B kill math. Volatility **0.40** + Movers **1.00** on roster is **presence only**, not a B **PROMOTE**. B still ships cold, seeded `{ "active": false }`. Bot vs SPY (1d −0.07% | 5d −1.83% vs −1.15% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%) is ensemble context, not a short-sleeve cutoff. `MomentumAgent` already benched is **not a today event** and not a B parent. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 

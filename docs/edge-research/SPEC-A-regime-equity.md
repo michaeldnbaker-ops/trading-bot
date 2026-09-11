@@ -124,7 +124,7 @@ Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = at
 
 Do not treat “ensemble got quieter” as success vs SPY.
 
-> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Book vs SPY (−21.02% since start, −5.17% 20d) is **ensemble context only**, not A FLAG math (71 ticks, Entries 0, almost all agent P&L $0). `MomentumAgent` **BENCHED** is rotator **persistence evidence**, not an A kill or a new promote parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Book: equity $82,288, day +0.78%. Bot vs SPY 1d edge −0.07% | 5d −1.83% vs −1.15% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%. **Ensemble context only**, not A FLAG math (ticks 71/~390, entries 0, almost all agent P&L $0; MetaAgent compound rows 1.00/$0 = attribution gap). Today FLAG/BENCHED/PROMOTED/REACTIVATED = **none**. `MomentumAgent` already `status=benched` is **not a today event** and not an A kill or new parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 

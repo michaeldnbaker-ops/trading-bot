@@ -93,7 +93,7 @@ Still **PROTECTED**. Still **FLAG**-able. Still **cannot** be BENCHED.
 
 **Cannot BENCH.** Improver cannot retire News or skip REACTIVATED.
 
-> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** `PremarketAgent` weight **1.15** with **Entries 0** is **not** Spec C evidence yet (not a quality FLAG, not a promote). Book vs SPY (−21.02% / −5.17% 20d) is ensemble context only. `MomentumAgent` **BENCHED** is rotator persistence, not a C parent. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Premarket **1.15 / $0** with **entries 0** is **not** Spec C evidence (not a quality FLAG, not a promote). Bot vs SPY (1d −0.07% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%) is ensemble context only. Today rotator events = **none**. `MomentumAgent` already benched is not a C parent. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 

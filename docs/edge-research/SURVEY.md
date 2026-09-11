@@ -119,6 +119,6 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 - Do not lift `block_shorts`.
 - Do not add options strategies until Ops D is lifted.
 - Do not touch `crypto_scheduler.py` / `CryptoAgent` except to keep them **out** of the equity bot.
-- Vs SPY: `report_data` 20d `edge`. Qualitative FLAG vs stay-active (vs SPY / vs BENCHED sibling / vs regime) in SPEC-A/B/C. **Numeric kill boxes stay TODO.** Day-1 print (−21.02% since start, −5.17% 20d) is ensemble context only — not locked FLAG math.
+- Vs SPY: `report_data` 20d `edge`. Qualitative FLAG vs stay-active (vs SPY / vs BENCHED sibling / vs regime) in SPEC-A/B/C. **Numeric kill boxes stay TODO.** Day-1 bot vs SPY (1d −0.07% | 5d −1.83% vs −1.15% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%) is ensemble context only — not locked FLAG math.
 - Vs existing agents: overlap vs the **BENCHED** sibling.
 - New names **must be seeded** in `agent_summary.json` `{ "active": false }` or they never **PROMOTE** (Ops PR #3). This PR is **docs only**.
