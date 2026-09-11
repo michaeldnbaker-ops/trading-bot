@@ -98,7 +98,7 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 
 **Forbidden (Ops E):** crypto edges; wiring CryptoAgent into the equity ensemble.
 
-**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First seeded `{ "active": false }` variant only — missing-from-summary is **not** a promote (Ops PR #3). A owns OptionsFlow; Technical is A then B; B on-ramps = Volatility + Movers (empty reserved; Ops PR #3 will not steal them). Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First seeded `{ "active": false }` variant only — missing-from-summary is **not** a promote (Ops PR #3). A owns OptionsFlow; Technical is A then B; B on-ramps = Volatility + Movers (empty reserved; Ops PR #3 will not steal them). Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO**. Day-1 scorecard (2026-09-11) is a **NOT LOCKED** footnote — do not invent cutoffs from it. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
@@ -119,6 +119,6 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 - Do not lift `block_shorts`.
 - Do not add options strategies until Ops D is lifted.
 - Do not touch `crypto_scheduler.py` / `CryptoAgent` except to keep them **out** of the equity bot.
-- Vs SPY: `report_data` 20d `edge`. Qualitative FLAG/promote rules in SPEC-A/B/C; **numeric kill TODOs** pending scorecard.
+- Vs SPY: `report_data` 20d `edge`. Qualitative FLAG vs stay-active (vs SPY / vs BENCHED sibling / vs regime) in SPEC-A/B/C. **Numeric kill boxes stay TODO.** Day-1 print (−21.02% since start, −5.17% 20d) is ensemble context only — not locked FLAG math.
 - Vs existing agents: overlap vs the **BENCHED** sibling.
 - New names **must be seeded** in `agent_summary.json` `{ "active": false }` or they never **PROMOTE** (Ops PR #3). This PR is **docs only**.

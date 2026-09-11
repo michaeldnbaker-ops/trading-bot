@@ -55,12 +55,26 @@ ship cold (active: false)
 
 | Event | Who | Meaning for A/B/C |
 |---|---|---|
-| **FLAG** | `agent_evaluator` | Underperform vs ensemble 20d. Numeric FLAG math is existing code; **new-sleeve kill numbers vs SPY are TODO** until Ops daily scorecard |
+| **FLAG** | `agent_evaluator` | Underperform vs ensemble 20d. Numeric FLAG math is existing code; **new-sleeve kill numbers vs SPY stay TODO** |
 | **BENCHED** | `agent_rotator` | `active: false` for 3 days. If this was the bleeder, replacement may be PROMOTED in the same cycle |
 | **PROMOTED** | `agent_rotator` | Cold sleeve flipped `active: true`. **Only the first seeded `active: false`** `AGENT_VARIANTS` entry. Missing-from-summary ≠ eligible |
 | **REACTIVATED** | `agent_rotator` | Bench expired after 3 days. Bleeder returns. Expected; not a failed replacement |
 
-Qualitative stay-active vs FLAG (no KEEP/DISABLE): see each spec vs **SPY** and **regime**. Numeric thresholds = **TODO (Ops daily scorecard)**.
+Qualitative stay-active vs FLAG (no KEEP/DISABLE): see each spec vs **SPY**, vs the **BENCHED** sibling, and vs **regime**. **Numeric kill boxes = TODO.** Do not invent cutoffs from one scorecard session.
+
+### Day-1 scorecard footnote (2026-09-11) — NOT LOCKED
+
+Ops authorized citing the first paper scorecard as **context only**. **Do not lock** A/B/C kill math until several more market days (Learning Loop: revisit after ≥5 sessions). **Do not** derive FLAG / BENCHED / PROMOTE thresholds from this print.
+
+| Day-1 fact | What it is **not** |
+|---|---|
+| Book vs SPY: since-start edge **−21.02%**, 20d **−5.17%**, 1d **−0.07%**; equity ~$82,288 (+0.78% day); naked 0 / ghosts 0 | **Not** A/B/C FLAG math. Ensemble context footnote only. Session was 71 ticks, Entries 0, almost all agent P&L $0 — too thin to set 20d-edge or drawdown cutoffs |
+| `MomentumAgent` **BENCHED** (Ops); FLAG/BENCHED/PROMOTED/REACTIVATED otherwise mostly empty | **Not** an A/B/C kill or promote parent. Rotator **persistence evidence** only. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation |
+| `PremarketAgent` weight **1.15**, Entries **0** | **Not** Spec C evidence. Weight↑ with zero fills is not a quality FLAG yet |
+| `BearishPatternAgent` + `ShortMomentumAgent` still active @ **0.40**; no FLAG on shorts | **Not** Spec B kill math. Day-1 had **no short FLAGs** |
+| `VolatilityAgent` + `MoversAgent` on roster | **Not** a B promote. Roster presence only; B still ships cold, seeded `{ "active": false }` |
+
+Paper-only. No crypto edges.
 
 Win rate is not a FLAG input for these specs (4% stop cap → low WR can still have expectancy). Evaluator already uses P&amp;L.
 

@@ -106,30 +106,31 @@ No new options exit rules. No share fallback from a failed option (this agent ne
 
 ---
 
-## FLAG vs remain-active (qualitative; numbers TODO)
+## FLAG vs remain-active (qualitative; numeric kill = TODO)
 
-Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = attribution. **Numeric kill thresholds = TODO pending Ops daily scorecard.**
+Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = attribution. **Numeric kill thresholds = TODO.** Do **not** invent 20d-edge, drawdown, or trade-count cutoffs from Day-1.
 
 **Remain active (no rotator event) when, qualitatively:**
 
 - Vs **SPY:** sleeve is not repeating “SPY up, book down.” In bull/neutral, attributed longs should not be the reason `report_data` 20d edge stays deeply negative. In BEAR/HIGH_VOL, if A still shorts, those shorts should not be the reason the book lags a falling SPY in the *wrong* direction (long into the dump).
-- Vs **existing agents:** attributed P&amp;L better than the **BENCHED** sibling over the same window; not a clone of Technical/OptionsFlow would-have signals; regime tags actually change side vs a no-regime Technical.
+- Vs **BENCHED sibling:** attributed P&amp;L better than the parent that was **BENCHED** to PROMOTE A over the same window; not a clone of Technical/OptionsFlow would-have signals; regime tags actually change side vs a no-regime Technical.
+- Vs **regime:** longs in BULL/NEUTRAL (not HIGH_VOL); silent on bull-tape shorts.
 
 **FLAG (evaluator → rotator may BENCHED A, then REACTIVATED after 3d) when, qualitatively:**
 
 - Vs **SPY:** sleeve is another always-on long book while SPY is down, or another bleeder while SPY is up.
-- Vs **agents:** worse than the sibling that was BENCHED to PROMOTE it, or same symbols/sessions as Technical 5m RSI / OptionsFlow P/C.
+- Vs **BENCHED sibling:** worse than the sibling that was BENCHED to PROMOTE it, or same symbols/sessions as Technical 5m RSI / OptionsFlow P/C.
 - Vs **regime:** any **short fill in BULL_TREND without HIGH_VOL** (gate bug — FLAG; do not “tune” via unused Friday deltas).
 
 Do not treat “ensemble got quieter” as success vs SPY.
 
-**TODO (scorecard):** concrete 20d edge vs SPY, overlap %, min closed trades for FLAG on this name. Until then, use existing evaluator FLAG math (ensemble-relative 20d P&amp;L) plus the qualitative tests above for Ops review.
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Book vs SPY (−21.02% since start, −5.17% 20d) is **ensemble context only**, not A FLAG math (71 ticks, Entries 0, almost all agent P&L $0). `MomentumAgent` **BENCHED** is rotator **persistence evidence**, not an A kill or a new promote parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
 ## How to measure vs SPY and vs existing agents
 
-**Vs SPY:** `report_data` 20d and since-start `edge`. Sleeve-level: sum attributed realized+unrealized / dollar-days risked vs buying SPY with the same 0.5% risk on entry days. Target: 20d edge ≥ 0 while SPY ≥ 0, or positive $ in SPY-down weeks.
+**Vs SPY:** `report_data` 20d and since-start `edge`. Sleeve-level: sum attributed realized+unrealized / dollar-days risked vs buying SPY with the same 0.5% risk on entry days. Pass/fail **numeric** vs SPY = **TODO** (not locked from Day-1). Qualitative: sleeve should not be the reason the book lags SPY in the wrong direction.
 
 **Vs bleeders:** 20d P&amp;L vs the sibling that was **BENCHED** to PROMOTE A. Must be better, not merely different.
 

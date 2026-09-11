@@ -8,7 +8,7 @@ This folder holds **research and specs**, not live trading code.
 
 **Ops lock (2026-09-11):** inventory and gap order below are authoritative. Do not add crypto edges. Do not add new options ideas until equity exits + scorecard are green.
 
-**Learning Loop lock:** A/B/C are **cold** sleeves **PROMOTED** only when a bleeder is **BENCHED**. Rotator words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. One first-slot owner per parent: Technical is A then B; OptionsFlow is A only; B on-ramps = Volatility + Movers (empty slots reserved; Ops PR #3 will not steal them). Cold names **must be seeded** `{ "active": false }` in `agent_summary.json` — missing-from-summary is not a promote (Ops PR #3 `_find_replacement`). 3-day **REACTIVATED** is expected. Improver cannot auto-apply. Friday learn does not retune until `get_agent_adjustment` is wired. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop lock:** A/B/C are **cold** sleeves **PROMOTED** only when a bleeder is **BENCHED**. Rotator words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. One first-slot owner per parent: Technical is A then B; OptionsFlow is A only; B on-ramps = Volatility + Movers (empty slots reserved; Ops PR #3 will not steal them). Cold names **must be seeded** `{ "active": false }` in `agent_summary.json` — missing-from-summary is not a promote (Ops PR #3 `_find_replacement`). 3-day **REACTIVATED** is expected. Numeric kill boxes = **TODO** (Day-1 scorecard is a **NOT LOCKED** footnote — do not invent cutoffs). Improver cannot auto-apply. Friday learn does not retune until `get_agent_adjustment` is wired. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ## Contents
 

@@ -65,33 +65,35 @@ Still **PROTECTED**. Still **FLAG**-able. Still **cannot** be BENCHED.
 
 ## 5. Qualitative kill / remain-active / FLAG (numeric TODO)
 
-**Kill** in this contract = **BENCHED** (Premarket family) or **FLAG without BENCH** (News). Thresholds **TODO**.
+**Kill** in this contract = **BENCHED** (Premarket family) or **FLAG without BENCH** (News). **Numeric boxes = TODO.** Do **not** invent ghost-rate, article-floor, or weight cutoffs from Day-1.
 
 ### PremarketAgent_strict
 
-**Remain active (do not BENCH) while:**
+**Remain active (do not BENCH) while, qualitatively:**
 
-- Ghost / bad-open **rate** is **better** than parent `PremarketAgent` in the same window (Ops scorecard).
-- Sleeve **does not uniquely** cause the book to **underperform SPY** on days Premarket is the ghost source.
-- In **BULL / SIDEWAYS**, opens that **survive the first print** are not systematically faded vs SPY.
+- Vs **BENCHED sibling:** ghost / bad-open **rate** is **better** than parent `PremarketAgent` in the same window.
+- Vs **SPY:** sleeve **does not uniquely** cause the book to **underperform SPY** on days Premarket is the ghost source.
+- Vs **regime:** in **BULL / SIDEWAYS**, opens that **survive the first print** are not systematically faded vs SPY.
 
-**FLAG when:**
+**FLAG when, qualitatively:**
 
 - Ghost / bad-open **rate** is **worse** than parent or book average (evaluator window).
-- Sleeve **P&L is negative** and **worse than book average** with enough trades (`agent_evaluator` — **20d / 20% / 10 trades** today).
+- Sleeve **P&L is negative** and **worse than book average** with enough trades (existing evaluator: 20d / 20% / ≥10 trades — **code today**, not a new Day-1 cutoff).
 
-**BENCH when:** FLAG **and** not PROTECTED — then **PROMOTED** next inactive variant if any; else empty roster slot until **REACTIVATED**.
+**BENCH when:** FLAG **and** not PROTECTED — then **PROMOTED** next seeded `active: false` variant if any; else empty roster slot until **REACTIVATED**.
 
 ### NewsAgent (in-place)
 
-**Remain as PROTECTED while:**
+**Remain as PROTECTED while, qualitatively:**
 
-- Quality patch **reduces** ghost rate vs pre-patch News (Ops).
+- Quality patch **reduces** ghost rate vs pre-patch News.
 - News is **not** the unique SPY-lag driver after the patch.
 
-**FLAG when:** ghost rate or P&L vs book still **worse than average** after the patch.
+**FLAG when, qualitatively:** ghost rate or P&L vs book still **worse than average** after the patch.
 
 **Cannot BENCH.** Improver cannot retire News or skip REACTIVATED.
+
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** `PremarketAgent` weight **1.15** with **Entries 0** is **not** Spec C evidence yet (not a quality FLAG, not a promote). Book vs SPY (−21.02% / −5.17% 20d) is ensemble context only. `MomentumAgent` **BENCHED** is rotator persistence, not a C parent. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 

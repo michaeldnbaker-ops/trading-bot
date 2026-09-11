@@ -108,28 +108,31 @@ Do **not** add options-manager rules here.
 
 ---
 
-## FLAG vs remain-active (qualitative; numbers TODO)
+## FLAG vs remain-active (qualitative; numeric kill = TODO)
 
-Clock: first paper short fill after **PROMOTED**. Score **BEAR/HIGH_VOL sessions** vs SPY. Do not require beating SPY CAGR over a bull year. **Numeric thresholds = TODO pending Ops daily scorecard.**
+Clock: first paper short fill after **PROMOTED**. Score **BEAR/HIGH_VOL sessions** vs SPY. Do not require beating SPY CAGR over a bull year. **Numeric thresholds = TODO.** Do **not** invent hedge-edge or drawdown cutoffs from Day-1.
 
 **Remain active when, qualitatively:**
 
 - Vs **SPY:** in BEAR/HIGH_VOL, sleeve $ should not be another long-book dump; shorts should hedge a down tape, not fight an up tape (and they should have **no fills** in pure BULL).
-- Vs **agents:** fade vs continuation (not the same names/days as ShortMomentum/BearishPattern breakdowns); names below SMA200, not Volatility overbought-above-200.
+- Vs **BENCHED sibling:** fade vs continuation (not the same names/days as ShortMomentum/BearishPattern breakdowns); names below SMA200, not Volatility overbought-above-200.
+- Vs **regime:** silent unless `BEAR_TREND` or `HIGH_VOL`.
 
 **FLAG (then rotator BENCHED → REACTIVATED) when, qualitatively:**
 
 - Vs **regime:** any short fill outside BEAR/HIGH_VOL.
 - Vs **SPY:** shorts lose while SPY is already down (failed hedge), or they are the only activity in a roaring bull (gate leak).
-- Vs **agents:** clone of PROTECTED shorts, or new options tickets while D is paused.
+- Vs **BENCHED sibling / agents:** clone of PROTECTED shorts, or new options tickets while D is paused.
 
 Zero fills in a bull tape = **not** a FLAG. That is the gate working.
+
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** No short **FLAG**s yet. `BearishPatternAgent` + `ShortMomentumAgent` still active @ 0.40 is **not** B kill math. `VolatilityAgent` + `MoversAgent` on the roster is **presence only**, not a B **PROMOTE**. B still ships cold, seeded `{ "active": false }`. Book vs SPY (−21.02% / −5.17% 20d) is ensemble context, not a short-sleeve cutoff. `MomentumAgent` **BENCHED** is not a B parent or kill. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
 ## How to measure vs SPY and vs existing agents
 
-**Vs SPY:** only score sessions tagged BEAR/HIGH_VOL. Sleeve contribution should be **positive** when SPY 20d is negative or flat. `report_data` full-period edge is context, not the pass/fail for this sleeve.
+**Vs SPY:** only score sessions tagged BEAR/HIGH_VOL. `report_data` full-period edge is context, not the pass/fail for this sleeve. **Numeric** hedge-edge vs SPY = **TODO** (not locked from Day-1). Qualitative: shorts should not be another long-book dump in a down tape.
 
 **Vs existing agents:**
 
