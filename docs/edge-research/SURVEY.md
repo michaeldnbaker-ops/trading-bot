@@ -90,15 +90,15 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 
 | # | Gap | Why this repo, not generic finance | Spec |
 |---|---|---|---|
-| **A** | Regime-aware **equity** L/S **PROMOTED** when a bleeder is **BENCHED** | Technical has **no** regime tags and is a named bleeder; OptionsFlow is a proxy bleeder with paper calls; Breakout / SectorRotation sit on bleeder↔bleeder `AGENT_VARIANTS`. MeanReversion is half-wired. Book ~−18% vs SPY | [SPEC-A](SPEC-A-regime-equity.md) |
-| **B** | Short/downside **PROMOTED** only after a non-PROTECTED short-capable bleeder is **BENCHED**; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). `short_research.py` inverse of the best long rule is unimplemented | [SPEC-B](SPEC-B-bear-shorts.md) |
+| **A** | Regime-aware **equity** L/S **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is **BENCHED** | Technical has **no** regime tags and is a named bleeder; OptionsFlow is a proxy bleeder with paper calls (**A owns this parent**; B does not share it). Breakout / SectorRotation sit on bleeder↔bleeder `AGENT_VARIANTS`. MeanReversion is half-wired. Book ~−18% vs SPY | [SPEC-A](SPEC-A-regime-equity.md) |
+| **B** | Short/downside **PROMOTED** from **VolatilityAgent / MoversAgent** (no variants today); **second** on Technical after A; **not** on OptionsFlow; live only in BEAR/HIGH_VOL | Gates already block bull-tape shorts. Dedicated shorts are two PROTECTED continuation agents (cannot BENCH them to promote B). `_find_replacement` promotes only the first inactive variant — A and B cannot both claim first slot | [SPEC-B](SPEC-B-bear-shorts.md) |
 | **C** | Premarket **strict** PROMOTED when Premarket is BENCHED; News quality in-place (PROTECTED → FLAG cannot BENCH) | Ghosts: Technical + News + Premarket. News keyword RSS; Premarket ±1.5% gaps. Catalyst boost rewards News+Premarket together | [SPEC-C](SPEC-C-news-premarket-quality.md) |
 
 **Paused (Ops D):** any new options product. Existing XLE/SBUX/F calls are exits/scorecard. Future options variants would use FLAG/BENCHED/PROMOTED — not specified here.
 
 **Forbidden (Ops E):** crypto edges; wiring CryptoAgent into the equity ensemble.
 
-**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop:** A/B/C ship **cold** and are **PROMOTED** only when `agent_rotator` **BENCHED** a sibling in `AGENT_VARIANTS`. First inactive variant only — A owns OptionsFlow; Technical is A then B; B’s clean on-ramps are Volatility + Movers. Words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. 3-day **REACTIVATED** is expected (replace is temporary unless FLAG fires again). Improver is **not** on the scheduler and cannot apply specs. Friday `get_agent_adjustment` is **unused** — do not assume learner retune. Numeric kill thresholds = **TODO** until Ops daily scorecard. Shared: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 
@@ -107,8 +107,8 @@ Almost every agent labels `instrument_type: options`. That is a **label**. Fills
 1. `MeanReversionAgent` missing from `DEFAULT_WEIGHTS` / `AGENT_VARIANTS`. New sleeves: both, start `active: false`.
 2. `get_agent_adjustment()` has no callers. Specs must not depend on Friday conf deltas.
 3. `performance_logger.ENSEMBLE_AGENTS` still five names — evaluator is ledger-backed.
-4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. A/B/C must be **first** substitute of a non-PROTECTED bleeder.
-5. `BENCH_DAYS = 3` then **REACTIVATED**. There is no permanent-off event in the rotator.
+4. Today `AGENT_VARIANTS` maps bleeders to **other bleeders**. Volatility / Movers have **no** keys. A and B **must not** both claim first slot: Technical → A then B; OptionsFlow → **A only**; B’s clean on-ramps = Volatility + Movers. Map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+5. `BENCH_DAYS = 3` then **REACTIVATED**. “Replace bleeders” is a **3-day window** unless **FLAG** fires again. Expected rotator behavior, not a reject. No permanent-off event.
 6. Improver writes `analysis/recommendations_*.md` only. Not a promotion path.
 
 ---

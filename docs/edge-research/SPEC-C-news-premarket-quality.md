@@ -23,7 +23,7 @@
 | **Roster name** | `PremarketAgent_strict` |
 | **`AGENT_VARIANTS` parent** | `"PremarketAgent": ["PremarketAgent_strict"]` |
 | **Promote-in** | When `PremarketAgent` is **BENCHED** |
-| **After 3 days** | Parent **REACTIVATED**. Both may run until next FLAG/BENCHED. |
+| **After 3 days** | Parent **REACTIVATED**. Both may run. Expected 3-day window, not a permanent replace. |
 | **`PROTECTED_AGENTS`** | **No** |
 
 ### 2.2 News — in-place (PROTECTED)
@@ -101,6 +101,7 @@ FLAG PremarketAgent (evaluator)
   → BENCHED 3 days
   → PROMOTED PremarketAgent_strict (first inactive AGENT_VARIANTS child)
   → after BENCH_DAYS: PremarketAgent REACTIVATED
+  (expected: parent returns; strict sleeve may stay active unless FLAG fires again)
 ```
 
 News: **no** this path.

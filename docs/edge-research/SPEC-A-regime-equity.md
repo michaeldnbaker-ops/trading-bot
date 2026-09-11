@@ -1,7 +1,7 @@
-# SPEC-A — Regime-aware equity long/short (replace bleeders)
+# SPEC-A — Regime-aware equity long/short (3-day BENCHED window)
 
 **Ops gap A (do first).** Paper Alpaca only. **Do not implement in this PR.**  
-**Not options. Not crypto.**
+**Not options. Not crypto.** “Replace bleeders” lasts `BENCH_DAYS = 3` then **REACTIVATED** — expected, not a reject.
 
 ---
 
@@ -17,9 +17,9 @@ Repo facts that match that diagnosis:
 - `SectorRotationAgent` longs leaders / shorts laggards with **no HIGH_VOL** affinity; its shorts are then crushed by the ensemble bear-gate or leak as lagging-sector longs in the wrong tape.
 - `MeanReversionAgent` is the one measured long add (PF ~1.67–1.68, 19/22 years) and is **half-wired** (not in `DEFAULT_WEIGHTS`).
 
-**Claim:** one **equity** regime switcher — long the in-repo dip rules in bull/neutral, short only in BEAR/HIGH_VOL if B is not shipped — is **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is **BENCHED**. Not a 17th always-on equal-weight voice.
+**Claim:** one **equity** regime switcher — long the in-repo dip rules in bull/neutral, short only in BEAR/HIGH_VOL if B is not shipped — is **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is **BENCHED**. A **owns OptionsFlow** (B does not share that parent). On Technical, A is **first** ordered variant, B is **second**. Not a 17th always-on equal-weight voice.
 
-Shared lifecycle: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Improver cannot apply this spec. Friday learn does not retune it until `get_agent_adjustment` is wired.
+Shared lifecycle and exclusive parent map: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Improver cannot apply this spec. Friday learn does not retune it until `get_agent_adjustment` is wired.
 
 **If both A and B ship:** A is **long-only** while live; B owns fade-rally shorts. Do not double-fire the same short rule.
 
@@ -52,18 +52,18 @@ Shared lifecycle: [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md). Improver cannot 
 
 **Default: cold.** `RegimeEquityAgent` is in `Ensemble.agents` and `DEFAULT_WEIGHTS` but `agent_summary.json` ships `{ "active": false }`. Ensemble skips it until **PROMOTED**.
 
-**PROMOTED in** — only `agent_rotator`, same cycle as **BENCHED** on a non-PROTECTED bleeder. First-choice `AGENT_VARIANTS` (replace today’s bleeder↔bleeder lists):
+**PROMOTED in** — only `agent_rotator`, same cycle as **BENCHED** on a non-PROTECTED bleeder. `_find_replacement` **PROMOTED** only the **first inactive** name in the parent’s list. A and B must not both sit first on the same parent (see contract ownership table).
 
-| Bleeder **BENCHED** (after evaluator **FLAG**) | **PROMOTED** (first inactive variant) |
+| Bleeder **BENCHED** (after evaluator **FLAG**) | Ordered `AGENT_VARIANTS` (first inactive is **PROMOTED**) |
 |---|---|
-| TechnicalAgent | **RegimeEquityAgent** (then MomentumAgent) |
-| OptionsFlowAgent | **RegimeEquityAgent** (then SentimentAgent) |
-| BreakoutAgent | **RegimeEquityAgent** (then MeanReversionAgent) |
-| SectorRotationAgent | **RegimeEquityAgent** |
+| TechnicalAgent | **RegimeEquityAgent (A), then ShortMeanReversionAgent (B)**, then Momentum / Breakout |
+| OptionsFlowAgent | **RegimeEquityAgent (A) only** as the new sleeve, then News / Sentiment. **B is not on this list.** |
+| BreakoutAgent | **RegimeEquityAgent (A)**, then Momentum / Technical |
+| SectorRotationAgent | **RegimeEquityAgent (A)**, then Premarket |
 
-Do **not** list Technical or OptionsFlow as substitutes *of* RegimeEquityAgent (v1.4 resurrection). PROTECTED agents are never BENCHED to make room for A.
+Do **not** list Technical or OptionsFlow as substitutes *of* RegimeEquityAgent (v1.4 resurrection). PROTECTED agents are never BENCHED to make room for A. Do **not** take VolatilityAgent or MoversAgent — those are **B’s** clean on-ramps.
 
-After `BENCH_DAYS` the bleeder is **REACTIVATED**. A may stay active; both can run until A is FLAG'd.
+After `BENCH_DAYS` the bleeder is **REACTIVATED**. A may stay active; both can run. That 3-day “replace” is **expected rotator behavior**, not a failed replacement. Permanent off requires another **FLAG** (then **BENCHED** again). If Technical **FLAG**s again while A is already active, the first inactive variant is **B**.
 
 **Regime while live (MetaAgent, every tick):**
 
@@ -102,7 +102,7 @@ No new options exit rules. No share fallback from a failed option (this agent ne
 - Dedup one position/symbol.
 - Bridge: equity sizing (`RISK_PER_TRADE_PCT` 0.5%), not the options contract sizer.
 - **Not PROTECTED.**
-- `DEFAULT_WEIGHTS` key for attribution. `AGENT_VARIANTS` as in the PROMOTED table.
+- `DEFAULT_WEIGHTS` key for attribution. `AGENT_VARIANTS` as in the PROMOTED table (A first on Technical and sole new name on OptionsFlow).
 
 ---
 
@@ -144,6 +144,7 @@ Do not treat “ensemble got quieter” as success vs SPY.
 - No live client. No crypto. No new options. **No strategy code in this PR.**
 - Do not raise `DAILY_TRADE_CAP`.
 - Do not list Technical as A’s first variant (REACTIVATED resurrection).
+- Do not take VolatilityAgent / MoversAgent first slots (B’s on-ramps).
 - Do not assume Friday learner retunes A.
 
 ---

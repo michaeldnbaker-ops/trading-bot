@@ -20,7 +20,7 @@ Same affinity, same aversion (`BULL_TREND`), same rotator variants of each other
 
 `short_research.py` already tested the **inverse of the best long rule** (`short_rally_downtrend`: `Close < SMA200` and RSI &gt; 60) and the short specialists’ docstrings quote that table. **No agent fires it.**
 
-**Claim:** a fade-rally-below-200 short that is **PROMOTED** when a **non-PROTECTED** short-capable bleeder is **BENCHED** — not a third always-on PROTECTED clone. Silent in bull. Improver cannot apply this. Friday learn does not retune it.
+**Claim:** a fade-rally-below-200 short that is **PROMOTED** when **VolatilityAgent** or **MoversAgent** is **BENCHED** (those keys have **no variants today** — B’s clean on-ramps). Second on **TechnicalAgent** after A. **Does not** list OptionsFlowAgent — A owns that parent as the long-regime replacement. Not a third always-on PROTECTED clone. Silent in bull. Improver cannot apply this. Friday learn does not retune it.
 
 If SPEC-A is also in the roster, A is long-only while live; **this name owns fade-rally shorts**.
 
@@ -59,16 +59,18 @@ Paper “put” language: if Ops later lifts D, a put **variant** would use the 
 
 PROTECTED shorts (**BearishPatternAgent**, **ShortMomentumAgent**) are **never BENCHED**. FLAG on them → rotator log “reducing weight instead of benching.” Listing B only as their variant would **never PROMOTE** B.
 
-**PROMOTED in** when rotator **BENCHED** a non-PROTECTED short-capable bleeder:
+**PROMOTED in** when rotator **BENCHED** a listed parent. `_find_replacement` takes the **first inactive** variant only — B must not share a first slot with A.
 
-| Bleeder **BENCHED** | **PROMOTED** |
-|---|---|
-| OptionsFlowAgent | **ShortMeanReversionAgent** |
-| TechnicalAgent | **ShortMeanReversionAgent** for the short hole (A is first for longs if both listed — put B **first** on Technical only if A is not shipping, else A first / B second) |
-| VolatilityAgent | **ShortMeanReversionAgent** |
-| MoversAgent | **ShortMeanReversionAgent** |
+| Bleeder **BENCHED** | Ordered `AGENT_VARIANTS` | Role |
+|---|---|---|
+| VolatilityAgent | **ShortMeanReversionAgent (B)** — **new key** (empty today) | **B clean on-ramp** |
+| MoversAgent | **ShortMeanReversionAgent (B)** — **new key** (empty today) | **B clean on-ramp** |
+| TechnicalAgent | RegimeEquityAgent **(A) first**, **then ShortMeanReversionAgent (B)**, then Momentum / Breakout | B only if A is already active or A is not in the roster |
+| OptionsFlowAgent | **Not B.** A owns this parent | Do **not** put B on this list |
 
-After **REACTIVATED** of that bleeder (3d), B may still be active. PROTECTED shorts stay on; MetaAgent may downweight them if 20d P&amp;L is bad.
+Do **not** list PROTECTED shorts (BearishPattern / ShortMomentum) as B’s promote parents — they are never **BENCHED**.
+
+After **REACTIVATED** of that bleeder (3d), B may still be active beside the returned parent. That is **expected**, not a reject. “Replace bleeders” lasts 3 days unless **FLAG** fires again. PROTECTED shorts stay on; MetaAgent may downweight them if 20d P&amp;L is bad.
 
 **Regime while live:**
 
@@ -98,7 +100,7 @@ Do **not** add options-manager rules here.
 - `regime_aversion = ["BULL_TREND"]`
 - `MIN_CONFIDENCE = 0.55`
 - Not PROTECTED.
-- `DEFAULT_WEIGHTS` key; `AGENT_VARIANTS` as in the PROMOTED table. Do **not** put Technical first on B’s own variant list.
+- `DEFAULT_WEIGHTS` key; `AGENT_VARIANTS` as in the PROMOTED table. **Do not** put B on OptionsFlow. **Do not** put B first on Technical if A ships. **Do not** put Technical first on B’s own variant list.
 - **Do not** emit `direction: long`.
 - **Do not** implement new put spreads while Ops D is paused.
 
@@ -133,7 +135,7 @@ Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 |---|---|---|
 | ShortMomentum / BearishPattern | Fade vs continuation; overlap &lt; 50% | Same names, same day, RSI &lt; 40 breakdowns |
 | VolatilityAgent shorts | ≥90% of trades have `px < sma200` | Shorting overbought names still above the 200-day |
-| Technical shorts | Technical should be benched under SPEC-A; if not, this agent must not be 5m RSI clones | Same 5m RSI shorts |
+| Technical shorts | Technical **REACTIVATED** after 3d (expected); B must not be 5m RSI clones while both run | Same 5m RSI shorts |
 | OptionsFlow / paper puts | No new options tickets from this `name` while D is paused | XLE/SBUX/F-style calls/puts attributed here |
 
 **Replay:** `short_research.py` `short_rally_downtrend` with production stop + **bear gate on**. Survivorship bias runs against shorts — a small positive is stronger evidence than the same number on longs.
@@ -145,6 +147,7 @@ Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 - Equity shorts on paper Alpaca. No live. No crypto. **No strategy code in this PR.**
 - No new options until Ops D is lifted.
 - Do not assume Friday learner retunes B.
+- Do not list OptionsFlowAgent as a B parent.
 - Do not change `SOLO_SHORT_CONFIDENCE` except via existing auto_tune.
 
 ---
