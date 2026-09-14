@@ -139,15 +139,92 @@ class ReporterLogParse(unittest.TestCase):
             "agent_activity": {},
             "shadow_pnl": dr._empty_pnl_summary(),
             "live_pnl": dr._empty_pnl_summary(),
+            "snapshot": {
+                "today": "2026-09-10",
+                "equity": 98765,
+                "prev_close": 100000,
+                "day_pnl": -1235,
+                "naked": ["AMD"],
+                "ghosts": [],
+                "windows": [
+                    {"label": "1-day", "bot_pct": -1.24, "spy_pct": 0.10, "edge": -1.34},
+                    {"label": "5-day", "bot_pct": -2.00, "spy_pct": 0.50, "edge": -2.50},
+                    {"label": "Since start", "bot_pct": -1.24, "spy_pct": 8.00, "edge": -9.24},
+                ],
+                "warnings": [],
+            },
+            "agent_roster": [
+                {"name": "NewsAgent", "status": "active", "weight": 1.00, "pnl": 210},
+                {"name": "MomentumAgent", "status": "benched", "weight": 0.15, "pnl": -80},
+                {"name": "EarningsAgent", "status": "active", "weight": 0.40, "pnl": 12},
+            ],
+            "flagged_today": ["MomentumAgent"],
+            "rotation_actions": {
+                "FLAG": ["MomentumAgent — 20d P&L below ensemble"],
+                "BENCHED": ["MomentumAgent"],
+                "PROMOTED": ["BreakoutAgent"],
+                "REACTIVATED": ["EarningsAgent"],
+            },
         }
-        with patch.object(reporter, "_format_intelligence_section",
-                          return_value="<p>snapshot</p>"):
-            html = reporter.format_email_html(data)
+        html = reporter.format_email_html(data)
         self.assertIn("PAPER TRADING", html)
         self.assertIn("not live", html.lower())
         self.assertIn("System errors: 1", html)
         self.assertIn("Entries today: 2", html)
         self.assertIn("Peak raw signals: 12", html)
+        self.assertIn("Bot vs SPY", html)
+        self.assertIn("Naked exits:", html)
+        self.assertIn("Weight", html)
+        self.assertIn("FLAG", html)
+        self.assertIn("BENCHED", html)
+        self.assertIn("PROMOTED", html)
+        self.assertIn("REACTIVATED", html)
+        self.assertIn("MomentumAgent", html)
+        self.assertIn("benched", html)
+        self.assertIn("active", html)
+        self.assertNotIn("Top 3 agents", html)
+        self.assertNotIn("Daily Report v2", html)
+        self.assertNotIn("v11", html.lower())
+
+    def test_scorecard_renders_evaluator_flags_without_rotation_log(self):
+        import daily_reporter as dr
+        actions = dr.scorecard_rotation_actions("2026-09-11", {
+            "flagged_today": ["BreakoutAgent", "TechnicalAgent"],
+        })
+        self.assertIn("BreakoutAgent", actions["FLAG"])
+        self.assertIn("TechnicalAgent", actions["FLAG"])
+        self.assertEqual(actions["BENCHED"], [])
+        self.assertEqual(actions["PROMOTED"], [])
+        self.assertEqual(actions["REACTIVATED"], [])
+
+    def test_subject_line_is_paper_scorecard(self):
+        import daily_reporter as dr
+        subj = dr.format_email_subject({
+            "today": "2026-09-11",
+            "equity": 98765.4,
+            "prev_close": 100000,
+        })
+        self.assertEqual(
+            subj,
+            "[PAPER] Market day — 2026-09-11 — equity $98,765 (day -1.23%)",
+        )
+
+    def test_kill_switch_and_holiday_skip_send(self):
+        import daily_reporter as dr
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        with patch.dict(os.environ, {"ENABLE_DAILY_EMAIL": "false"}, clear=False):
+            self.assertIn("ENABLE_DAILY_EMAIL=false", dr.skip_send_reason(send_now=True) or "")
+        saturday = datetime(2026, 9, 12, 16, 35, tzinfo=ET)
+        with patch.object(dr, "daily_email_enabled", return_value=True):
+            with patch.object(dr, "is_open_market_report_day", return_value=False):
+                self.assertIn("market closed", dr.skip_send_reason(send_now=True) or "")
+        self.assertIsNone(dr.skip_send_reason(send_now=False))
+        # holiday helper: Thanksgiving 2026 is a Thursday
+        turkey = datetime(2026, 11, 26, 16, 35, tzinfo=ET)
+        self.assertFalse(dr.is_open_market_report_day(turkey))
+        self.assertFalse(dr.is_open_market_report_day(saturday))
 
 
 class TrailQtyHelper(unittest.TestCase):
@@ -225,6 +302,73 @@ class EnsureExitsBackstop(unittest.TestCase):
         self.assertEqual(result["protected"], ["AMD"])
         self.assertEqual(result["still_naked"], [])
         self.assertEqual(len(client.submitted), 1)
+
+
+class SlackHardDisabled(unittest.TestCase):
+    """Slack outbound is a hard no-op — env/webhook cannot re-enable it."""
+
+    FAKE_HOOK = "https://hooks.slack.com/services/T00/B00/FAKE"
+
+    def test_helpers_never_http_post(self):
+        import slack_notify
+        self.assertFalse(slack_notify.ENABLE_SLACK_SUMMARY)
+        self.assertFalse(slack_notify.slack_outbound_enabled())
+        self.assertEqual(slack_notify.SLACK_WEBHOOK_URL, "")
+        with patch.dict(os.environ, {
+            "SLACK_WEBHOOK_URL": self.FAKE_HOOK,
+            "ENABLE_SLACK_SUMMARY": "true",
+        }):
+            with patch("urllib.request.urlopen") as urlopen:
+                with patch("urllib.request.Request") as req:
+                    ok = slack_notify.post_text(
+                        "CRITICAL: test", webhook_url=self.FAKE_HOOK)
+                    ok2 = slack_notify.post_webhook(
+                        self.FAKE_HOOK, {"text": "CRITICAL: test"})
+        self.assertFalse(ok)
+        self.assertFalse(ok2)
+        urlopen.assert_not_called()
+        req.assert_not_called()
+
+    def test_scheduler_summary_never_http_post(self):
+        import inspect
+        import market_scheduler as ms
+        self.assertFalse(ms.ENABLE_SLACK_SUMMARY)
+        self.assertEqual(ms.SLACK_WEBHOOK, "")
+        src = inspect.getsource(ms.post_daily_slack_summary)
+        self.assertNotIn("urlopen", src)
+        with patch.dict(os.environ, {
+            "SLACK_WEBHOOK_URL": self.FAKE_HOOK,
+            "ENABLE_SLACK_SUMMARY": "true",
+        }):
+            with patch("urllib.request.urlopen") as urlopen:
+                ms.post_daily_slack_summary()
+        urlopen.assert_not_called()
+
+    def test_health_critical_never_slacks(self):
+        import inspect
+        import health_check as hc
+        self.assertEqual(hc.SLACK_WEBHOOK, "")
+        src = inspect.getsource(hc.send_alert)
+        self.assertNotIn("urlopen", src)
+        with patch.dict(os.environ, {"SLACK_WEBHOOK_URL": self.FAKE_HOOK}):
+            with patch("urllib.request.urlopen") as urlopen:
+                with patch.object(hc, "GMAIL_ADDRESS", ""):
+                    with patch.object(hc, "GMAIL_APP_PW", ""):
+                        hc.send_alert(["CRITICAL: scheduler.log missing"])
+        urlopen.assert_not_called()
+
+    def test_health_critical_still_emails(self):
+        import health_check as hc
+        with patch.object(hc, "GMAIL_ADDRESS", "a@b.com"):
+            with patch.object(hc, "GMAIL_APP_PW", "pw"):
+                with patch.object(hc, "REPORT_TO_EMAIL", "a@b.com"):
+                    with patch("urllib.request.urlopen") as urlopen:
+                        with patch("health_check.smtplib.SMTP_SSL") as smtp:
+                            client = smtp.return_value.__enter__.return_value
+                            hc.send_alert(["CRITICAL: bot dead"])
+        urlopen.assert_not_called()
+        smtp.assert_called()
+        client.sendmail.assert_called()
 
 
 if __name__ == "__main__":
