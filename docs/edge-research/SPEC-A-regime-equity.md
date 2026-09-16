@@ -1,5 +1,7 @@
 # SPEC-A — Regime-aware equity long/short (3-day BENCHED window)
 
+**CoS / Learning Loop lock (2026-09-16): single focus.** Validation design + kill criteria live in [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md). Spec B is **PARKED** (do not PROMOTE B). Spec C is **quality-filter-only, not alpha**. Day-1 (2026-09-11) is **NOT LOCKED**. ≥5-day healthy-scorecard clock **restarts 2026-09-16** (Sep 14–15 gap days, no backfill).
+
 **Ops gap A (do first).** Paper Alpaca only. **Do not implement in this PR.**  
 **Not options. Not crypto.** “Replace bleeders” lasts `BENCH_DAYS = 3` then **REACTIVATED** — expected, not a reject.
 
@@ -108,7 +110,9 @@ No new options exit rules. No share fallback from a failed option (this agent ne
 
 ## FLAG vs remain-active (qualitative; numeric kill = TODO)
 
-Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = attribution. **Numeric kill thresholds = TODO.** Do **not** invent 20d-edge, drawdown, or trade-count cutoffs from Day-1.
+**Authoritative kill structure:** [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md) (primary = expectancy after costs; vs SPY secondary; boxes TODO until ≥5 healthy days from **2026-09-16**).
+
+Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = attribution. **Numeric kill thresholds = TODO.** Do **not** invent 20d-edge, drawdown, or trade-count cutoffs from Day-1 (NOT LOCKED) or from Sep 14–15 gap days.
 
 **Remain active (no rotator event) when, qualitatively:**
 
@@ -124,7 +128,7 @@ Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = at
 
 Do not treat “ensemble got quieter” as success vs SPY.
 
-> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Book: equity $82,288, day +0.78%. Bot vs SPY 1d edge −0.07% | 5d −1.83% vs −1.15% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%. **Ensemble context only**, not A FLAG math (ticks 71/~390, entries 0, almost all agent P&L $0; MetaAgent compound rows 1.00/$0 = attribution gap). Today FLAG/BENCHED/PROMOTED/REACTIVATED = **none**. `MomentumAgent` already `status=benched` is **not a today event** and not an A kill or new parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Book: equity $82,288, day +0.78%. Bot vs SPY 1d edge −0.07% | 5d −1.83% vs −1.15% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%. **Ensemble context only**, not A FLAG math (ticks 71/~390, entries 0, almost all agent P&L $0; MetaAgent compound rows 1.00/$0 = attribution gap). Today FLAG/BENCHED/PROMOTED/REACTIVATED = **none**. `MomentumAgent` already `status=benched` is **not a today event** and not an A kill or new parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation. **≥5-day clock restarts 2026-09-16** (scorecard email restored; Sep 14–15 gap, no backfill). See [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md) and [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ---
 

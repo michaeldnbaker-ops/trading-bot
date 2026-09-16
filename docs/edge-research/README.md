@@ -8,7 +8,7 @@ This folder holds **research and specs**, not live trading code.
 
 **Ops lock (2026-09-11):** inventory and gap order below are authoritative. Do not add crypto edges. Do not add new options ideas until equity exits + scorecard are green.
 
-**Learning Loop lock:** A/B/C are **cold** sleeves **PROMOTED** only when a bleeder is **BENCHED**. Rotator words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. One first-slot owner per parent: Technical is A then B; OptionsFlow is A only; B on-ramps = Volatility + Movers (empty slots reserved; Ops PR #3 will not steal them). Cold names **must be seeded** `{ "active": false }` in `agent_summary.json` — missing-from-summary is not a promote (Ops PR #3 `_find_replacement`). 3-day **REACTIVATED** is expected. Numeric kill boxes = **TODO** (Day-1 scorecard is a **NOT LOCKED** footnote — do not invent cutoffs). Improver cannot auto-apply. Friday learn does not retune until `get_agent_adjustment` is wired. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+**Learning Loop lock (2026-09-16):** **Single focus = Spec A** RegimeEquity **validation design + kill criteria** ([SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md)). Spec B implementation is **PARKED** — do **not** PROMOTE B. Spec C is **quality-filter-only, not alpha**. Day-1 scorecard (2026-09-11) is **NOT LOCKED**. Scorecard email restored **2026-09-16**; Sep 14–15 are **gap days (no backfill)**; ≥5-day healthy-scorecard clock **restarts 2026-09-16**. Handoff to Learning Loop only after ≥5 healthy scorecard days. Seed `agent_summary.json` `{ "active": false }` **before** PROMOTE — no cold PROMOTE. Rotator words: FLAG / BENCHED / PROMOTED / REACTIVATED — not KEEP/DISABLE. Parents while B is parked: Technical is **A first**; OptionsFlow is **A only**. Numeric kill boxes = **TODO** until ≥5 healthy days. Improver cannot auto-apply. Friday learn does not retune until `get_agent_adjustment` is wired. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
 
 ## Contents
 
@@ -17,8 +17,9 @@ This folder holds **research and specs**, not live trading code.
 | [SURVEY.md](SURVEY.md) | — | Confirmed roster vs `ensemble.py`, measurement loop, Ops book notes |
 | [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md) | — | FLAG → BENCHED → PROMOTED / REACTIVATED; exclusive A/B `AGENT_VARIANTS` parents |
 | [SPEC-A-regime-equity.md](SPEC-A-regime-equity.md) | **A** | Regime-aware equity L/S **PROMOTED** when Technical / OptionsFlow / Breakout / SectorRotation is BENCHED (A first on Technical; sole new name on OptionsFlow) |
-| [SPEC-B-bear-shorts.md](SPEC-B-bear-shorts.md) | **B** | Fade-rally short, **BEAR/HIGH_VOL only**; **PROMOTED** from Volatility / Movers (empty reserved); second on Technical after A; not on OptionsFlow |
-| [SPEC-C-news-premarket-quality.md](SPEC-C-news-premarket-quality.md) | **C** | Premarket strict **PROMOTED** when Premarket is BENCHED; News in-place (PROTECTED) |
+| [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md) | **A** | **Focus (2026-09-16):** mini → purged walk-forward → locked OOS → paper envelope → seed `{active:false}` → PROMOTE; kill structure with TODO boxes |
+| [SPEC-B-bear-shorts.md](SPEC-B-bear-shorts.md) | **B PARKED** | Fade-rally short — **implementation frozen**; do **not** PROMOTE B |
+| [SPEC-C-news-premarket-quality.md](SPEC-C-news-premarket-quality.md) | **C quality-filter-only** | Premarket / News = **quality filter, not alpha**; implementation frozen |
 
 ## Explicitly out of scope
 

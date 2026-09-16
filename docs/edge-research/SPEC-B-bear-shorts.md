@@ -1,6 +1,8 @@
 # SPEC-B — BEAR/HIGH_VOL short (equity downside)
 
-**Ops gap B (after A).** Paper Alpaca only. **Do not implement in this PR.**  
+**Status: PARKED (2026-09-16 CoS / Learning Loop lock).** Implementation **frozen**. Do **not** code B. Do **not** PROMOTE B. Single research focus is Spec A RegimeEquity validation + kill criteria — [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md). Technical stays **A first**; OptionsFlow stays **A only**. Volatility / Movers `[]` stay empty.
+
+**Ops gap B (after A) — parked.** Paper Alpaca only. **Do not implement in this PR.**  
 **Not a new options product.** Ops D pauses new options ideas until equity exits + scorecard are green. “Puts” here means **downside expression**; v1 is **equity short**. Existing `options_executor` may still wrap a high-confidence short as a paper put — do not design a new put structure in this spec.
 
 **No crypto.**
@@ -126,7 +128,7 @@ Clock: first paper short fill after **PROMOTED**. Score **BEAR/HIGH_VOL sessions
 
 Zero fills in a bull tape = **not** a FLAG. That is the gate working.
 
-> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Today short FLAGs = **none**. BearishPattern + ShortMomentum **0.40 / $0** is **not** B kill math. Volatility **0.40** + Movers **1.00** on roster is **presence only**, not a B **PROMOTE**. B still ships cold, seeded `{ "active": false }`. Bot vs SPY (1d −0.07% | 5d −1.83% vs −1.15% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%) is ensemble context, not a short-sleeve cutoff. `MomentumAgent` already benched is **not a today event** and not a B parent. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+> **Day-1 footnote (2026-09-11) — NOT LOCKED.** Today short FLAGs = **none**. BearishPattern + ShortMomentum **0.40 / $0** is **not** B kill math. Volatility **0.40** + Movers **1.00** on roster is **presence only**, not a B **PROMOTE**. **B is PARKED (2026-09-16) — do not PROMOTE.** ≥5-day clock restarts 2026-09-16 (Sep 14–15 gap, no backfill). See [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md).
 
 ---
 

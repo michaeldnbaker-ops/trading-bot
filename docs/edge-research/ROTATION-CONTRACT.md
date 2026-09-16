@@ -2,6 +2,8 @@
 
 **Applies to specs A, B, and C.** Docs-only / research HOLD. Paper Alpaca only. No crypto. No strategy implementation.
 
+**CoS / Learning Loop lock (2026-09-16):** Spec B implementation **PARKED** (do not PROMOTE B). Spec C is **quality-filter-only, not alpha**. Single focus = Spec A validation + kill — [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md). Day-1 (2026-09-11) **NOT LOCKED**. ≥5-day clock **restarts 2026-09-16** (scorecard email restored; Sep 14–15 gap days, no backfill). Seed `{ "active": false }` before PROMOTE; no cold PROMOTE.
+
 Rotator vocabulary is the **only** state language these specs use: **FLAG** → **BENCHED** → **PROMOTED** / **REACTIVATED**. Do not use KEEP / DISABLE.
 
 ---
@@ -64,7 +66,7 @@ Qualitative stay-active vs FLAG (no KEEP/DISABLE): see each spec vs **SPY**, vs 
 
 ### Day-1 scorecard footnote (2026-09-11) — NOT LOCKED
 
-Ops first paper scorecard, **context only**. **Do not lock** A/B/C kill math until several more market days (revisit after ≥5 sessions). **Do not** derive FLAG / BENCHED / PROMOTE thresholds from this print.
+Ops first paper scorecard, **context only**. **Do not lock** A/B/C kill math from this print. **≥5-day healthy-scorecard clock restarts 2026-09-16** (email restored). **Sep 14–15 are gap days — no backfill, do not count.** Revisit numeric boxes only after ≥5 **healthy** sessions from that restart. **Do not** derive FLAG / BENCHED / PROMOTE thresholds from Day-1.
 
 **Book (footnote, not FLAG math):** equity **$82,288**, day **+0.78%**. Naked **0**, ghosts **0**.
 

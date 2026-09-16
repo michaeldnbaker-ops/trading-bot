@@ -1,6 +1,8 @@
 # Spec C — News / Premarket quality (paper)
 
-**Status:** DRAFT — research HOLD. **No implementation in this PR.** Paper Alpaca only. **No crypto.**
+**Status: quality-filter-only — not alpha (2026-09-16 CoS / Learning Loop lock).** Implementation **frozen**. Premarket / News is a **quality filter**, not an alpha sleeve. Do **not** PROMOTE `PremarketAgent_strict` as a new edge. Single research focus is Spec A RegimeEquity validation + kill criteria — [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md).
+
+**Status (HOLD):** research HOLD. **No implementation in this PR.** Paper Alpaca only. **No crypto.**
 
 **Contract:** `ROTATION-CONTRACT.md`. **Vocabulary:** **BENCHED / PROMOTED / REACTIVATED / FLAG.** Do **not** use KEEP/DISABLE.
 
@@ -93,7 +95,7 @@ Still **PROTECTED**. Still **FLAG**-able. Still **cannot** be BENCHED.
 
 **Cannot BENCH.** Improver cannot retire News or skip REACTIVATED.
 
-> **Day-1 footnote (2026-09-11) — NOT LOCKED / pending several market days.** Premarket **1.15 / $0** with **entries 0** is **not** Spec C evidence (not a quality FLAG, not a promote). Bot vs SPY (1d −0.07% | 20d −6.92% vs −1.75% | since −17.71% vs +3.30%) is ensemble context only. Today rotator events = **none**. `MomentumAgent` already benched is not a C parent. Revisit numeric boxes after ≥5 market days. See [ROTATION-CONTRACT.md](ROTATION-CONTRACT.md).
+> **Day-1 footnote (2026-09-11) — NOT LOCKED.** Premarket **1.15 / $0** with **entries 0** is **not** Spec C evidence (not a quality FLAG, not a promote). **C is quality-filter-only, not alpha (2026-09-16).** ≥5-day clock restarts 2026-09-16 (Sep 14–15 gap, no backfill). See [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md).
 
 ---
 
