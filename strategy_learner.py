@@ -73,7 +73,10 @@ class StrategyLearner:
         })
 
         for t in closed:
-            for agent in t.all_agents:
+            leaves = getattr(t, "leaf_agents", None) or t.all_agents
+            for agent in leaves:
+                if agent in {"MetaAgent", "BrokerSync"} or str(agent).startswith("MetaAgent("):
+                    continue
                 d = agent_stats[agent]
                 pnl = t.realized_pnl
                 d["total_pnl"] += pnl

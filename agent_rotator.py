@@ -41,10 +41,16 @@ CHANGE LOG (v1.1):
 
 Rotation logic:
   1. Read the latest EvalReport from agent_evaluator.
-  2. For each flagged agent, bench it (active=False) for BENCH_DAYS.
-  3. Log the rotation event to logs/rotation_log.jsonl.
-  4. Update agent_summary.json accordingly.
-  5. Re-activate benched agents after BENCH_DAYS if they've been rested.
+  2. For each flagged agent (relative underperform OR N<10 absolute
+     drain — see agent_evaluator thresholds), bench it for BENCH_DAYS.
+     MIN_ACTIVE_AGENTS is the only bench skip besides PROTECTED_AGENTS.
+     Drain FLAGs are not silently overridden.
+  3. PROMOTE is variant substitution only. Prefer the inactive variant
+     with the best 20d expectancy-after-costs. A known negative-
+     expectancy variant is never promoted (bench without replacement).
+  4. Log the rotation event to logs/rotation_log.jsonl.
+  5. Update agent_summary.json accordingly.
+  6. Re-activate benched agents after BENCH_DAYS if they've been rested.
 
 "Better alternatives" in this system means an agent variant with different
 parameters (e.g. TechnicalAgent_v2, TechnicalAgent_conservative).
@@ -67,6 +73,8 @@ from performance_logger import PerformanceLogger, LOGS_DIR, SUMMARY
 BENCH_DAYS          = 3      # how long a flagged agent sits out
 ROTATION_LOG        = LOGS_DIR / "rotation_log.jsonl"
 MIN_ACTIVE_AGENTS   = 2      # never bench below this count (safety floor)
+# Drain FLAGs (N<10 absolute-drain) use this same floor. There is no
+# second override path that looks like a bench and then no-ops.
 
 # ── Full 12-agent roster with cross-substitution logic ──────────────────────
 # When an agent underperforms, the rotator promotes its best substitute.
@@ -94,6 +102,10 @@ AGENT_VARIANTS: dict[str, list[str]] = {
     # Timing agents
     "PremarketAgent":      ["SectorRotationAgent"],
     "SectorRotationAgent": ["PremarketAgent"],
+
+    # Soft-watch / later additions — bench without promoting a sibling
+    # unless a real variant is listed. Empty on purpose (no override-theater).
+    "MeanReversionAgent":  [],
 }
 
 # Agents that are NEVER benched — they provide critical infrastructure.
@@ -164,7 +176,10 @@ class AgentRotator:
         agent_stats = {a.name: a for a in report.agents}
         flagged_sorted = sorted(
             report.flagged_agents,
-            key=lambda name: agent_stats[name].pnl_20d if name in agent_stats else 0.0,
+            key=lambda name: (
+                agent_stats[name].pnl_20d_after_costs
+                if name in agent_stats else 0.0
+            ),
         )
 
         # Track agents benched in THIS cycle so we don't accidentally
@@ -185,7 +200,9 @@ class AgentRotator:
 
             # Find best available replacement (excluding agents we just
             # benched in this cycle — they're losers, not promotion targets)
-            replacement = self._find_replacement(agent_name, summary, exclude=newly_benched)
+            replacement = self._find_replacement(
+                agent_name, summary, exclude=newly_benched, report=report,
+            )
 
             if not dry_run:
                 # Ensure the entry exists before mutating it. On a freshly
@@ -242,22 +259,45 @@ class AgentRotator:
         agent_name: str,
         summary: dict,
         exclude: set[str] | None = None,
+        report: EvalReport | None = None,
     ) -> str | None:
-        """Return the first available (inactive or unknown) variant for agent_name.
+        """Return the best available (inactive or unknown) variant.
 
-        `exclude` lets the caller block agents that were benched earlier in
-        the same rotation cycle — otherwise a just-benched loser could be
-        immediately re-promoted as a sibling's replacement.
+        `exclude` blocks agents benched earlier in this cycle.
+        Expectancy-after-costs (20d) ranks candidates:
+          • known positive expectancy first (best E wins)
+          • unknown / no 20d trades next (trial)
+          • known negative expectancy is never promoted — that would
+            be override-theater (swap one loser for another)
         """
         exclude = exclude or set()
         variants = AGENT_VARIANTS.get(agent_name, [])
+        candidates: list[str] = []
         for variant in variants:
             if variant in exclude:
                 continue
             entry = summary.get(variant)
             if entry is None or not entry.get("active", False):
-                return variant
-        return None
+                candidates.append(variant)
+        if not candidates:
+            return None
+
+        stats = {a.name: a for a in (report.agents if report else [])}
+
+        def _rank(name: str) -> tuple[int, float]:
+            st = stats.get(name)
+            if st is None or st.trades_20d == 0 or st.expectancy_after_costs_20d is None:
+                return (1, 0.0)  # unknown — eligible trial
+            exp = float(st.expectancy_after_costs_20d)
+            if exp < 0:
+                return (0, exp)  # known loser — last resort, then rejected
+            return (2, exp)
+
+        ranked = sorted(candidates, key=_rank, reverse=True)
+        best = ranked[0]
+        if _rank(best)[0] == 0:
+            return None
+        return best
 
     @staticmethod
     def _blank_agent_entry() -> dict:

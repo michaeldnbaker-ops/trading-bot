@@ -91,6 +91,7 @@ DEFAULT_WEIGHTS = {
     "VolatilityAgent":     1.0,
     "IntermarketAgent":    1.0,
     "MoversAgent":         1.0,
+    "MeanReversionAgent":  1.0,
 }
 # Note: RiskAgent is a monitor only — not a signal source
 
@@ -468,9 +469,15 @@ class MetaAgent:
                 if t.is_open:
                     continue
                 pnl = t.realized_pnl or 0.0
-                for agent in t.all_agents:
+                cost = _ledger.round_trip_cost(t)
+                after = pnl - cost
+                leaves = getattr(t, "leaf_agents", None) or _ledger.leaf_agent_names(
+                    getattr(t, "primary_agent", ""),
+                    getattr(t, "contributors", ""),
+                )
+                for agent in leaves:
                     if agent in agent_pnl:
-                        agent_pnl[agent] += pnl
+                        agent_pnl[agent] += after
 
             # ── Power-curve weights ─────────────────────────────────────
             max_pnl = max(agent_pnl.values(), default=0.0)
@@ -512,7 +519,11 @@ class MetaAgent:
             for name in DEFAULT_WEIGHTS:
                 streak = 0
                 for t in closed:
-                    if name not in t.all_agents:
+                    leaves = getattr(t, "leaf_agents", None) or _ledger.leaf_agent_names(
+                        getattr(t, "primary_agent", ""),
+                        getattr(t, "contributors", ""),
+                    )
+                    if name not in leaves:
                         continue
                     if (t.realized_pnl or 0.0) > 0:
                         streak += 1

@@ -237,7 +237,7 @@ class ScorecardLeafRoster(unittest.TestCase):
                 {"name": "MetaAgent(MomentumAgent)", "status": "active",
                  "weight": 1.0, "pnl": 1},
                 {"name": "MomentumAgent", "status": "active",
-                 "weight": 0.55, "pnl": 12},
+                 "weight": 0.55, "pnl": 12, "expectancy_after_costs": 1.25},
             ],
             "shadow_pnl": dr._empty_pnl_summary(),
             "live_pnl": dr._empty_pnl_summary(),
@@ -247,6 +247,8 @@ class ScorecardLeafRoster(unittest.TestCase):
             html = reporter.format_email_html(data)
         self.assertIn("MomentumAgent", html)
         self.assertIn("0.55", html)
+        self.assertIn("E after cost", html)
+        self.assertIn("$+1.25", html)
         self.assertNotIn(">MetaAgent(", html)
         self.assertNotIn("MetaAgent(MomentumAgent)", html)
         self.assertNotIn("MetaAgent(MomentumAgent, BreakoutAgent)", html)
