@@ -43,8 +43,15 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
-from dotenv import load_dotenv
+try:
+    import yfinance as yf  # noqa: F401 — optional; this module no longer prices here
+except ImportError:
+    yf = None
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_a, **_k):
+        return False
 
 from agent_evaluator import AgentEvaluator
 from performance_logger import PerformanceLogger, LOGS_DIR
@@ -166,12 +173,58 @@ def _load_meta_weights() -> dict:
             return {}
 
 
+def _attribution_by_leaf(d: dict | None = None) -> dict:
+    """Leaf attribution rows keyed by agent name. Unwraps leftover wrappers."""
+    rows = []
+    if d and d.get("agent_attribution"):
+        rows = list(d.get("agent_attribution") or [])
+    elif _LEDGER_AVAILABLE:
+        try:
+            rows = list(_ledger.per_agent_attribution())
+        except Exception:
+            rows = []
+    by_name: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw = str(row.get("agent") or "")
+        leaves = _leaf_agent_names(raw)
+        if not leaves and raw and not _is_wrapper_agent_name(raw):
+            leaves = [raw]
+        for leaf in leaves:
+            if leaf not in by_name:
+                by_name[leaf] = row
+    return by_name
+
+
+def _leaf_pnl_from_sources(info: dict, ev: dict, attr: dict | None) -> float:
+    """Real leaf P&L. Ignore rotator-seeded summary zeros with no trades."""
+    if attr:
+        for key in ("pnl_after_costs", "total_pnl"):
+            if attr.get(key) is not None:
+                return float(attr[key])
+    if ev:
+        for key in ("pnl_20d_after_costs", "pnl_alltime_after_costs", "pnl_20d", "pnl_alltime"):
+            if ev.get(key) is not None:
+                return float(ev[key])
+    summary_n = int(info.get("trade_count") or 0)
+    summary_pnl = info.get("total_pnl")
+    # Rotator blank seeds are {total_pnl: 0.0, trade_count: 0}. Those
+    # hid real leaf P&L. A non-zero summary or a counted trade is real.
+    if summary_pnl is not None and (summary_n > 0 or float(summary_pnl) != 0.0):
+        return float(summary_pnl)
+    return 0.0
+
+
 def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
-    """Leaf-agent roster: status, MetaAgent weight, P&L.
+    """Leaf-agent roster: status, MetaAgent weight, after-cost P&L, expectancy.
 
     MetaAgent(*) wrapper labels are stripped. Soft leaf weights are the real
     MetaAgent values. Unknown wrapper names are never invented at 1.00 —
     that was polluting kill/BENCH reads on the Learning Loop scorecard.
+
+    P&L comes from ledger leaf attribution / latest_eval after MetaAgent
+    unwrap — not from agent_summary.json zeros on unused leaf keys.
     """
     d = d or {}
     if "agent_roster" in d:
@@ -200,10 +253,13 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
         for a in (eval_data.get("agents") or [])
         if isinstance(a, dict) and a.get("name")
     }
+    attribution = _attribution_by_leaf(d)
     if isinstance(summary, dict):
         for name in summary:
             _add_name(name)
     for name in eval_agents:
+        _add_name(name)
+    for name in attribution:
         _add_name(name)
 
     weights = _load_meta_weights()
@@ -217,15 +273,19 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
         if not isinstance(info, dict):
             info = {}
         ev = eval_agents.get(name) or {}
+        attr = attribution.get(name)
         if "active" in info:
             status = "active" if info.get("active", True) else "benched"
         elif "active" in ev:
             status = "active" if ev.get("active", True) else "benched"
         else:
             status = "active"
-        pnl = info.get("total_pnl")
-        if pnl is None:
-            pnl = ev.get("pnl_20d") if ev.get("pnl_20d") is not None else ev.get("pnl_alltime")
+        if ev.get("flagged"):
+            status = "FLAG"
+        pnl = _leaf_pnl_from_sources(info, ev, attr)
+        exp = ev.get("expectancy_after_costs_20d")
+        if exp is None and attr is not None:
+            exp = attr.get("expectancy_after_costs")
         w = weights.get(name)
         if w is None:
             w = defaults.get(name)
@@ -237,6 +297,9 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
             "status": status,
             "weight": float(w),
             "pnl": float(pnl or 0),
+            "expectancy_after_costs": (
+                None if exp is None else float(exp)
+            ),
         })
     roster.sort(key=lambda r: r["pnl"], reverse=True)
     return roster
@@ -1247,12 +1310,20 @@ class DailyReporter:
         def clr(v):
             return "#22c55e" if (v or 0) >= 0 else "#ef4444"
 
+        def exp_cell(a):
+            e = a.get("expectancy_after_costs")
+            if e is None:
+                return "—"
+            return f"${float(e):+,.2f}"
+
         trows = "".join(
             f'<tr><td style="padding:4px 8px;font-weight:600">{a["name"]}</td>'
             f'<td style="padding:4px 8px">{a.get("status") or "active"}</td>'
             f'<td style="padding:4px 8px;text-align:right">{float(a.get("weight") or 0):.2f}</td>'
             f'<td style="padding:4px 8px;text-align:right;color:{clr(a.get("pnl"))}">'
-            f'${float(a.get("pnl") or 0):+,.0f}</td></tr>'
+            f'${float(a.get("pnl") or 0):+,.0f}</td>'
+            f'<td style="padding:4px 8px;text-align:right;color:{clr(a.get("expectancy_after_costs") or 0)}">'
+            f'{exp_cell(a)}</td></tr>'
             for a in roster
         )
         return (
@@ -1262,10 +1333,13 @@ class DailyReporter:
             '<th style="padding:6px 8px;text-align:left">Status</th>'
             '<th style="padding:6px 8px;text-align:right">Weight</th>'
             '<th style="padding:6px 8px;text-align:right">P&amp;L</th>'
+            '<th style="padding:6px 8px;text-align:right">E after cost</th>'
             '</tr></thead><tbody>' + trows + '</tbody></table>'
             + '<p style="font-size:10px;color:#94a3b8;margin:6px 0 0;font-style:italic">'
-              'Leaf agents only. MetaAgent(...) wrapper rows are omitted so '
-              'soft weights (not a fake 1.00) drive kill/BENCH reads.</p>'
+              'Leaf agents only after MetaAgent unwrap. P&amp;L and expectancy '
+              'are after paper friction (10 bps round-trip, $2 floor). '
+              'Those after-cost numbers drive FLAG / BENCH / PROMOTE. '
+              'N&lt;10 still FLAGs on absolute drain (≥$800 and ≤−$150/trade).</p>'
         )
 
     def _format_agent_evaluator_section(self, d: dict) -> str:
@@ -1287,6 +1361,8 @@ class DailyReporter:
             worst = a["worst_trade"]
             best_str  = f'{best["symbol"]} {best["side"]} ${best["pnl"]:+,.0f}'   if best  else "—"
             worst_str = f'{worst["symbol"]} {worst["side"]} ${worst["pnl"]:+,.0f}' if worst else "—"
+            exp = a.get("expectancy_after_costs")
+            exp_str = "—" if exp is None else f"${float(exp):+,.2f}"
             rows += (
                 f'<tr>'
                 f'<td style="padding:6px 8px;font-weight:600;font-size:12px">{a["agent"]}</td>'
@@ -1296,6 +1372,7 @@ class DailyReporter:
                 f'<td style="padding:6px 8px;text-align:right;color:{wr_color};font-weight:700">{wr:.0f}%</td>'
                 f'<td style="padding:6px 8px;text-align:right">${a["avg_pnl"]:+,.2f}</td>'
                 f'<td style="padding:6px 8px;text-align:right;color:{clr};font-weight:700">{sign}${a["total_pnl"]:,.2f}</td>'
+                f'<td style="padding:6px 8px;text-align:right">{exp_str}</td>'
                 f'<td style="padding:6px 8px;font-size:10px;color:#15803d">{best_str}</td>'
                 f'<td style="padding:6px 8px;font-size:10px;color:#991b1b">{worst_str}</td>'
                 f'</tr>'
@@ -1310,6 +1387,7 @@ class DailyReporter:
             '<th style="padding:6px 8px;text-align:right">Win %</th>'
             '<th style="padding:6px 8px;text-align:right">Avg P&amp;L</th>'
             '<th style="padding:6px 8px;text-align:right">Total P&amp;L</th>'
+            '<th style="padding:6px 8px;text-align:right">E after cost</th>'
             '<th style="padding:6px 8px;text-align:left">Best</th>'
             '<th style="padding:6px 8px;text-align:left">Worst</th>'
             '</tr></thead><tbody>' + rows + '</tbody></table>'

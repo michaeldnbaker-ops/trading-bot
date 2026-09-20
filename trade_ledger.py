@@ -72,6 +72,12 @@ except Exception:
 DEFAULT_RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "320"))  # $ per trade
 MAX_HOLD_DAYS          = int(os.getenv("MAX_HOLD_DAYS", "5"))       # auto-expire after N
 
+# Paper friction model for Learning Loop FLAG / PROMOTE / scorecard.
+# Alpaca paper is $0 commission. Kill and promote still haircut P&L so
+# "edge" is not a frictionless fill. 5 bps per side, $1/side floor.
+ROUND_TRIP_COST_BPS = 10.0
+ROUND_TRIP_COST_FLOOR_USD = 2.0
+
 LONG_SIDES  = {"LONG", "BUY", "CALL"}
 SHORT_SIDES = {"SHORT", "SELL", "PUT"}
 
@@ -138,6 +144,20 @@ class Trade:
         return agents
 
     @property
+    def leaf_agents(self) -> list[str]:
+        """Unique real agents after MetaAgent(...) unwrap. Empty for wrappers."""
+        return leaf_agent_names(self.primary_agent, self.contributors)
+
+    @property
+    def primary_leaves(self) -> list[str]:
+        return expand_agent_names(self.primary_agent)
+
+    @property
+    def contributor_leaves(self) -> list[str]:
+        prim = set(self.primary_leaves)
+        return [n for n in expand_agent_names(self.contributors) if n not in prim]
+
+    @property
     def opened_date_et(self) -> str:
         return self.opened_at_et[:10]
 
@@ -176,6 +196,15 @@ def expand_agent_names(raw: str) -> list[str]:
         return out
     if raw in {"MetaAgent", "BrokerSync"}:
         return []
+    if "," in raw:
+        out: list[str] = []
+        seen: set[str] = set()
+        for part in raw.split(","):
+            for name in expand_agent_names(part.strip()):
+                if name not in seen:
+                    seen.add(name)
+                    out.append(name)
+        return out
     return [raw]
 
 
@@ -185,6 +214,47 @@ def is_wrapper_agent_name(name: str) -> bool:
     if not n or n in {"MetaAgent", "BrokerSync"}:
         return True
     return n.startswith("MetaAgent(")
+
+
+def leaf_agent_names(*raw_parts: str) -> list[str]:
+    """Unique leaf names from one or more stored agent fields, order preserved."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_parts:
+        for name in expand_agent_names(raw):
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def round_trip_cost(trade: Trade) -> float:
+    """Conservative paper round-trip friction for one ledger row."""
+    shares = float(getattr(trade, "shares", 0) or 0)
+    entry = float(getattr(trade, "entry_price", 0) or 0)
+    notional = abs(shares * entry)
+    if notional <= 0:
+        notional = abs(float(getattr(trade, "risk_dollar", 0) or 0))
+    bps_cost = notional * ROUND_TRIP_COST_BPS / 10_000.0
+    return round(max(ROUND_TRIP_COST_FLOOR_USD, bps_cost), 2)
+
+
+def expectancy_after_costs(
+    gross_pnls: Iterable[float],
+    costs: Optional[Iterable[float]] = None,
+) -> Optional[float]:
+    """Mean P&L after paper friction. None when there are no trades."""
+    pnls = [float(p) for p in gross_pnls]
+    if not pnls:
+        return None
+    if costs is None:
+        cost_list = [ROUND_TRIP_COST_FLOOR_USD] * len(pnls)
+    else:
+        cost_list = [float(c) for c in costs]
+        if len(cost_list) != len(pnls):
+            raise ValueError("costs must align 1:1 with gross_pnls")
+    net = sum(p - c for p, c in zip(pnls, cost_list))
+    return round(net / len(pnls), 4)
 
 
 def _parse_agent_field(agent_raw: str) -> tuple[str, str]:
@@ -949,21 +1019,41 @@ def cumulative_pnl() -> dict:
 
 
 def per_agent_attribution() -> list[dict]:
-    """For each agent (primary + contributors counted), return aggregate stats."""
+    """Leaf-agent aggregates after MetaAgent unwrap.
+
+    Wrapper labels (``MetaAgent``, ``MetaAgent(...)``, ``BrokerSync``) are
+    never rows. A trade stored as ``MetaAgent(NewsAgent, OptionsFlowAgent)``
+    credits NewsAgent and OptionsFlowAgent with the real P&L — the roster
+    used to show $0 on those leaves while the wrapper held the only entry.
+    """
     by_agent: dict[str, dict] = defaultdict(lambda: {
         "agent": "", "trades_total": 0, "trades_open": 0, "trades_closed": 0,
         "wins": 0, "losses": 0,
         "realized_pnl": 0.0, "unrealized_pnl": 0.0,
+        "cost_total": 0.0,
         "as_primary": 0, "as_contributor": 0,
         "best_trade": None, "worst_trade": None,
+        "_gross_pnls": [], "_costs": [],
     })
     for t in all_trades():
-        for i, agent in enumerate(t.all_agents):
+        primary = t.primary_leaves
+        contrib = t.contributor_leaves
+        leaves = t.leaf_agents
+        if not leaves:
+            continue
+        cost = round_trip_cost(t)
+        pnl = t.realized_pnl if not t.is_open else t.unrealized_pnl
+        for agent in leaves:
             d = by_agent[agent]
             d["agent"] = agent
             d["trades_total"] += 1
-            if i == 0: d["as_primary"]    += 1
-            else:      d["as_contributor"] += 1
+            if agent in primary:
+                d["as_primary"] += 1
+            else:
+                d["as_contributor"] += 1
+            d["cost_total"] += cost
+            d["_gross_pnls"].append(pnl)
+            d["_costs"].append(cost)
             if t.is_open:
                 d["trades_open"]    += 1
                 d["unrealized_pnl"] += t.unrealized_pnl
@@ -972,7 +1062,6 @@ def per_agent_attribution() -> list[dict]:
                 d["realized_pnl"]   += t.realized_pnl
                 if t.realized_pnl >= 0: d["wins"]   += 1
                 else:                   d["losses"] += 1
-            pnl = t.realized_pnl if not t.is_open else t.unrealized_pnl
             if d["best_trade"] is None or pnl > d["best_trade"]["pnl"]:
                 d["best_trade"] = {
                     "symbol": t.symbol, "side": t.side, "pnl": round(pnl, 2),
@@ -989,6 +1078,11 @@ def per_agent_attribution() -> list[dict]:
         d["total_pnl"]    = round(total_pnl, 2)
         d["realized_pnl"] = round(d["realized_pnl"], 2)
         d["unrealized_pnl"] = round(d["unrealized_pnl"], 2)
+        d["cost_total"] = round(d["cost_total"], 2)
+        d["pnl_after_costs"] = round(total_pnl - d["cost_total"], 2)
+        d["expectancy_after_costs"] = expectancy_after_costs(
+            d.pop("_gross_pnls"), d.pop("_costs")
+        )
         if d["trades_closed"] > 0:
             d["win_rate"]   = round(d["wins"] / d["trades_closed"] * 100, 1)
             d["avg_pnl"]    = round(d["realized_pnl"] / d["trades_closed"], 2)
