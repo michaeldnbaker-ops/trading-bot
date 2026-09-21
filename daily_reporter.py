@@ -633,16 +633,20 @@ def diagnose(report: dict) -> list[str]:
                 break
 
     if report["approved_count"] > 0:
-        # Check for oversized risk
+        # approved_trades["risk_dollar"] is actually entry*shares NOTIONAL
+        # (see ledger_today builder). RISK_PER_TRADE (~$320) is dollar risk
+        # to stop, not a notional cap — flag when notional exceeds the
+        # order_executor hard-cap (MAX_NOTIONAL_USD default $1,500).
+        max_notional = float(os.getenv("MAX_NOTIONAL_USD", "1500"))
         oversized = [t for t in report["approved_trades"]
-                     if t.get("risk_dollar") and float(t["risk_dollar"]) > 1000]
+                     if t.get("risk_dollar") and float(t["risk_dollar"]) > max_notional]
         if oversized:
             biggest = max(oversized, key=lambda t: float(t["risk_dollar"]))
             findings.append(
-                f"⚠️  {len(oversized)} approved trades exceed $1,000 notional risk "
+                f"⚠️  {len(oversized)} approved trades exceed ${max_notional:,.0f} notional "
                 f"(biggest: {biggest['symbol']} @ ${float(biggest['risk_dollar']):,.0f}). "
-                f"Account is $16K — these are leveraged options or unenforced caps. "
-                f"Verify `dynamic_risk.py` is hard-capping at $320/trade."
+                f"RISK_PER_TRADE (~$320) is dollar risk to stop, not a notional cap. "
+                f"Verify order_executor clamps to MAX_NOTIONAL_USD / MAX_POSITION_PCT."
             )
 
     # Silence detection across agents
