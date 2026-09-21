@@ -15,8 +15,9 @@ Position sizing is driven by the approved_signal dict from AgentRiskBridge.
   ALPACA_API_KEY       — paper trading API key (PA3EZ46Z9UUC)
   ALPACA_API_SECRET    — paper trading secret
   PAPER_TRADING        — must be "true" (live mode not wired yet)
-  RISK_PER_TRADE       — dollar risk per trade (default $320)
-  MAX_POSITION_PCT     — max % of portfolio per trade (default 2.0)
+  RISK_PER_TRADE       — dollar risk TO STOP per trade (default $320; not a notional cap)
+  MAX_POSITION_PCT     — max % of live equity notional per trade (default 2.0)
+  MAX_NOTIONAL_USD     — absolute notional hard-cap per trade (default 1500)
 """
 
 from __future__ import annotations
@@ -56,15 +57,16 @@ if _paper_violation:
 PAPER_TRADING     = True
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
-RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE", "320"))
-MAX_POSITION_PCT  = float(os.getenv("MAX_POSITION_PCT", "2.0"))   # % of portfolio
+RISK_PER_TRADE    = float(os.getenv("RISK_PER_TRADE", "320"))  # $ risk to stop, NOT notional
+MAX_POSITION_PCT  = float(os.getenv("MAX_POSITION_PCT", "2.0"))   # % of live equity notional
+MAX_NOTIONAL_USD  = float(os.getenv("MAX_NOTIONAL_USD", "1500"))  # absolute notional hard-cap
 DEFAULT_TRAIL_PCT = 4.0   # matches the ATR stop cap used at entry
 PROTECT_RETRY_SEC = 120   # don't hammer Alpaca on a symbol that just rejected
 
 # Symbols Alpaca handles as crypto (use notional sizing, no bracket)
 CRYPTO_SYMBOLS = {"BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LTC/USD"}
 
-# Max portfolio allocation per single position ($100k * 2% = $2k default)
+# Fallback equity when the broker is unreachable ($100k * 2% = $2k default)
 PORTFOLIO_VALUE   = float(os.getenv("ACCOUNT_BALANCE", "100000"))
 
 # Per-symbol last-failed timestamp for the tick-level exit backstop.
@@ -102,6 +104,18 @@ class OrderExecutor:
         )
         log.info("OrderExecutor ready — paper=True (live trading is not enabled)")
 
+    def _portfolio_equity(self) -> float:
+        """Live paper equity for notional clamps; falls back to ACCOUNT_BALANCE."""
+        try:
+            if self._client is not None:
+                acct = self._client.get_account()
+                eq = float(getattr(acct, "equity", 0) or 0)
+                if 1_000 <= eq <= 100_000_000:
+                    return eq
+        except Exception as e:
+            log.warning(f"live equity unavailable for notional clamp ({e})")
+        return PORTFOLIO_VALUE
+
     # ── Public entry point ─────────────────────────────────────────────────────
     def execute(self, approved_signal: dict) -> dict:
         """
@@ -126,6 +140,21 @@ class OrderExecutor:
         sizing    = approved_signal.get("position_sizing") or {}
         pos_usd   = float(sizing.get("total_cost") or approved_signal.get(
                           "position_size_usd", PORTFOLIO_VALUE * MAX_POSITION_PCT / 100))
+
+        # Hard notional clamp. AgentRiskBridge sizes to RISK_PER_TRADE_PCT /
+        # stop distance (ATR ≤4% → ~$8k notional from a $320 risk budget).
+        # MAX_POSITION_PCT and MAX_NOTIONAL_USD are the notional caps and must
+        # bind here — the bridge total_cost path previously bypassed them.
+        equity = self._portfolio_equity()
+        pct_cap = equity * (MAX_POSITION_PCT / 100.0)
+        raw_pos = pos_usd
+        pos_usd = min(pos_usd, pct_cap, MAX_NOTIONAL_USD)
+        if pos_usd < raw_pos - 1e-6:
+            log.info(
+                f"NOTIONAL CLAMP: {symbol} ${raw_pos:.0f} → ${pos_usd:.0f} "
+                f"(pct_cap=${pct_cap:.0f} @ {MAX_POSITION_PCT}% of "
+                f"${equity:,.0f}; abs_cap=${MAX_NOTIONAL_USD:.0f})"
+            )
 
         if paper_only_violation():
             return self._reject(paper_only_violation())
