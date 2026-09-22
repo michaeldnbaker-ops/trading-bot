@@ -162,6 +162,14 @@ class OrderExecutor:
             return self._reject("entry_price is 0 or missing")
         if stop <= 0 or target <= 0:
             return self._reject("stop_loss_price or target_price missing")
+
+        from session_gates import assert_paper_only, equity_entries_allowed, is_crypto_symbol as session_is_crypto
+        assert_paper_only("OrderExecutor.execute")
+        allowed, reason = equity_entries_allowed(symbol=symbol)
+        if not allowed:
+            log.info(f"⏭  BLOCKED ENTRY: {symbol} {direction.upper()} — {reason}")
+            return {"status": "blocked", "symbol": symbol, "direction": direction, "reason": reason}
+
         if self._client is None:
             return self._log_only(approved_signal)
 
@@ -174,7 +182,7 @@ class OrderExecutor:
                      f"failed, retrying in ~{remaining}m")
             return {"status": "cooldown", "symbol": symbol, "direction": direction}
 
-        is_crypto = symbol in CRYPTO_SYMBOLS
+        is_crypto = session_is_crypto(symbol) or symbol in CRYPTO_SYMBOLS
 
         try:
             if is_crypto:
