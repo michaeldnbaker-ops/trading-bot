@@ -1,6 +1,6 @@
 # SPEC-A — Regime-aware equity long/short (3-day BENCHED window)
 
-**CoS / Learning Loop lock (2026-09-16): single focus.** Validation design + kill criteria live in [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md). Spec B is **PARKED** (do not PROMOTE B). Spec C is **quality-filter-only, not alpha**. Day-1 (2026-09-11) is **NOT LOCKED**. ≥5-day healthy-scorecard clock **restarts 2026-09-16** (Sep 14–15 gap days, no backfill).
+**CoS / Learning Loop lock (2026-09-16): single focus.** Validation envelope + provisional kill numerics live in [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md) (**5/5** healthy EODs banked 2026-09-23; Spec A trades = 0). Cold-seed JSON is a **prep artifact only** — [SPEC-A-SEED-PREP.md](SPEC-A-SEED-PREP.md). **DO NOT APPLY. Do not seed into the ensemble. NO PROMOTE. No weight-test.** Spec B is **PARKED** (do not PROMOTE B). Spec C is **quality-filter-only, not alpha**. Day-1 (2026-09-11) is **NOT LOCKED**. ≥5-day healthy-scorecard clock **restarted 2026-09-16** (Sep 14–15 gap days, no backfill) and is **5/5 banked**.
 
 **Ops gap A (do first).** Paper Alpaca only. **Do not implement in this PR.**  
 **Not options. Not crypto.** “Replace bleeders” lasts `BENCH_DAYS = 3` then **REACTIVATED** — expected, not a reject.
@@ -110,9 +110,9 @@ No new options exit rules. No share fallback from a failed option (this agent ne
 
 ## FLAG vs remain-active (qualitative; numeric kill = TODO)
 
-**Authoritative kill structure:** [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md) (primary = expectancy after costs; vs SPY secondary; boxes TODO until ≥5 healthy days from **2026-09-16**).
+**Authoritative kill structure:** [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md) (primary = expectancy after costs; vs SPY secondary). **Provisional** numerics filed 2026-09-23 from the banked 5/5 book window (Spec A trade count = 0): kill if after-cost expectancy ≤ **$0** at **N ≥ 20**; sleeve DD > **3% of equity** (~$2,400 at $80k) or > **1.5×** mini-backtest DD; paper vs locked OOS divergence > **~25%**. Those boxes do **not** authorize seed, weight-test, or PROMOTE.
 
-Clock starts on first paper fill after **PROMOTED**. Broker = money, ledger = attribution. **Numeric kill thresholds = TODO.** Do **not** invent 20d-edge, drawdown, or trade-count cutoffs from Day-1 (NOT LOCKED) or from Sep 14–15 gap days.
+Clock for Spec A expectancy starts on first paper fill after **PROMOTED**. Broker = money, ledger = attribution. **NO PROMOTE. Do not seed into the ensemble** — seed prep is [SPEC-A-SEED-PREP.md](SPEC-A-SEED-PREP.md) only. Do **not** invent cutoffs from Day-1 (NOT LOCKED) or from Sep 14–15 gap days.
 
 **Remain active (no rotator event) when, qualitatively:**
 
