@@ -40,6 +40,14 @@ class NakedAndGhostDetection(unittest.TestCase):
             [],
         )
 
+    def test_undersized_exit_is_naked(self):
+        from invariants import naked_equity_symbols
+        positions = [{"symbol": "P", "qty": 12}]
+        orders = [{"symbol": "P", "side": "sell", "qty": 1}]
+        self.assertEqual(naked_equity_symbols(positions, orders), ["P"])
+        covered = [{"symbol": "P", "side": "sell", "qty": 12}]
+        self.assertEqual(naked_equity_symbols(positions, covered), [])
+
     def test_crypto_and_options_excluded(self):
         from invariants import naked_equity_symbols
         positions = [

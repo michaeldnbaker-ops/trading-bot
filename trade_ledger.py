@@ -40,7 +40,7 @@ import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -454,6 +454,27 @@ def _check_hits(trade: Trade, df) -> tuple[Optional[str], Optional[float], Optio
     return (None, None, None)
 
 
+def broker_time_to_et(when: str) -> str:
+    """Alpaca transaction_time is UTC. exit_at_et is an ET wall clock.
+
+    Slicing the ISO string left ghost closes stamped in UTC (18:05 stored
+    as if it were 18:05 ET). Parse and convert. A value that is already
+    an ET wall clock without a timezone is returned unchanged.
+    """
+    if not when:
+        return ""
+    raw = str(when).strip()
+    if "T" not in raw and "+" not in raw and not raw.endswith("Z"):
+        return raw[:19]
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ET).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return raw[:19].replace("T", " ")
+
+
 def _pnl_for(trade: Trade, exit_price: float) -> float:
     sign = 1 if trade.side == "LONG" else -1
     return round(trade.shares * (exit_price - trade.entry_price) * sign, 2)
@@ -621,7 +642,7 @@ def close_ghosts() -> dict:
             px, when = fill
             t.status = "stop"
             t.exit_price = px
-            t.exit_at_et = when[:19].replace("T", " ")
+            t.exit_at_et = broker_time_to_et(when)
             t.exit_reason = "broker fill (ghost close)"
         else:
             px = t.current_price or t.entry_price
@@ -777,7 +798,7 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     _px, _when = _fill
                     t.status       = "stop"
                     t.exit_price   = _px
-                    t.exit_at_et   = _when[:19].replace("T", " ")
+                    t.exit_at_et   = broker_time_to_et(_when)
                     t.exit_reason  = "broker fill (ghost close)"
                 elif last_price is not None:
                     t.status       = "expired"
@@ -797,6 +818,11 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                 continue
 
             if status:
+                # Broker-held names never reach here (the override above
+                # clears status). When the broker is unreachable this is
+                # the simulated target/stop. When a fill is already known
+                # because the broker dropped the position, the ghost-close
+                # branch above booked that fill instead of the signal price.
                 t.status        = status
                 t.exit_price    = exit_price
                 t.exit_at_et    = exit_at
@@ -841,7 +867,7 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                         _px, _when = _fill
                         t.status       = "stop"
                         t.exit_price   = _px
-                        t.exit_at_et   = _when[:19].replace("T", " ")
+                        t.exit_at_et   = broker_time_to_et(_when)
                         t.exit_reason  = f"trail stop hit after {age_days}d"
                     else:
                         t.status       = "expired"

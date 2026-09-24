@@ -50,7 +50,10 @@ Rotation logic:
      expectancy variant is never promoted (bench without replacement).
   4. Log the rotation event to logs/rotation_log.jsonl.
   5. Update agent_summary.json accordingly.
-  6. Re-activate benched agents after BENCH_DAYS if they've been rested.
+  6. Re-activate benched agents after BENCH_DAYS only when after-cost
+     expectancy is positive over MIN_TRADES_TO_EVALUATE (20d window).
+     Otherwise they stay BENCHED and the cycle logs why. A pin
+     (benched_at far in the future, and/or pinned_reason) stays benched.
 
 "Better alternatives" in this system means an agent variant with different
 parameters (e.g. TechnicalAgent_v2, TechnicalAgent_conservative).
@@ -66,11 +69,18 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from agent_evaluator import AgentEvaluator, EvalReport
+import logging
+
+from agent_evaluator import MIN_TRADES_TO_EVALUATE, AgentEvaluator, EvalReport
 from performance_logger import PerformanceLogger, LOGS_DIR, SUMMARY
+
+log = logging.getLogger("AgentRotator")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BENCH_DAYS          = 3      # how long a flagged agent sits out
+# Same sample floor the evaluator uses before a P&L number means anything.
+# Resting BENCH_DAYS is not evidence; reactivation needs a real sample.
+REACTIVATION_MIN_TRADES = MIN_TRADES_TO_EVALUATE
 ROTATION_LOG        = LOGS_DIR / "rotation_log.jsonl"
 MIN_ACTIVE_AGENTS   = 2      # never bench below this count (safety floor)
 # Drain FLAGs (N<10 absolute-drain) use this same floor. There is no
@@ -123,6 +133,47 @@ PROTECTED_AGENTS = {"NewsAgent", "SentimentAgent",
                     "BearishPatternAgent", "ShortMomentumAgent"}
 
 
+def is_pinned_bench(info: dict, benched_at: datetime, now: datetime) -> bool:
+    """Pin convention: far-future benched_at and/or pinned_reason.
+
+    Improver notes record a manual pin as benched_at in 2099 plus
+    pinned_reason on the agent_summary.json row. Either signal keeps
+    the agent BENCHED. A normal 3-day bench timestamp does not.
+    """
+    if str(info.get("pinned_reason") or "").strip():
+        return True
+    if benched_at - now >= timedelta(days=365):
+        return True
+    return False
+
+
+def reactivation_decision(stats, min_trades: int | None = None) -> tuple[bool, str]:
+    """(reactivate, reason) from the evaluator's 20d after-cost expectancy.
+
+    Positive means strictly greater than zero. The trade count is the
+    evaluator's MIN_TRADES_TO_EVALUATE unless a test overrides it.
+    """
+    need = REACTIVATION_MIN_TRADES if min_trades is None else min_trades
+    if stats is None:
+        return False, f"no expectancy sample (need ≥{need} trades)"
+    trades = int(getattr(stats, "trades_20d", 0) or 0)
+    exp = getattr(stats, "expectancy_after_costs_20d", None)
+    if exp is None:
+        exp = getattr(stats, "expectancy_after_costs", None)
+    if trades < need or exp is None:
+        shown = "n/a" if exp is None else f"{float(exp):+.2f}"
+        return False, (
+            f"after-cost expectancy {shown} over {trades} trades "
+            f"(need positive expectancy and ≥{need} trades)"
+        )
+    if float(exp) <= 0:
+        return False, (
+            f"after-cost expectancy {float(exp):+.2f} over {trades} trades "
+            f"is not positive"
+        )
+    return True, f"after-cost expectancy {float(exp):+.2f} over {trades} trades"
+
+
 class AgentRotator:
     """Reads the latest evaluation and rotates agents as needed."""
 
@@ -143,8 +194,13 @@ class AgentRotator:
         now     = datetime.now(timezone.utc)
 
         actions: list[str] = []
+        agent_stats = {a.name: a for a in report.agents}
 
-        # ── Step 1: Re-activate agents whose bench time has expired ───────
+        # ── Step 1: Re-activate rested agents with positive expectancy ────
+        # Time on the bench is not a performance check. REACTIVATED only
+        # when the evaluator's 20d after-cost expectancy is positive over
+        # REACTIVATION_MIN_TRADES. Pins (far-future benched_at and/or
+        # pinned_reason) stay BENCHED regardless of the numbers.
         for name, info in summary.items():
             if info.get("active", True):
                 continue
@@ -154,13 +210,27 @@ class AgentRotator:
             benched_at = datetime.fromisoformat(benched_at_str)
             if benched_at.tzinfo is None:
                 benched_at = benched_at.replace(tzinfo=timezone.utc)
-            if (now - benched_at).days >= BENCH_DAYS:
-                if not dry_run:
-                    summary[name]["active"]     = True
-                    summary[name]["benched_at"] = None
-                action = f"REACTIVATED {name} (benched {(now - benched_at).days}d ago)"
+            if is_pinned_bench(info, benched_at, now):
+                why = info.get("pinned_reason") or "benched_at far future"
+                action = f"BENCHED {name} stays benched — pinned ({why})"
                 actions.append(action)
-                self._write_rotation_event(name, "REACTIVATED", action, dry_run)
+                log.info(action)
+                continue
+            if (now - benched_at).days < BENCH_DAYS:
+                continue
+            ok, why = reactivation_decision(agent_stats.get(name))
+            if not ok:
+                action = f"BENCHED {name} stays benched — {why}"
+                actions.append(action)
+                log.info(action)
+                continue
+            if not dry_run:
+                summary[name]["active"]     = True
+                summary[name]["benched_at"] = None
+            days = (now - benched_at).days
+            action = f"REACTIVATED {name} (benched {days}d ago; {why})"
+            actions.append(action)
+            self._write_rotation_event(name, "REACTIVATED", action, dry_run)
 
         # ── Step 2: Bench underperforming agents ───────────────────────────
         # Active count must reflect the FULL roster, not just deviations
@@ -173,7 +243,6 @@ class AgentRotator:
 
         # Bench worst-first: spend the bench-budget on the biggest 20-day
         # losers, not on whatever order the flagged dict happened to use.
-        agent_stats = {a.name: a for a in report.agents}
         flagged_sorted = sorted(
             report.flagged_agents,
             key=lambda name: (

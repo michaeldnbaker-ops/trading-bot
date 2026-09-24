@@ -204,6 +204,66 @@ def execute_options_trade(signal: dict) -> dict | None:
         return None
 
 
+def submit_option_protective_stop(client, position) -> dict:
+    """Place a stop that caps a long option near STOP_LOSS_MULT of premium.
+
+    Alpaca rejects trailing stops on option contracts. A plain stop is the
+    protective exit the broker can actually hold. GTC is tried first, then
+    DAY (many option routes only accept DAY). Both failures come back as
+    placed=False so the caller can say the broker refused, instead of
+    claiming a trailing stop is active.
+    """
+    sym = str(getattr(position, "symbol", "") or "")
+    try:
+        signed = float(position.qty)
+        basis = abs(float(position.avg_entry_price))
+    except (TypeError, ValueError, AttributeError) as e:
+        return {"placed": False, "error": f"bad option position: {e}",
+                "stop_price": None, "qty": 0}
+    qty = abs(int(signed))
+    if qty < 1 or basis <= 0:
+        return {"placed": False, "error": "qty or premium is zero",
+                "stop_price": None, "qty": qty}
+    # Long premium: sell stop below the debit. Short premium is not how
+    # this book enters, but a buy stop above the credit is the mirror.
+    if signed > 0:
+        stop_px = round(max(basis * STOP_LOSS_MULT, 0.01), 2)
+        side_name = "sell"
+    else:
+        stop_px = round(basis / STOP_LOSS_MULT, 2)
+        side_name = "buy"
+    try:
+        from alpaca.trading.requests import StopOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+    except ImportError as e:
+        return {"placed": False, "error": f"alpaca stop unavailable: {e}",
+                "stop_price": stop_px, "qty": qty}
+    side = OrderSide.SELL if side_name == "sell" else OrderSide.BUY
+    errors = []
+    for tif in (TimeInForce.GTC, TimeInForce.DAY):
+        try:
+            order = client.submit_order(StopOrderRequest(
+                symbol=sym, qty=qty, side=side,
+                time_in_force=tif, stop_price=stop_px,
+            ))
+            return {
+                "placed": True,
+                "order_id": str(getattr(order, "id", "")),
+                "stop_price": stop_px,
+                "qty": qty,
+                "tif": str(tif),
+                "error": "",
+            }
+        except Exception as e:
+            errors.append(f"{tif}: {e}")
+    return {
+        "placed": False,
+        "stop_price": stop_px,
+        "qty": qty,
+        "error": "; ".join(errors) or "broker rejected options stop",
+    }
+
+
 def manage_options_exits() -> None:
     """Exit rules for open option positions.
 

@@ -23,7 +23,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ── Optional: pandas_market_calendars for holiday-aware scheduling ──────────
@@ -282,6 +282,222 @@ def send_daily_email():
         log.warning(f"Email send failed: {e}")
 
 
+def seconds_until_next_minute(now: datetime) -> float:
+    """Seconds until the next minute boundary (wall clock)."""
+    nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return max(0.0, (nxt - now).total_seconds())
+
+
+def tick_spilled_into_new_minute(last_tick_minute: int, now: datetime) -> bool:
+    """True when work that started on last_tick_minute has crossed into another.
+
+    A cycle a few seconds over 60s used to sleep another full TICK_SECONDS
+    and skip the minute it had already entered. The loop should run that
+    minute immediately instead of sleeping past it.
+    """
+    if last_tick_minute < 0:
+        return False
+    return (now.hour * 60 + now.minute) != last_tick_minute
+
+
+def _order_side_name(order) -> str:
+    return str(getattr(order, "side", "") or "").lower().split(".")[-1]
+
+
+def _load_open_orders(client) -> list:
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
+    except ImportError:
+        req = None
+    try:
+        if req is None:
+            return list(client.get_orders())
+        return list(client.get_orders(req))
+    except Exception as e:
+        log.warning(f"Orphan reconcile: open orders unreadable ({e})")
+        return []
+
+
+def _exit_side_token(signed: float):
+    try:
+        from alpaca.trading.enums import OrderSide
+        return OrderSide.SELL if signed > 0 else OrderSide.BUY
+    except ImportError:
+        return "sell" if signed > 0 else "buy"
+
+
+def _closing_orders(orders, signed_qty: float) -> list:
+    out = []
+    for o in orders:
+        side = _order_side_name(o)
+        if signed_qty > 0 and side == "sell":
+            out.append(o)
+        elif signed_qty < 0 and side == "buy":
+            out.append(o)
+    return out
+
+
+def reconcile_orphan_positions(client, ledger_open: set[str]) -> list[dict]:
+    """Close losing broker positions the ledger already exited.
+
+    Winning orphans are kept. Their open exit orders are not cancelled
+    before that decision — cancelling first is what left kept names with
+    no stop while the log said the trailing stop was still active.
+
+    A kept orphan that is not fully covered gets a protective exit
+    re-placed: an equity trailing stop sized to the broker qty, or an
+    options stop. If the broker rejects the options stop, the log says
+    so. It does not claim a trailing stop is active.
+    """
+    from invariants import is_option_symbol, position_is_protected
+
+    actions: list[dict] = []
+    try:
+        positions = list(client.get_all_positions())
+    except Exception as e:
+        log.warning(f"Orphan reconcile failed: {e}")
+        return [{"action": "error", "message": str(e)}]
+
+    open_orders = _load_open_orders(client)
+    by_sym: dict[str, list] = {}
+    for o in open_orders:
+        by_sym.setdefault(str(getattr(o, "symbol", "")), []).append(o)
+
+    for p in positions:
+        sym = str(p.symbol)
+        key = sym.replace("/", "")
+        if key in ledger_open or sym in ledger_open:
+            continue
+        try:
+            signed = float(p.qty)
+            upl = float(p.unrealized_pl)
+        except (TypeError, ValueError):
+            continue
+        sym_orders = by_sym.get(sym, [])
+        if upl > 0:
+            action = _keep_winning_orphan(
+                client, p, sym, signed, upl, sym_orders, position_is_protected,
+                is_option_symbol,
+            )
+        else:
+            action = _close_losing_orphan(client, sym, sym_orders)
+        actions.append(action)
+        (log.warning if action.get("level") == "warning" else log.info)(action["message"])
+    return actions
+
+
+def _keep_winning_orphan(client, position, sym, signed, upl, sym_orders,
+                         position_is_protected, is_option_symbol) -> dict:
+    closing = _closing_orders(sym_orders, signed)
+    if position_is_protected(signed, closing):
+        trails = [
+            o for o in closing
+            if "trail" in str(
+                getattr(o, "order_type", "") or getattr(o, "type", "")
+            ).lower()
+        ]
+        kind = "trailing stop" if trails else "protective exit"
+        msg = (f"Reconcile: KEEPING winning orphan {sym} "
+               f"(+${upl:.0f}) — {kind} still active")
+        return {"symbol": sym, "action": "kept", "protected": True,
+                "replaced": False, "message": msg}
+
+    # An undersized exit holds shares and blocks a full-size replacement.
+    # Cancel only those closing orders, and only because they do not cover.
+    # Equity replacement restores the old exit if the full-size trail is rejected.
+    if is_option_symbol(sym):
+        _cancel_closing(client, sym, closing)
+        return _reprotect_option(client, position, sym, upl)
+    return _reprotect_equity(client, position, sym, signed, upl, closing)
+
+
+def _cancel_closing(client, sym, closing) -> float:
+    old_qty = 0.0
+    for o in closing:
+        try:
+            q = getattr(o, "qty", None)
+            if q is not None:
+                old_qty += abs(float(q))
+        except (TypeError, ValueError):
+            pass
+        try:
+            client.cancel_order_by_id(o.id)
+        except Exception as e:
+            log.warning(f"Reconcile: {sym} cancel undersized exit failed: {e}")
+    return old_qty
+
+
+def _reprotect_equity(client, position, sym, signed, upl, closing=None) -> dict:
+    from order_executor import (
+        DEFAULT_TRAIL_PCT, _order_qty, _submit_trail_with_retry, _trail_for_profit,
+    )
+    qty = _order_qty(signed)
+    try:
+        live = client.get_open_position(sym)
+        qty = _order_qty(live.qty) or qty
+        signed = float(live.qty)
+    except Exception:
+        pass
+    plpc = 0.0
+    try:
+        plpc = abs(float(getattr(position, "unrealized_plpc", 0) or 0)) * 100
+    except (TypeError, ValueError):
+        plpc = 0.0
+    trail_pct = _trail_for_profit(plpc) if plpc >= 4 else DEFAULT_TRAIL_PCT
+    old_qty = _cancel_closing(client, sym, closing or [])
+    side = _exit_side_token(signed)
+    order, err = _submit_trail_with_retry(client, sym, qty, side, trail_pct)
+    if order is None and old_qty > 0:
+        restored, restore_err = _submit_trail_with_retry(
+            client, sym, _order_qty(old_qty), side, trail_pct)
+        if restored is not None:
+            msg = (f"Reconcile: KEEPING winning orphan {sym} (+${upl:.0f}) — "
+                   f"full-size trail rejected ({err}); restored {old_qty:g}-share "
+                   f"exit, position still under-covered")
+            return {"symbol": sym, "action": "kept", "protected": False,
+                    "replaced": False, "level": "warning", "message": msg}
+        err = restore_err or err
+    if order is None:
+        msg = (f"Reconcile: KEEPING winning orphan {sym} (+${upl:.0f}) — "
+               f"NO protective exit; trail rejected ({err})")
+        return {"symbol": sym, "action": "kept", "protected": False,
+                "replaced": False, "level": "warning", "message": msg}
+    msg = (f"Reconcile: KEEPING winning orphan {sym} (+${upl:.0f}) — "
+           f"re-placed trailing stop {trail_pct}% on {qty}")
+    return {"symbol": sym, "action": "kept", "protected": True,
+            "replaced": True, "message": msg}
+
+
+def _reprotect_option(client, position, sym, upl) -> dict:
+    from options_executor import submit_option_protective_stop
+    result = submit_option_protective_stop(client, position)
+    if result.get("placed"):
+        msg = (f"Reconcile: KEEPING winning option orphan {sym} (+${upl:.0f}) — "
+               f"re-placed options stop ${result.get('stop_price')} "
+               f"on {result.get('qty')} contract(s)")
+        return {"symbol": sym, "action": "kept", "protected": True,
+                "replaced": True, "message": msg}
+    msg = (f"Reconcile: KEEPING winning option orphan {sym} (+${upl:.0f}) — "
+           f"NO protective exit; broker refused an options stop "
+           f"({result.get('error')}). manage_options_exits is the only backstop")
+    return {"symbol": sym, "action": "kept", "protected": False,
+            "replaced": False, "level": "warning", "message": msg}
+
+
+def _close_losing_orphan(client, sym, sym_orders) -> dict:
+    for o in sym_orders:
+        try:
+            client.cancel_order_by_id(o.id)
+        except Exception:
+            pass
+    client.close_position(sym)
+    msg = (f"Reconcile: closed orphan broker position {sym} "
+           f"(ledger already exited it)")
+    return {"symbol": sym, "action": "closed", "message": msg}
+
+
 def sync_alpaca_positions():
     """
     Pull closed orders from Alpaca and update trade_ledger with realized P&L.
@@ -328,34 +544,16 @@ def sync_alpaca_positions():
         # broker's trailing-stop exits are different engines; when the
         # simulation closes first, the real position lingers and consumes
         # buying power invisibly (this froze the account on 2026-07-08).
+        #
+        # Only liquidate LOSERS. A profitable orphan means the ledger's
+        # price simulation closed early while the broker's exit is still
+        # riding a winner — killing those forfeits the runners the
+        # asymmetry design exists to capture (2026-07-27: GPC +$1,060,
+        # NFLX +$877). Exit orders are cancelled only on the liquidate
+        # path. A kept orphan keeps, or is given, a real protective exit.
         try:
             ledger_open = {t.symbol.replace("/", "") for t in _ledger.open_positions()}
-            for p in client.get_all_positions():
-                sym = str(p.symbol)
-                if sym not in ledger_open:
-                    # Stale exit orders (old brackets/trails) hold the qty
-                    # and make close_position fail with "insufficient qty
-                    # available" — cancel them first, then liquidate.
-                    try:
-                        stale = client.get_orders(GetOrdersRequest(
-                            status=QueryOrderStatus.OPEN, symbols=[sym]))
-                        for o in stale:
-                            client.cancel_order_by_id(o.id)
-                    except Exception:
-                        pass
-                    # Only liquidate LOSERS. A profitable "orphan" means the
-                    # ledger's price simulation closed early while the
-                    # broker's trailing stop is still riding a winner —
-                    # killing those forfeits exactly the runners the whole
-                    # asymmetry design exists to capture (2026-07-27:
-                    # GPC +$1,060, NFLX +$877 were orphans).
-                    if float(p.unrealized_pl) > 0:
-                        log.info(f"Reconcile: KEEPING winning orphan {sym} "
-                                 f"(+${float(p.unrealized_pl):.0f}) — trailing stop still active")
-                        continue
-                    client.close_position(sym)
-                    log.info(f"Reconcile: closed orphan broker position {sym} "
-                             f"(ledger already exited it)")
+            reconcile_orphan_positions(client, ledger_open)
         except Exception as e:
             log.warning(f"Orphan reconcile failed: {e}")
     except Exception as e:
@@ -464,7 +662,14 @@ def main():
             time.sleep(TICK_SECONDS * 5)
             continue
 
-        time.sleep(TICK_SECONDS)
+        # Align to the next minute. If this pass already spilled into a
+        # new minute, run that tick now instead of sleeping a full
+        # TICK_SECONDS and skipping it.
+        now_after = datetime.now(ET)
+        if tick_spilled_into_new_minute(last_tick_minute, now_after):
+            continue
+        delay = seconds_until_next_minute(now_after)
+        time.sleep(delay if delay > 0 else 0.05)
 
     log.info("Scheduler stopped cleanly.")
 

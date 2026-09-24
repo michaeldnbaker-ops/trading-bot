@@ -192,9 +192,25 @@ class OrderExecutor:
                     symbol, direction, entry, stop, target, pos_usd
                 )
 
+            if not _should_record_fill(result):
+                if result.get("status") == "unfilled":
+                    log.warning(
+                        f"ORDER UNFILLED: {symbol} {direction.upper()} — "
+                        f"working order cancelled, not ledgered "
+                        f"| order_id={result.get('order_id')}"
+                    )
+                else:
+                    log.info(
+                        f"ORDER NOT RECORDED: {symbol} {direction.upper()} "
+                        f"status={result.get('status')} qty={result.get('qty')}"
+                    )
+                return result
+
             log.info(
                 f"✅ ORDER SUBMITTED: {symbol} {direction.upper()} "
-                f"${pos_usd:.0f} | order_id={result.get('order_id')} "
+                f"${pos_usd:.0f} | qty={result.get('qty')} "
+                f"fill={result.get('fill_price')} "
+                f"| order_id={result.get('order_id')} "
                 f"| agent={agent}"
             )
             self._record_ledger(approved_signal, result)
@@ -221,10 +237,13 @@ class OrderExecutor:
         asymmetry is the entire engine of a compounding account.
         """
         qty       = max(1, int(pos_usd / entry))
-        side      = OrderSide.BUY  if direction == "long" else OrderSide.SELL
-        exit_side = OrderSide.SELL if direction == "long" else OrderSide.BUY
         # Trail distance = the ATR stop distance as a percent, clamped 2-6%
         trail_pct = round(min(max(abs(entry - stop) / entry * 100, 2.0), 6.0), 2)
+
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        side      = OrderSide.BUY  if direction == "long" else OrderSide.SELL
+        exit_side = OrderSide.SELL if direction == "long" else OrderSide.BUY
 
         entry_order = self._client.submit_order(MarketOrderRequest(
             symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
@@ -232,44 +251,76 @@ class OrderExecutor:
 
         # Wait for the fill so the trailing stop isn't rejected for missing qty.
         #
-        # This is the source of every "position has NO exit order" CRITICAL
-        # this month (Aug 4: 14 positions, Aug 12: 6, Aug 13: 3, Aug 14: 2).
-        # Two bugs compounded:
-        #
-        #   1. status.endswith("filled") is ALSO true for "partially_filled",
-        #      so the wait broke the moment the first share printed.
-        #   2. the trail was then sized from the REQUESTED qty, not what
-        #      actually filled. Alpaca rejects the whole order:
-        #        "insufficient qty available (requested: 279, available: 181)"
-        #      — and the position is left completely unprotected.
-        #
-        # Fix: wait for a terminal state, then size the stop from what the
-        # broker actually holds. A partial fill must still be protected; a
-        # smaller stop is correct, no stop is a catastrophe.
+        # A DAY market order that is still working after this wait must not
+        # be left live. On 2026-09-24 P filled 12 @ $122.21 after the wait;
+        # the caller had already treated the attempt as unfilled (ledger
+        # shares=0) and the backstop trail covered only the 1 share that
+        # had printed during the wait. Cancel the remainder. If the cancel
+        # races a fill, ledger and protect whatever the broker actually holds.
         import time as _t
-        filled_qty = 0
+        o = entry_order
+        st = ""
         for _ in range(15):
             o = self._client.get_order_by_id(entry_order.id)
-            st = str(o.status).lower().split(".")[-1]
-            filled_qty = int(float(getattr(o, "filled_qty", 0) or 0))
-            if st == "filled":
-                break
-            if st in ("canceled", "expired", "rejected"):
+            st = _norm_status(o)
+            if st in ("filled", "canceled", "expired", "rejected"):
                 break
             _t.sleep(1)
 
+        filled_qty = _filled_qty_of(o)
+        fill_price = _fill_price_of(o)
         # The broker's position is the authority — it also absorbs any
         # pre-existing holding this order added to.
-        try:
-            _p = self._client.get_open_position(symbol)
-            protect_qty = abs(int(float(_p.qty)))
-        except Exception:
-            protect_qty = filled_qty
+        protect_qty = _broker_position_qty(self._client, symbol) or filled_qty
+
+        if protect_qty < 1 and st not in ("canceled", "expired", "rejected", "filled"):
+            self._cancel_quiet(entry_order.id)
+            _t.sleep(0.4)
+            try:
+                o = self._client.get_order_by_id(entry_order.id)
+            except Exception:
+                pass
+            filled_qty = _filled_qty_of(o)
+            fill_price = _fill_price_of(o) or fill_price
+            protect_qty = _broker_position_qty(self._client, symbol) or filled_qty
+            st = _norm_status(o)
 
         if protect_qty < 1:
             log.error(f"{symbol}: entry did not fill (status={st}) — "
-                      f"no position to protect")
-            return {"status": "unfilled", "symbol": symbol}
+                      f"cancelled working order; nothing to ledger")
+            return {
+                "status": "unfilled",
+                "symbol": symbol,
+                "order_id": str(entry_order.id),
+                "qty": 0,
+                "cancelled": True,
+            }
+
+        # Partial fill with the DAY order still working: cancel the rest so
+        # later shares cannot arrive outside the protective stop.
+        if st not in ("filled", "canceled", "expired", "rejected"):
+            self._cancel_quiet(entry_order.id)
+            _t.sleep(0.4)
+            try:
+                o = self._client.get_order_by_id(entry_order.id)
+            except Exception:
+                pass
+            filled_qty = max(filled_qty, _filled_qty_of(o))
+            fill_price = _fill_price_of(o) or fill_price
+            protect_qty = _broker_position_qty(self._client, symbol) or filled_qty
+            st = _norm_status(o)
+
+        if protect_qty < 1:
+            return {
+                "status": "unfilled",
+                "symbol": symbol,
+                "order_id": str(entry_order.id),
+                "qty": 0,
+                "cancelled": True,
+            }
+
+        if fill_price <= 0:
+            fill_price = entry
 
         if protect_qty != qty:
             log.warning(f"{symbol}: requested {qty} but hold {protect_qty} — "
@@ -295,6 +346,7 @@ class OrderExecutor:
             "direction":    direction,
             "qty":          protect_qty,
             "entry":        entry,
+            "fill_price":   fill_price,
             "stop":         stop,
             "target":       target,       # bookkeeping marker only — real exit is the trail
             "trail_percent": trail_pct,
@@ -337,21 +389,37 @@ class OrderExecutor:
         log.warning(f"OrderExecutor rejected: {reason}")
         return {"status": "rejected", "reason": reason}
 
+    def _cancel_quiet(self, order_id) -> None:
+        try:
+            self._client.cancel_order_by_id(order_id)
+        except Exception as e:
+            log.warning(f"cancel {order_id} failed: {e}")
+
     # ── Write to trade_ledger ─────────────────────────────────────────────────
     def _record_ledger(self, signal: dict, order_result: dict) -> None:
         try:
             import trade_ledger as _ledger
-            entry  = float(signal.get("entry_price", 0))
-            stop   = float(signal.get("stop_loss_price", 0))
-            target = float(signal.get("target_price", 0))
+            signal_entry = float(signal.get("entry_price", 0) or 0)
+            # Broker fill, not the signal price. A signal at $100 that
+            # prints at $122.21 must not be ledgered as a $0 or $100 basis.
+            fill = order_result.get("fill_price")
+            entry = float(fill) if fill else signal_entry
+            stop   = float(signal.get("stop_loss_price", 0) or 0)
+            target = float(signal.get("target_price", 0) or 0)
             # Crypto orders are notional (no qty) — derive fractional shares
             # from notional/entry so the ledger can compute real P&L. With
             # shares recorded as 0, unrealized P&L multiplied by zero and
             # crypto positions were invisible to every downstream evaluator.
             qty = order_result.get("qty")
             if not qty and entry > 0:
-                qty = round(float(order_result.get("notional", 0)) / entry, 8)
-            qty  = qty or 0
+                qty = round(float(order_result.get("notional", 0) or 0) / entry, 8)
+            qty = float(qty or 0)
+            if qty <= 0 or entry <= 0:
+                log.warning(
+                    f"not ledgering {signal.get('symbol')}: "
+                    f"qty={qty} entry={entry} (no fill)"
+                )
+                return
             risk = abs(entry - stop) * qty
             _ledger.record_trade(
                 symbol        = signal["symbol"],
@@ -369,6 +437,45 @@ class OrderExecutor:
             log.warning(f"Could not record to trade_ledger: {e}")
 
 
+def _should_record_fill(result: dict) -> bool:
+    """Ledger and ORDER SUBMITTED only after a real submission with size.
+
+    Unfilled equity orders are cancelled, not recorded. A submitted equity
+    fill must carry qty. Crypto notionals have no qty key and still record.
+    """
+    if result.get("status") != "submitted":
+        return False
+    if "qty" in result and not result.get("qty"):
+        return False
+    return True
+
+
+def _norm_status(order) -> str:
+    return str(getattr(order, "status", "") or "").lower().split(".")[-1]
+
+
+def _filled_qty_of(order) -> int:
+    try:
+        return int(float(getattr(order, "filled_qty", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fill_price_of(order) -> float:
+    try:
+        return float(getattr(order, "filled_avg_price", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _broker_position_qty(client, symbol: str) -> int:
+    try:
+        p = client.get_open_position(symbol)
+        return abs(int(float(p.qty)))
+    except Exception:
+        return 0
+
+
 def _order_qty(qty) -> int | float:
     """Whole shares as int; otherwise the float Alpaca will accept."""
     q = abs(float(qty or 0))
@@ -377,6 +484,38 @@ def _order_qty(qty) -> int | float:
     if abs(q - round(q)) < 1e-8:
         return int(round(q))
     return q
+
+
+def _order_abs_qty_obj(order):
+    q = getattr(order, "qty", None)
+    if q is None and isinstance(order, dict):
+        q = order.get("qty")
+    if q is None:
+        return None
+    try:
+        return abs(float(q))
+    except (TypeError, ValueError):
+        return None
+
+
+def _closing_orders_for(orders, symbol: str, signed_qty: float) -> list:
+    """Closing-side open orders for one symbol (sell vs long, buy vs short)."""
+    out = []
+    for o in orders:
+        if isinstance(o, dict):
+            sym = str(o.get("symbol") or "")
+            side = str(o.get("side") or "")
+        else:
+            sym = str(getattr(o, "symbol", "") or "")
+            side = str(getattr(o, "side", "") or "")
+        if sym != symbol:
+            continue
+        side = side.lower().split(".")[-1]
+        if signed_qty > 0 and side == "sell":
+            out.append(o)
+        elif signed_qty < 0 and side == "buy":
+            out.append(o)
+    return out
 
 
 def _submit_trail_with_retry(client, symbol: str, qty, exit_side, trail_pct: float,
@@ -422,7 +561,11 @@ def ensure_protective_exits(client=None) -> dict:
     gaps, late fills after the 15s wait, rejected trails, and leftovers
     from before those commits deployed.
 
-    Never cancels an existing protective order. Only ADDS missing ones.
+    A closing order that covers fewer shares than the broker position is
+    naked, not protected. Those undersized exits are cancelled and
+    replaced with a trail sized to the broker's actual qty. If the
+    replacement fails, the previous (smaller) exit is restored so the
+    position is not left with nothing.
     """
     out = {"checked": 0, "protected": [], "failed": [], "already_ok": 0, "skipped": 0}
     if paper_only_violation():
@@ -462,10 +605,17 @@ def ensure_protective_exits(client=None) -> dict:
         p = pos_by_sym.get(sym)
         if p is None:
             continue
-        qty = _order_qty(p.qty)
+        signed = float(p.qty)
+        # Size from the live broker position, not from an earlier partial.
+        try:
+            live = client.get_open_position(sym)
+            signed = float(live.qty)
+        except Exception:
+            pass
+        qty = _order_qty(signed)
         if qty == 0:
             continue
-        side = OrderSide.SELL if float(p.qty) > 0 else OrderSide.BUY
+        side = OrderSide.SELL if signed > 0 else OrderSide.BUY
         trail_pct = DEFAULT_TRAIL_PCT
         try:
             plpc = abs(float(getattr(p, "unrealized_plpc", 0) or 0)) * 100
@@ -473,7 +623,28 @@ def ensure_protective_exits(client=None) -> dict:
                 trail_pct = _trail_for_profit(plpc)
         except Exception:
             pass
+        existing = _closing_orders_for(orders, sym, signed)
+        old_qty = 0.0
+        if existing:
+            for o in existing:
+                q = _order_abs_qty_obj(o)
+                if q:
+                    old_qty += q
+                try:
+                    client.cancel_order_by_id(o.id)
+                except Exception as ce:
+                    log.warning(f"{sym}: could not cancel undersized exit: {ce}")
+            _t.sleep(0.3)
+        placed_qty = qty
         order, err = _submit_trail_with_retry(client, sym, qty, side, trail_pct)
+        if order is None and existing and old_qty > 0:
+            placed_qty = _order_qty(old_qty)
+            log.error(f"{sym}: full-size trail failed ({err}) — "
+                      f"restoring {placed_qty}-share exit")
+            order, err = _submit_trail_with_retry(
+                client, sym, placed_qty, side, trail_pct)
+        if order is not None:
+            qty = placed_qty
         if order is None:
             _protect_failed_at[sym] = now
             out["failed"].append(sym)

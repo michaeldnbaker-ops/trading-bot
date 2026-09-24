@@ -70,13 +70,65 @@ def _field(obj, name, default=None):
     return getattr(obj, name, default)
 
 
+def _order_abs_qty(order):
+    """Absolute order qty, or None when the payload has no qty.
+
+    Missing qty is not zero: older checks and partial payloads omit it,
+    and those still count as covering the position. A present qty that
+    is smaller than the position does not.
+    """
+    q = _field(order, "qty", None)
+    if q is None:
+        return None
+    try:
+        return abs(float(q))
+    except (TypeError, ValueError):
+        return None
+
+
+def position_is_protected(position_qty: float, orders, symbol: str | None = None) -> bool:
+    """True when closing-side orders cover the whole position.
+
+    Sell protects a long, buy protects a short. A 1-share sell against a
+    12-share long is not protection — the other 11 shares are naked.
+    An order that does not carry qty cannot be proven short, so it still
+    counts as covering (callers that know the size must pass qty).
+    """
+    need = abs(float(position_qty or 0))
+    if need <= 0:
+        return True
+    covered = 0.0
+    unqualified = False
+    saw_closing = False
+    for o in orders:
+        if symbol is not None and str(_field(o, "symbol", "") or "") != symbol:
+            continue
+        side = str(_field(o, "side", "") or "").lower().split(".")[-1]
+        if float(position_qty) > 0 and side != "sell":
+            continue
+        if float(position_qty) < 0 and side != "buy":
+            continue
+        saw_closing = True
+        q = _order_abs_qty(o)
+        if q is None:
+            unqualified = True
+        else:
+            covered += q
+    if not saw_closing:
+        return False
+    if unqualified:
+        return True
+    return covered + 1e-9 >= need
+
+
 def naked_equity_symbols(positions, orders) -> list[str]:
-    """Equity symbols the broker holds with no closing-side open order.
+    """Equity symbols the broker holds without a full-size closing order.
 
     An order only protects a position if it CLOSES it: sell against a long,
-    buy against a short. Matching on symbol alone treats any resting order
-    as protection, so a wrong-side order would read as safe while the
-    position sat naked.
+    buy against a short, and the closing qty covers the position. Matching
+    on symbol alone treats any resting order as protection, so a wrong-side
+    order — or a 1-share trail on a 12-share fill — would read as safe
+    while the position sat naked.
     """
     qty: dict[str, float] = {}
     for p in positions:
@@ -85,20 +137,10 @@ def naked_equity_symbols(positions, orders) -> list[str]:
         if sym:
             qty[sym] = q
 
-    protected: set[str] = set()
-    for o in orders:
-        sym = str(_field(o, "symbol", "") or "")
-        q = qty.get(sym)
-        if q is None or q == 0:
-            continue
-        side = str(_field(o, "side", "") or "").lower().split(".")[-1]
-        if (side == "sell" and q > 0) or (side == "buy" and q < 0):
-            protected.add(sym)
-
     return sorted(
         sym for sym, q in qty.items()
         if q != 0
-        and sym not in protected
+        and not position_is_protected(q, orders, symbol=sym)
         and not is_crypto_symbol(sym)
         and not is_option_symbol(sym)
     )
