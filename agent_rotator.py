@@ -52,8 +52,15 @@ Rotation logic:
   5. Update agent_summary.json accordingly.
   6. Re-activate benched agents after BENCH_DAYS only when after-cost
      expectancy is positive over MIN_TRADES_TO_EVALUATE (20d window).
-     Otherwise they stay BENCHED and the cycle logs why. A pin
-     (benched_at far in the future, and/or pinned_reason) stays benched.
+     Otherwise they stay BENCHED. That note is a hold, not a rotation:
+     it is printed and returned, and it does not rewrite
+     agent_summary.json. A pin (benched_at far in the future, and/or
+     pinned_reason) stays benched.
+
+     Benched agents do not trade, so trades_20d decays. After about 20
+     days the sample falls under MIN_TRADES_TO_EVALUATE and this gate
+     cannot pass. A timer bench is effectively permanent. The way back
+     is a new variant or an Edge Research spec, not waiting out the timer.
 
 "Better alternatives" in this system means an agent variant with different
 parameters (e.g. TechnicalAgent_v2, TechnicalAgent_conservative).
@@ -152,6 +159,11 @@ def reactivation_decision(stats, min_trades: int | None = None) -> tuple[bool, s
 
     Positive means strictly greater than zero. The trade count is the
     evaluator's MIN_TRADES_TO_EVALUATE unless a test overrides it.
+
+    A benched agent places no trades, so the 20d sample shrinks. After
+    about 20 days trades_20d is below the floor and this function stays
+    False. Waiting out BENCH_DAYS does not bring the agent back; a new
+    variant or an Edge Research spec does.
     """
     need = REACTIVATION_MIN_TRADES if min_trades is None else min_trades
     if stats is None:
@@ -194,6 +206,11 @@ class AgentRotator:
         now     = datetime.now(timezone.utc)
 
         actions: list[str] = []
+        # Holds are not rotations. A pin or a failed expectancy gate must
+        # not land in `actions`: step 3 rewrites agent_summary.json whenever
+        # that list is non-empty, so a permanent pin would rewrite the file
+        # every live cycle and "No rotations needed" would never print.
+        holds: list[str] = []
         agent_stats = {a.name: a for a in report.agents}
 
         # ── Step 1: Re-activate rested agents with positive expectancy ────
@@ -201,6 +218,9 @@ class AgentRotator:
         # when the evaluator's 20d after-cost expectancy is positive over
         # REACTIVATION_MIN_TRADES. Pins (far-future benched_at and/or
         # pinned_reason) stay BENCHED regardless of the numbers.
+        # Benched agents do not trade, so trades_20d decays and after ~20
+        # days the gate cannot pass. That hold is permanent until a new
+        # variant or an Edge Research spec replaces the agent.
         for name, info in summary.items():
             if info.get("active", True):
                 continue
@@ -212,17 +232,17 @@ class AgentRotator:
                 benched_at = benched_at.replace(tzinfo=timezone.utc)
             if is_pinned_bench(info, benched_at, now):
                 why = info.get("pinned_reason") or "benched_at far future"
-                action = f"BENCHED {name} stays benched — pinned ({why})"
-                actions.append(action)
-                log.info(action)
+                hold = f"BENCHED {name} stays benched — pinned ({why})"
+                holds.append(hold)
+                log.info(hold)
                 continue
             if (now - benched_at).days < BENCH_DAYS:
                 continue
             ok, why = reactivation_decision(agent_stats.get(name))
             if not ok:
-                action = f"BENCHED {name} stays benched — {why}"
-                actions.append(action)
-                log.info(action)
+                hold = f"BENCHED {name} stays benched — {why}"
+                holds.append(hold)
+                log.info(hold)
                 continue
             if not dry_run:
                 summary[name]["active"]     = True
@@ -299,6 +319,7 @@ class AgentRotator:
             active_count -= 1
 
         # ── Step 3: Persist updated summary ───────────────────────────────
+        # Holds do not count. A pinned-only cycle must not touch the file.
         if not dry_run and actions:
             with open(SUMMARY, "w") as f:
                 json.dump(summary, f, indent=2)
@@ -307,17 +328,23 @@ class AgentRotator:
             "timestamp": now.isoformat(),
             "dry_run":   dry_run,
             "actions":   actions,
+            "holds":     holds,
             "top_agent": report.top_agent,
             "flagged":   report.flagged_agents,
         }
 
-        # Print summary
+        # Print summary. Holds have their own header so a pin does not
+        # look like a rotation and does not suppress the no-change line.
         print(f"\n{'[DRY RUN] ' if dry_run else ''}Rotation cycle — {now.strftime('%Y-%m-%d %H:%M UTC')}")
         if actions:
             for a in actions:
                 print(f"  • {a}")
         else:
             print("  No rotations needed — all agents performing within threshold.")
+        if holds:
+            print("  Holds — still benched, no state change:")
+            for h in holds:
+                print(f"  • {h}")
 
         return result
 

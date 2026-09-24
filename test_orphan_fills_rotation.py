@@ -5,9 +5,11 @@ No broker and no alpaca-py. Paper-only and the crypto hard-off stay as they are.
 
 from __future__ import annotations
 
+import io
 import sys
 import types
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -461,12 +463,17 @@ class ExpectancyReactivation(unittest.TestCase):
         name = "TechnicalAgent"
         benched = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
         summary = {name: {"active": False, "benched_at": benched}}
-        result, summary, ev = self._run(summary, [
-            _stats(name=name, expectancy_after_costs_20d=-4.5, trades_20d=12),
-        ])
-        self.assertTrue(any("stays benched" in a and "not positive" in a
-                            for a in result["actions"]))
-        self.assertFalse(any(a.startswith("REACTIVATED") for a in result["actions"]))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result, summary, ev = self._run(summary, [
+                _stats(name=name, expectancy_after_costs_20d=-4.5, trades_20d=12),
+            ])
+        self.assertEqual(result["actions"], [])
+        self.assertTrue(any("stays benched" in h and "not positive" in h
+                            for h in result["holds"]))
+        text = buf.getvalue()
+        self.assertIn("No rotations needed", text)
+        self.assertIn("Holds — still benched", text)
         self.assertFalse(summary[name]["active"])
         ev.assert_not_called()
 
@@ -477,9 +484,9 @@ class ExpectancyReactivation(unittest.TestCase):
         result, _, ev = self._run(summary, [
             _stats(name=name, trades_20d=3, expectancy_after_costs_20d=20.0),
         ])
-        self.assertTrue(any("stays benched" in a and "3 trades" in a
-                            for a in result["actions"]))
-        self.assertFalse(any(a.startswith("REACTIVATED") for a in result["actions"]))
+        self.assertEqual(result["actions"], [])
+        self.assertTrue(any("stays benched" in h and "3 trades" in h
+                            for h in result["holds"]))
         ev.assert_not_called()
 
     def test_bench_window_still_required(self):
@@ -506,9 +513,9 @@ class ExpectancyReactivation(unittest.TestCase):
         result, summary, ev = self._run(summary, [
             _stats(name=name, expectancy_after_costs_20d=25.0, trades_20d=20),
         ])
-        self.assertTrue(any("pinned" in a and "stays benched" in a
-                            for a in result["actions"]))
-        self.assertFalse(any(a.startswith("REACTIVATED") for a in result["actions"]))
+        self.assertEqual(result["actions"], [])
+        self.assertTrue(any("pinned" in h and "stays benched" in h
+                            for h in result["holds"]))
         self.assertFalse(summary[name]["active"])
         self.assertIsNotNone(summary[name]["benched_at"])
         ev.assert_not_called()
@@ -520,8 +527,42 @@ class ExpectancyReactivation(unittest.TestCase):
             "active": False, "benched_at": benched, "pinned_reason": "ops hold",
         }}
         result, summary, _ev = self._run(summary, [_stats(name=name)])
-        self.assertTrue(any("pinned" in a for a in result["actions"]))
+        self.assertEqual(result["actions"], [])
+        self.assertTrue(any("pinned" in h for h in result["holds"]))
         self.assertFalse(summary[name]["active"])
+
+    def test_pinned_only_does_not_write_summary(self):
+        import tempfile
+        from pathlib import Path
+        name = "MeanReversionAgent"
+        summary = {name: {
+            "active": False,
+            "benched_at": "2099-01-01T00:00:00+00:00",
+            "pinned_reason": "manual pin",
+        }}
+        rotator = AgentRotator()
+        report = EvalReport(
+            generated_at="test",
+            agents=[_stats(name=name, expectancy_after_costs_20d=25.0, trades_20d=20)],
+            flagged_agents=[],
+        )
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "agent_summary.json"
+            with redirect_stdout(buf), \
+                 patch.object(rotator.evaluator, "evaluate", return_value=report), \
+                 patch.object(rotator.logger, "get_summary", return_value=summary), \
+                 patch.object(rotator, "_write_rotation_event") as ev, \
+                 patch("agent_rotator.SUMMARY", path):
+                result = rotator.run_rotation(dry_run=False)
+            self.assertFalse(path.exists())
+        self.assertEqual(result["actions"], [])
+        self.assertTrue(any("pinned" in h for h in result["holds"]))
+        self.assertFalse(summary[name]["active"])
+        ev.assert_not_called()
+        text = buf.getvalue()
+        self.assertIn("No rotations needed", text)
+        self.assertIn("Holds — still benched", text)
 
     def test_decision_helper_requires_positive_sample(self):
         ok, _why = reactivation_decision(_stats(trades_20d=10, expectancy_after_costs_20d=0.01))
@@ -543,6 +584,9 @@ class ReconcileAndSchedule(unittest.TestCase):
         self.assertAlmostEqual(unexplained_day_gap(1000, 100, 0), 900)
 
     def test_ghost_close_exit_at_is_et(self):
+        # No network, no wall clock, no dotenv. The old test patched
+        # requests.get; close_ghosts imports invariants, and a missing
+        # dotenv was swallowed as closed=0.
         import trade_ledger as tl
         self.assertEqual(
             tl.broker_time_to_et("2026-09-24T18:05:00.000Z"),
@@ -558,30 +602,22 @@ class ReconcileAndSchedule(unittest.TestCase):
             entry_price=10.0, target_price=12.0, stop_price=9.0,
             risk_dollar=10.0, shares=1,
         )
-
-        def fake_get(url, headers=None, params=None, timeout=None):
-            class R:
-                status_code = 200
-
-                def json(self):
-                    if url.endswith("/positions"):
-                        return []
-                    if "/orders" in url:
-                        return []
-                    return [{
-                        "symbol": "SUNB", "price": "11.50",
-                        "transaction_time": "2026-09-24T18:05:00.000Z",
-                    }]
-            return R()
-
-        with patch("requests.get", fake_get), \
-             patch.object(tl, "load_ledger", return_value={"t1": trade}), \
-             patch.object(tl, "save_ledger"):
-            out = tl.close_ghosts()
+        book = {
+            "broker_syms": set(),
+            "pending": set(),
+            "fills": {"SUNB": (11.5, "2026-09-24T18:05:00.000Z")},
+        }
+        fixed_now = datetime(2026, 9, 24, 15, 0, tzinfo=tl.ET)
+        with patch.object(tl, "load_ledger", return_value={"t1": trade}), \
+             patch.object(tl, "save_ledger") as save, \
+             patch.object(tl, "_fetch_ghost_book", side_effect=AssertionError("network")):
+            out = tl.close_ghosts(book=book, now=fixed_now)
+        self.assertNotIn("error", out, out)
         self.assertEqual(out["closed"], 1)
         self.assertEqual(trade.exit_at_et, "2026-09-24 14:05:00")
         self.assertEqual(trade.exit_price, 11.5)
         self.assertNotEqual(trade.exit_at_et[:13], "2026-09-24 18")
+        save.assert_called_once()
 
     def test_earnings_skips_etfs_before_calendar(self):
         import earnings_agent as ea

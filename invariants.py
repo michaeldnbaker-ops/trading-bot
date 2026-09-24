@@ -39,10 +39,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 
 BASE = Path(__file__).resolve().parent
-load_dotenv(BASE / ".env")
+# Optional. Cron and unit tests import this module without python-dotenv;
+# a hard import used to abort close_ghosts inside its broad except and
+# look like "nothing closed" instead of a missing dependency.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE / ".env")
+except Exception:
+    pass
 log = logging.getLogger("Invariants")
 HISTORY = BASE / "data" / "invariant_history.jsonl"
 PAPER_API = "https://paper-api.alpaca.markets"
