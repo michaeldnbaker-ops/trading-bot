@@ -47,6 +47,22 @@ TARGET_PCT          = 0.07
 MIN_CONFIDENCE      = 0.55
 EXPIRY_DAYS         = 7      # shorter expiry for earnings plays
 
+# ETFs have no earnings calendar. ticker.calendar 404s on DIA/QQQ/XLV
+# and the same noise shows up once the dynamic universe injects them.
+ETF_SYMBOLS = frozenset({
+    "SPY", "QQQ", "IWM", "DIA",
+    "XLK", "XLF", "XLE", "XLV", "XLI", "XLC", "XLY", "XLP", "XLB", "XLU", "XLRE",
+    "GLD", "TLT", "UUP", "HYG", "LQD",
+    "TQQQ", "SQQQ", "UPRO", "SPXU", "TNA", "TZA", "LABU", "LABD",
+    "SOXL", "SOXS", "SPXS", "SDOW", "UDOW", "TECL", "TECS", "FAS", "FAZ",
+    "QLD", "SSO", "DDM", "UWM", "QID", "SDS", "DXD", "TWM",
+    "SH", "PSQ", "DOG", "RWM",
+})
+
+
+def is_etf_symbol(symbol: str) -> bool:
+    return str(symbol or "").upper() in ETF_SYMBOLS
+
 
 class EarningsAgent:
     name = "EarningsAgent"
@@ -60,6 +76,9 @@ class EarningsAgent:
             return []
         signals = []
         for symbol in self.watchlist:
+            if is_etf_symbol(symbol):
+                log.debug(f"EarningsAgent: skip ETF {symbol} (no earnings calendar)")
+                continue
             try:
                 sig = self._analyze(symbol)
                 if sig:
@@ -69,6 +88,10 @@ class EarningsAgent:
         return signals
 
     def _analyze(self, symbol: str) -> Optional[dict]:
+        if is_etf_symbol(symbol):
+            return None
+        if not _YF_OK:
+            return None
         ticker = yf.Ticker(symbol)
 
         # Check for upcoming or recent earnings

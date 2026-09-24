@@ -48,6 +48,18 @@ START_EQUITY = 100_000.0
 RECONCILE_TOLERANCE = 250.0     # $ gap that triggers a visible warning
 
 
+def unexplained_day_gap(day_pnl, ledger_realized, options_day_pnl=0.0) -> float:
+    """Broker day P&L minus ledger realized, after option marks.
+
+    Options are placed by options_executor and are not ledger rows, so
+    their intraday P&L sits inside broker day P&L and used to inflate
+    the RECONCILE gap. Pass today's option P&L (unrealized_intraday_pl
+    on open contracts, not lifetime unrealized — that would subtract
+    marks from prior days that are not in today's day_pnl).
+    """
+    return abs(float(day_pnl) - float(ledger_realized) - float(options_day_pnl or 0))
+
+
 def _hdr() -> dict:
     return {"APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
             "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "")}
@@ -114,6 +126,7 @@ def snapshot() -> dict:
             "is_option": len(p["symbol"]) > 12,
             "side": "LONG" if float(p["qty"]) > 0 else "SHORT",
             "mv": float(p["market_value"]), "unrl": float(p["unrealized_pl"]),
+            "unrl_intraday": float(p.get("unrealized_intraday_pl") or 0),
         } for p in ps]
         d["unrealized"] = sum(p["unrl"] for p in d["positions"])
         d["gross_exposure"] = sum(abs(p["mv"]) for p in d["positions"])
@@ -150,13 +163,21 @@ def snapshot() -> dict:
     # broker's day P&L. A large gap means positions exist that the ledger
     # cannot see (the drift that hid $19,908 of losses). Say so loudly.
     if d.get("ledger_realized_today") is not None and d.get("day_pnl") is not None:
-        gap = abs(d["day_pnl"] - d["ledger_realized_today"])
+        options_day = sum(
+            float(p.get("unrl_intraday") or 0)
+            for p in d.get("positions", [])
+            if p.get("is_option")
+        )
+        d["options_day_pnl"] = round(options_day, 2)
+        gap = unexplained_day_gap(
+            d["day_pnl"], d["ledger_realized_today"], options_day)
         d["reconcile_gap"] = gap
         if gap > RECONCILE_TOLERANCE:
             d["warnings"].append(
                 f"RECONCILE: broker day P&L ${d['day_pnl']:+,.0f} vs ledger realized "
-                f"${d['ledger_realized_today']:+,.0f} — ${gap:,.0f} unexplained. "
-                f"Broker figure is authoritative; the gap is open-position marks "
+                f"${d['ledger_realized_today']:+,.0f} plus option day marks "
+                f"${options_day:+,.0f} — ${gap:,.0f} unexplained. "
+                f"Broker figure is authoritative; the gap is open equity marks "
                 f"and/or positions missing from the ledger.")
 
     # Positions the ledger does not know about — the drift that has

@@ -40,7 +40,7 @@ import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -454,6 +454,27 @@ def _check_hits(trade: Trade, df) -> tuple[Optional[str], Optional[float], Optio
     return (None, None, None)
 
 
+def broker_time_to_et(when: str) -> str:
+    """Alpaca transaction_time is UTC. exit_at_et is an ET wall clock.
+
+    Slicing the ISO string left ghost closes stamped in UTC (18:05 stored
+    as if it were 18:05 ET). Parse and convert. A value that is already
+    an ET wall clock without a timezone is returned unchanged.
+    """
+    if not when:
+        return ""
+    raw = str(when).strip()
+    if "T" not in raw and "+" not in raw and not raw.endswith("Z"):
+        return raw[:19]
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ET).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return raw[:19].replace("T", " ")
+
+
 def _pnl_for(trade: Trade, exit_price: float) -> float:
     sign = 1 if trade.side == "LONG" else -1
     return round(trade.shares * (exit_price - trade.entry_price) * sign, 2)
@@ -542,16 +563,62 @@ def sync_from_broker() -> dict:
     return out
 
 
-def _recently_opened(trade: Trade, seconds: int = 120) -> bool:
+def _recently_opened(trade: Trade, seconds: int = 120, now: datetime | None = None) -> bool:
     """True if the row is so new the broker fill may not have landed yet."""
     try:
         opened = datetime.fromisoformat(trade.opened_at_et[:19]).replace(tzinfo=ET)
-        return (datetime.now(ET) - opened).total_seconds() < seconds
+        clock = now or datetime.now(ET)
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=ET)
+        return (clock - opened).total_seconds() < seconds
     except Exception:
         return False
 
 
-def close_ghosts() -> dict:
+def _fetch_ghost_book() -> dict:
+    """Positions, pending symbols, and the latest fill per symbol.
+
+    Returns {broker_syms, pending, fills} or {error}. Callers that already
+    have this book (tests) skip the network.
+    """
+    import os as _os, requests as _rq
+    h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
+         "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
+    r = _rq.get("https://paper-api.alpaca.markets/v2/positions",
+                headers=h, timeout=15)
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code}"}
+    broker_syms = {p["symbol"] for p in r.json()}
+    pending = set()
+    try:
+        ords = _rq.get("https://paper-api.alpaca.markets/v2/orders",
+                       headers=h, params={"status": "open", "limit": 200},
+                       timeout=15)
+        if ords.status_code == 200:
+            pending = {o.get("symbol") for o in ords.json() if o.get("symbol")}
+    except Exception:
+        pass
+    fills: dict[str, tuple[float, str]] = {}
+    try:
+        from datetime import timedelta as _td
+        since = (datetime.now(ET) - _td(days=5)).strftime("%Y-%m-%d")
+        fr = _rq.get("https://paper-api.alpaca.markets/v2/account/activities/FILL",
+                     headers=h, params={"after": since, "page_size": 100},
+                     timeout=15)
+        if fr.status_code == 200:
+            for a in fr.json():
+                sym = a.get("symbol")
+                if not sym:
+                    continue
+                prev = fills.get(sym)
+                if prev is None or a["transaction_time"] > prev[1]:
+                    fills[sym] = (float(a["price"]), a["transaction_time"])
+    except Exception:
+        pass
+    return {"broker_syms": broker_syms, "pending": pending, "fills": fills}
+
+
+def close_ghosts(book: dict | None = None, now: datetime | None = None) -> dict:
     """Close ledger rows the broker does not hold.
 
     sync_from_broker is one-directional: it re-opens orphans. Ghosts —
@@ -559,51 +626,33 @@ def close_ghosts() -> dict:
     and produced the SUNB warning. Close them against the actual fill
     when we have one. Skip rows opened in the last two minutes (fill
     race) and crypto (own scheduler / different symbol format).
+
+    `book` and `now` are for tests: pass the broker snapshot and a fixed
+    clock so this does not touch the network or the wall clock.
     """
     out = {"closed": 0, "skipped_recent": 0, "checked": 0}
     try:
-        import os as _os, requests as _rq
         from invariants import is_crypto_symbol, is_option_symbol, ghost_symbols
-        h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
-             "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
-        r = _rq.get("https://paper-api.alpaca.markets/v2/positions",
-                    headers=h, timeout=15)
-        if r.status_code != 200:
-            return {**out, "error": f"HTTP {r.status_code}"}
-        broker_syms = {p["symbol"] for p in r.json()}
-        pending = set()
-        try:
-            ords = _rq.get("https://paper-api.alpaca.markets/v2/orders",
-                           headers=h, params={"status": "open", "limit": 200},
-                           timeout=15)
-            if ords.status_code == 200:
-                pending = {o.get("symbol") for o in ords.json() if o.get("symbol")}
-        except Exception:
-            pass
-        fills: dict[str, tuple[float, str]] = {}
-        try:
-            from datetime import timedelta as _td
-            since = (datetime.now(ET) - _td(days=5)).strftime("%Y-%m-%d")
-            fr = _rq.get("https://paper-api.alpaca.markets/v2/account/activities/FILL",
-                         headers=h, params={"after": since, "page_size": 100},
-                         timeout=15)
-            if fr.status_code == 200:
-                for a in fr.json():
-                    sym = a.get("symbol")
-                    if not sym:
-                        continue
-                    prev = fills.get(sym)
-                    if prev is None or a["transaction_time"] > prev[1]:
-                        fills[sym] = (float(a["price"]), a["transaction_time"])
-        except Exception:
-            pass
     except Exception as e:
         return {**out, "error": str(e)}
+    if book is None:
+        try:
+            book = _fetch_ghost_book()
+        except Exception as e:
+            return {**out, "error": str(e)}
+    if book.get("error") and "broker_syms" not in book:
+        return {**out, "error": book["error"]}
+    broker_syms = book.get("broker_syms") or set()
+    pending = book.get("pending") or set()
+    fills = book.get("fills") or {}
 
     trades = load_ledger()
     open_syms = [t.symbol for t in trades.values() if t.is_open]
     ghosts = ghost_symbols(open_syms, broker_syms)
-    now_iso = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
+    clock = now or datetime.now(ET)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=ET)
+    now_iso = clock.strftime("%Y-%m-%d %H:%M:%S")
     for t in list(trades.values()):
         if not t.is_open:
             continue
@@ -613,7 +662,7 @@ def close_ghosts() -> dict:
         if is_crypto_symbol(t.symbol) or is_option_symbol(t.symbol):
             continue
         out["checked"] += 1
-        if _recently_opened(t) or t.symbol in pending or key in pending:
+        if _recently_opened(t, now=clock) or t.symbol in pending or key in pending:
             out["skipped_recent"] += 1
             continue
         fill = fills.get(key) or fills.get(t.symbol)
@@ -621,7 +670,7 @@ def close_ghosts() -> dict:
             px, when = fill
             t.status = "stop"
             t.exit_price = px
-            t.exit_at_et = when[:19].replace("T", " ")
+            t.exit_at_et = broker_time_to_et(when)
             t.exit_reason = "broker fill (ghost close)"
         else:
             px = t.current_price or t.entry_price
@@ -777,7 +826,7 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     _px, _when = _fill
                     t.status       = "stop"
                     t.exit_price   = _px
-                    t.exit_at_et   = _when[:19].replace("T", " ")
+                    t.exit_at_et   = broker_time_to_et(_when)
                     t.exit_reason  = "broker fill (ghost close)"
                 elif last_price is not None:
                     t.status       = "expired"
@@ -797,6 +846,11 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                 continue
 
             if status:
+                # Broker-held names never reach here (the override above
+                # clears status). When the broker is unreachable this is
+                # the simulated target/stop. When a fill is already known
+                # because the broker dropped the position, the ghost-close
+                # branch above booked that fill instead of the signal price.
                 t.status        = status
                 t.exit_price    = exit_price
                 t.exit_at_et    = exit_at
@@ -841,7 +895,7 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                         _px, _when = _fill
                         t.status       = "stop"
                         t.exit_price   = _px
-                        t.exit_at_et   = _when[:19].replace("T", " ")
+                        t.exit_at_et   = broker_time_to_et(_when)
                         t.exit_reason  = f"trail stop hit after {age_days}d"
                     else:
                         t.status       = "expired"
