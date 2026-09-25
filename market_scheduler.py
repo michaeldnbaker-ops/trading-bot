@@ -590,6 +590,15 @@ def run_eval_cycle():
         report    = evaluator.evaluate()
         evaluator.save_report(report)
         log.info("\n" + report.summary_text())
+        # Same eval windows as today (10:00 and 15:30 ET). The 10:00 ET
+        # run is 9:00 CT and is what writes logs/size_tilt_qualifiers.json
+        # when SIZE_TILT_ENABLED is off. Orders do not. A complete list
+        # locks for the day, so the 15:30 repeat does not recompute.
+        try:
+            from size_tilt import ensure_today
+            ensure_today(report)
+        except Exception as e:
+            log.warning(f"size tilt qualifier record failed: {e}")
 
         if report.flagged_agents:
             log.info(f"Flagged agents detected: {report.flagged_agents} — running rotation...")

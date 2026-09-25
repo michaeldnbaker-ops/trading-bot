@@ -99,6 +99,12 @@ ETRADE_ACCESS_TOKEN_SECRET=your_access_token_secret
 GMAIL_ADDRESS=mddnnbr@gmail.com
 GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
 REPORT_TO_EMAIL=mddnnbr@gmail.com
+
+# Evidence-gated per-agent size tilt. Default off. Do not enable until an
+# agent clears both after-cost bars (20d expectancy > 0 over >= 10 trades
+# AND all-time expectancy > 0 over >= 30). Qualifiers may size to 1.5×
+# MAX_NOTIONAL_USD ($2,250) and may exceed the 2% cap up to that amount.
+SIZE_TILT_ENABLED=false
 ```
 
 Press **Ctrl+X**, then **Y**, then **Enter** to save.
