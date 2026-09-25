@@ -1,0 +1,141 @@
+# Rotation contract (Learning Loop)
+
+**Applies to specs A, B, and C.** Docs-only / research HOLD. Paper Alpaca only. No crypto. No strategy implementation.
+
+**CoS / Learning Loop lock (2026-09-16):** Spec B implementation **PARKED** (do not PROMOTE B). Spec C is **quality-filter-only, not alpha**. Single focus = Spec A validation + kill — [SPEC-A-VALIDATION.md](SPEC-A-VALIDATION.md). Day-1 (2026-09-11) **NOT LOCKED**. ≥5-day clock **restarts 2026-09-16** (scorecard email restored; Sep 14–15 gap days, no backfill). Seed `{ "active": false }` before PROMOTE; no cold PROMOTE.
+
+Rotator vocabulary is the **only** state language these specs use: **FLAG** → **BENCHED** → **PROMOTED** / **REACTIVATED**. Do not use KEEP / DISABLE.
+
+---
+
+## What the code actually does (`agent_rotator.py`)
+
+Twice daily (`market_scheduler` 10:00 and 15:30 ET):
+
+1. `AgentEvaluator.evaluate()` may **FLAG** an agent (20d P&amp;L negative and &gt;20% worse than ensemble avg, ≥10 trades).
+2. For each FLAG, if the name is not in `PROTECTED_AGENTS` and active count &gt; `MIN_ACTIVE_AGENTS` (2): rotator writes `active: false` and logs **BENCHED**.
+3. `_find_replacement` (**Ops PR #3 head**; this HOLD does not change rotator code) walks `AGENT_VARIANTS[benched_name]` **in list order** and **PROMOTED** the **first** variant whose `agent_summary.json` entry is explicitly `{ "active": false }`. **Missing-from-summary is not a promote.** Cold sleeves must be **seeded** in `agent_summary.json` as `{ "active": false }` or they **never PROMOTE**. Later `active: false` names in the same list are not promoted in that cycle. Two sleeves cannot both be “first.”
+4. After `BENCH_DAYS` (3), a benched name is **REACTIVATED** (`active: true`, `benched_at: null`). The bleeder returns to the tick. **PROMOTED does not permanently replace the bleeder.** That 3-day window is expected rotator behavior, not a spec reject. Permanent off is not in the rotator. If the bleeder **FLAG**s again after REACTIVATED, it can be **BENCHED** again — and the next inactive ordered variant may then be **PROMOTED**.
+
+`improver_agent.py` is **not** on the scheduler. It writes markdown recs only. It **cannot** auto-apply these specs, retire a sleeve, or skip REACTIVATED.
+
+`StrategyLearner.get_agent_adjustment()` has **no callers**. Friday `learned_params.json` confidence deltas **do not** retune a new sleeve until Ops wires that hook. Specs must not assume Friday learn will raise/lower a new agent’s bar.
+
+---
+
+## Historical blinds (inventory, not a second loop)
+
+| Blind | Code today |
+|---|---|
+| Ensemble ignored benches | `ensemble._load_benched_agent_names` skips `active: false` — assume this holds |
+| MetaAgent weights stuck at 1.0 | Weights from ledger 20d closed P&amp;L when enough trades exist; else `DEFAULT_WEIGHTS` |
+| Improver human-only | Still true. Promotion path = **rotator only** |
+| Friday params unused | Still true. Do not spec learner-driven retune |
+
+---
+
+## Sleeve lifecycle (not always-on)
+
+```
+ship cold (active: false)
+    → FLAG on a bleeder (evaluator)
+    → BENCHED bleeder (rotator)
+    → PROMOTED this sleeve (AGENT_VARIANTS first hit)
+    → live: generate_signals + MetaAgent weight/regime
+    → if this sleeve is later FLAG'd: BENCHED (3d) then REACTIVATED
+```
+
+1. **Ship cold.** Name is in `Ensemble.agents` **and** `agent_summary.json` is seeded `{ "active": false }`. Roster presence alone is not enough: Ops PR #3 `_find_replacement` skips names missing from summary. Seeded cold so ticks skip it until **PROMOTED**. Not equal-weight on day one.
+2. **PROMOTED only** when rotator **BENCHED** a listed sibling **and** this sleeve is already a summary row with `active: false`. That is the only on-ramp.
+3. **Regime while live:** `regime_affinity` / `regime_aversion` on every signal. MetaAgent boosts intersection with `RegimeDetector`, applies `REGIME_PENALTY` on aversion. Wrong regime → mute via weight/empty signals, not a fake rotator event.
+4. **After 3 days** the **BENCHED bleeder is REACTIVATED**. “Replace bleeders” is **temporary** unless **FLAG** fires again. Both the bleeder and the **PROMOTED** sleeve may then run. This is expected. Specs must not invent a permanent-off flag.
+5. **PROTECTED** names are never BENCHED. FLAG on them logs “reducing weight instead of benching.” A sleeve that only lists a PROTECTED parent in `AGENT_VARIANTS` will **never** be PROMOTED.
+
+---
+
+## FLAG / BENCHED / PROMOTED / REACTIVATED
+
+| Event | Who | Meaning for A/B/C |
+|---|---|---|
+| **FLAG** | `agent_evaluator` | Underperform vs ensemble 20d. Numeric FLAG math is existing code; **new-sleeve kill numbers vs SPY stay TODO** |
+| **BENCHED** | `agent_rotator` | `active: false` for 3 days. If this was the bleeder, replacement may be PROMOTED in the same cycle |
+| **PROMOTED** | `agent_rotator` | Cold sleeve flipped `active: true`. **Only the first seeded `active: false`** `AGENT_VARIANTS` entry. Missing-from-summary ≠ eligible |
+| **REACTIVATED** | `agent_rotator` | Bench expired after 3 days. Bleeder returns. Expected; not a failed replacement |
+
+Qualitative stay-active vs FLAG (no KEEP/DISABLE): see each spec vs **SPY**, vs the **BENCHED** sibling, and vs **regime**. **Numeric kill boxes = TODO.** Do not invent cutoffs from one scorecard session.
+
+### Day-1 scorecard footnote (2026-09-11) — NOT LOCKED
+
+Ops first paper scorecard, **context only**. **Do not lock** A/B/C kill math from this print. **≥5-day healthy-scorecard clock restarts 2026-09-16** (email restored). **Sep 14–15 are gap days — no backfill, do not count.** Revisit numeric boxes only after ≥5 **healthy** sessions from that restart. **Do not** derive FLAG / BENCHED / PROMOTE thresholds from Day-1.
+
+**Book (footnote, not FLAG math):** equity **$82,288**, day **+0.78%**. Naked **0**, ghosts **0**.
+
+**Bot vs SPY (footnote, not FLAG math):** 1d edge **−0.07%** | 5d **−1.83% vs −1.15%** | 20d **−6.92% vs −1.75%** | since **−17.71% vs +3.30%**.
+
+**Today’s rotator events:** FLAG / BENCHED / PROMOTED / REACTIVATED = **all none**. `MomentumAgent` is already `status=benched` in the roster — **not a today event**. Do **not** use that as an A/B/C kill or promote parent. A’s primary parents stay Technical / OptionsFlow / Breakout / SectorRotation.
+
+**Agents (weight / P&L) — $0 is not a kill sample:** Technical 1.00 $0 | News 0.40 $0 | Sentiment 0.40 $0 | Momentum benched 0.40 $0 | Breakout 0.40 $0 | BearishPattern 0.40 $0 | ShortMomentum 0.40 $0 | Earnings 0.40 $0 | Macro 0.40 $0 | Premarket 1.15 $0 | SectorRotation 0.40 $0 | OptionsFlow 0.40 $0 | Volatility 0.40 $0 | Intermarket 0.40 $0 | Movers 1.00 $0 | MeanReversion 0.40 $0 | CryptoAgent active@0.40 **gated off** (no crypto edges) | AlpacaSurgeDetector 1.00 **−$41**.
+
+| Day-1 fact | What it is **not** |
+|---|---|
+| Thin session: ticks **71/~390**, sys err **0**, fetch/404 **126**, entries **0**, peak raw **115** | Too thin to set 20d-edge or drawdown cutoffs |
+| Many `MetaAgent(…)` compound rows weight 1.00 / $0 | **Attribution gap**, not A/B/C FLAG math |
+| Premarket **1.15 / $0**, entries **0** | **Not** Spec C evidence (not a quality FLAG, not a promote) |
+| Volatility **0.40** + Movers **1.00** on roster, both $0 | **Not** a B **PROMOTE**. Roster presence only; B still ships cold, seeded `{ "active": false }` |
+| BearishPattern + ShortMomentum **0.40 / $0**; today short FLAGs = none | **Not** Spec B kill math |
+
+Paper-only. No crypto edges.
+
+Win rate is not a FLAG input for these specs (4% stop cap → low WR can still have expectancy). Evaluator already uses P&amp;L.
+
+---
+
+## Wiring every new name (when an implementation PR exists — not this HOLD PR)
+
+| Hook | Required |
+|---|---|
+| `Ensemble.agents` | Present, **cold** |
+| `agent_summary.json` | **Must seed** `{ "active": false }` at ship. If the name is absent from the file, Ops PR #3 will **never PROMOTE** it |
+| `AGENT_VARIANTS` | Ordered list. **One first-slot owner per parent.** See map below |
+| `DEFAULT_WEIGHTS` | Key so ledger P&amp;L can attribute; do not count on 1.0 forever |
+| `PROTECTED_AGENTS` | Do **not** add A/B/C names |
+| `regime_affinity` / `aversion` | On every signal |
+| Friday learner | **Unused** for retune until `get_agent_adjustment` is wired |
+| Improver | Advisory markdown only — not a promotion path |
+
+`_find_replacement` (Ops PR #3) selects the first list entry whose summary row is a dict with `active: false`. It does **not** promote `entry is None`. Do not list the bleeder as first variant **of** the new sleeve (v1.4 `newly_benched` helps; still don’t resurrect Technical as A’s substitute).
+
+---
+
+## Proposed `AGENT_VARIANTS` ownership (A and B must not collide)
+
+Ops PR #3: `VolatilityAgent` and `MoversAgent` are **keys with empty lists `[]`** (not missing keys). `_find_replacement` on `[]` still returns `None` — same promote behavior; slots reserved for Spec B. Do **not** reassign B’s parent list.
+
+An implementation PR (not this HOLD) must write **one** ordered list per parent. A and B **must not** both claim first slot on the same parent.
+
+**Locked proposal:**
+
+| Parent **BENCHED** | Ordered variants (first seeded `active: false` is **PROMOTED**) | Owner |
+|---|---|---|
+| `TechnicalAgent` | **`RegimeEquityAgent` (A), then `ShortMeanReversionAgent` (B)**, then existing Momentum / Breakout | A first, B second. **Do not reorder.** |
+| `OptionsFlowAgent` | **`RegimeEquityAgent` (A) only** as the new name, then existing News / Sentiment | **A.** B does **not** share OptionsFlow |
+| `BreakoutAgent` | **`RegimeEquityAgent` (A)**, then existing Momentum / Technical | A |
+| `SectorRotationAgent` | **`RegimeEquityAgent` (A)**, then existing Premarket | A |
+| `VolatilityAgent` | **`ShortMeanReversionAgent` (B)** — empty slot reserved | **B on-ramp.** Do not reassign. |
+| `MoversAgent` | **`ShortMeanReversionAgent` (B)** — empty slot reserved | **B on-ramp.** Do not reassign. |
+| `PremarketAgent` | **`PremarketAgent_strict` (C)** | C (SPEC-C) |
+
+Why this split:
+
+- Rotator **cannot** promote two cold sleeves from one **BENCHED** parent in the same cycle.
+- OptionsFlow is the long-regime / proxy-flow bleeder → **A** replaces that equity decision. B is a fade-rally short; it does **not** list OptionsFlow.
+- Technical is L/S with no regime tags → **A first**. If A is already `active: true` when Technical is **BENCHED** again, the first seeded `active: false` is **B** (B must already be in summary).
+- Volatility and Movers already short without SMA200 / as same-day continuation → **B’s** on-ramps. Lists stay `[]` until B ships.
+
+If A is not in the roster at all, B may sit first on Technical. If both ship, Technical order above is required.
+
+> **Footnote (not the plan):** if Ops later **cannot** leave Volatility / Movers empty, revisit B’s first-slot wiring then. Do **not** treat MeanReversion / Momentum / Breakout occupancy as the design, and do **not** move B off Volatility + Movers in this spec.
+
+**REACTIVATED (expected, not a reject):** `BENCH_DAYS = 3` then the bleeder is **REACTIVATED**. A/B/C staying live beside a returned bleeder is correct. “Replace bleeders” lasts those 3 days unless the bleeder **FLAG**s again.
+
+Later options variants (Ops D, paused) would use this same FLAG/BENCHED/PROMOTED path. Not specified here.
