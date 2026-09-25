@@ -30,6 +30,9 @@ LEVERAGED_ETFS: dict[str, float] = {
     "QID": -2.0, "SDS": -2.0, "DXD": -2.0, "TWM": -2.0,
     # 1x inverse
     "SH": -1.0, "PSQ": -1.0, "DOG": -1.0, "RWM": -1.0,
+    # SPXU is on TechnicalAgent's watchlist and was missing here, so a
+    # long SPXU counted as long S&P exposure instead of -3x.
+    "SPXU": -3.0,
     # 3x long
     "TQQQ": 3.0, "UPRO": 3.0, "UDOW": 3.0, "SOXL": 3.0,
     "TNA": 3.0, "LABU": 3.0, "TECL": 3.0, "FAS": 3.0,

@@ -791,7 +791,16 @@ class Ensemble:
                 (df["High"] - prev_close).abs(),
                 (df["Low"] - prev_close).abs(),
             ], axis=1).max(axis=1)
-            atr = float(tr.rolling(14).mean().iloc[-1])
+            atr_series = tr.rolling(14).mean()
+            # Today's daily bar is still forming during RTH. Using iloc[-1]
+            # puts today's high/low into the stop before the close.
+            from risk_caps import completed_bar_value
+            from zoneinfo import ZoneInfo
+            _now = datetime.now(ZoneInfo("America/New_York"))
+            _prev = float(atr_series.iloc[-2]) if len(atr_series) >= 2 else None
+            atr = completed_bar_value(
+                float(atr_series.iloc[-1]), _prev, df.index[-1], _now,
+            )
             entry = float(signal.get("entry_price") or 0)
             if atr <= 0 or entry <= 0:
                 return signal

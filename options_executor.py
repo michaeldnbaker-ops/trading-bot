@@ -170,10 +170,14 @@ def execute_options_trade(signal: dict) -> dict | None:
         if not contract:
             return None
 
-        # Size so the PREMIUM (the entire downside) is <= risk budget
-        risk_budget = equity * (OPTIONS_RISK_PCT / 100)
+        # Premium IS the max loss. OPTIONS_RISK_PCT (1% of equity) is
+        # ~$1,000 on this account, which is past the $320 hard cap.
+        # One contract that costs more than the cap is skipped (qty 0),
+        # not forced through.
+        from risk_caps import option_contracts, risk_per_trade_usd
+        risk_budget = min(equity * (OPTIONS_RISK_PCT / 100), risk_per_trade_usd())
         per_contract = contract["ask"] * 100
-        qty = int(risk_budget / per_contract)
+        qty = option_contracts(contract["ask"], risk_budget)
         if qty < 1:
             log.info(f"options: {symbol} contract ${per_contract:,.0f} exceeds "
                      f"${risk_budget:,.0f} risk budget — skipping")

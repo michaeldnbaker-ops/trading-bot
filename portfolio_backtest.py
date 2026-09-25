@@ -23,8 +23,10 @@ that could not both be satisfied. A trade-level harness cannot catch that
 because the failure only exists at the book level.
 
 What is faithful here:
-    • the exact sizing formula from agent_risk_bridge
-      (risk_budget/stop_distance, capped by notional %)
+    • the exact sizing formula from risk_caps.dynamic_risk_shares
+      (risk budget capped at RISK_PER_TRADE $320, notional capped at
+      min(config %, MAX_NOTIONAL_USD $1,500)). A 10% config cannot
+      outgrow the live hard caps.
     • the ATR(14)x1.5 stop capped at 4%, as ensemble._normalize_geometry
     • the progressive trail ratchet from order_executor, tighten-only
     • entry gates: net long %, gross leverage, daily cap, one-per-symbol
@@ -216,7 +218,12 @@ def run(cfg: Config, bars: dict, spy: pd.DataFrame, dates: pd.DatetimeIndex) -> 
             if not np.isfinite(atr) or atr <= 0 or entry <= 0:
                 continue
             sd = min(max(ATR_MULT * atr, entry * 0.01), entry * STOP_CAP)
-            shares = min(eq * RISK_PCT / 100 / sd, eq * cfg.max_pos_pct / 100 / entry)
+            from risk_caps import dynamic_risk_shares, max_notional_usd, risk_per_trade_usd
+            notional_cap = min(eq * cfg.max_pos_pct / 100.0, max_notional_usd())
+            risk_cap = min(eq * RISK_PCT / 100.0, risk_per_trade_usd())
+            shares = dynamic_risk_shares(
+                entry, entry - sd, notional_cap=notional_cap, risk_cap=risk_cap,
+            )
             if shares < 1:
                 continue
             short = side == "short"
