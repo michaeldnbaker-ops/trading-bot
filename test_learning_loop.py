@@ -29,7 +29,7 @@ from agent_evaluator import (
     EvalReport,
     flag_reasons,
 )
-from agent_rotator import MIN_ACTIVE_AGENTS, AgentRotator
+from agent_rotator import MIN_ACTIVE_AGENTS, PROTECTED_AGENTS, AgentRotator
 
 
 TODAY = datetime(2026, 9, 20)
@@ -349,6 +349,20 @@ class DrainFlagFlowsToBench(unittest.TestCase):
             result["actions"],
         )
         self.assertFalse(any("PROMOTED" in a for a in result["actions"]))
+
+
+class ProtectedAgents(unittest.TestCase):
+    """L-2026-09-25a: closed-trade evidence decides News and Sentiment."""
+
+    def test_news_and_sentiment_unprotected_shorts_stay(self):
+        self.assertNotIn("NewsAgent", PROTECTED_AGENTS)
+        self.assertNotIn("SentimentAgent", PROTECTED_AGENTS)
+        self.assertIn("BearishPatternAgent", PROTECTED_AGENTS)
+        self.assertIn("ShortMomentumAgent", PROTECTED_AGENTS)
+        self.assertEqual(
+            PROTECTED_AGENTS,
+            {"BearishPatternAgent", "ShortMomentumAgent"},
+        )
 
 
 class PaperOnlyUntouched(unittest.TestCase):

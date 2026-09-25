@@ -1,7 +1,13 @@
 """
-agent_rotator.py — v1.4 (2026-04-24)
+agent_rotator.py — v1.5 (2026-09-25)
 ────────────────────────────────────
 Rotates underperforming agents out and promotes better alternatives.
+
+CHANGE LOG (v1.5, 2026-09-25):
+  • NewsAgent and SentimentAgent were unprotected per L-2026-09-25a.
+    Closed-trade evidence decides whether the rotator benches them.
+    BearishPatternAgent and ShortMomentumAgent stay protected so short
+    consensus remains possible.
 
 CHANGE LOG (v1.4):
   • FIX: don't promote an agent that was benched earlier in the same cycle.
@@ -127,8 +133,11 @@ AGENT_VARIANTS: dict[str, list[str]] = {
 
 # Agents that are NEVER benched — they provide critical infrastructure.
 # NOTE (v1.1): TechnicalAgent was removed — its 9% win rate didn't justify
-# protection. NewsAgent and SentimentAgent stay protected because their
-# signals feed multiple downstream evaluators beyond P&L attribution.
+# protection.
+# NOTE (2026-09-25, L-2026-09-25a): NewsAgent and SentimentAgent were
+# unprotected. Closed-trade evidence decides whether the rotator benches
+# them. BearishPatternAgent and ShortMomentumAgent stay protected so
+# short consensus remains possible.
 # Short specialists are PROTECTED. On 2026-07-29 the market fell ~1000pts
 # and the book was 100% long with zero shorts — because rotation had
 # benched BearishPatternAgent AND ShortMomentumAgent on P&L earned under
@@ -136,8 +145,7 @@ AGENT_VARIANTS: dict[str, list[str]] = {
 # the 2-agent short-consensus rule unsatisfiable, so the ensemble becomes
 # structurally long-only exactly when downside protection matters most.
 # Weight them down if they underperform; never bench them to zero.
-PROTECTED_AGENTS = {"NewsAgent", "SentimentAgent",
-                    "BearishPatternAgent", "ShortMomentumAgent"}
+PROTECTED_AGENTS = {"BearishPatternAgent", "ShortMomentumAgent"}
 
 
 def is_pinned_bench(info: dict, benched_at: datetime, now: datetime) -> bool:
