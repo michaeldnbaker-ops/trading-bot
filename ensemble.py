@@ -297,15 +297,22 @@ class Ensemble:
         # 9-10am ran +$102/trade against the rest of the session on 38
         # vs 95 trades. After 10am, hold back half the daily budget so
         # the good window is never starved by mediocre later setups.
+        # Logged below. None before 10:00 ET; the same max(1, cap // 2)
+        # value the budget uses once that limit applies. Cap math is unchanged.
+        _after_10_limit = None
         try:
             from datetime import datetime as _d2
             import trade_ledger as _tl2
             if _d2.now(_tl2.ET).hour >= 10:
-                entries_remaining = min(entries_remaining, max(1, _cap // 2))
+                _after_10_limit = max(1, _cap // 2)
+                entries_remaining = min(entries_remaining, _after_10_limit)
         except Exception:
             pass
         if entries_remaining <= 0:
-            log.info(f"Daily trade cap reached ({opened_today}/{DAILY_TRADE_CAP}) "
+            _cap_shown = f"{opened_today}/{_cap}"
+            if _after_10_limit is not None:
+                _cap_shown += f", after-10:00-ET limit {_after_10_limit}"
+            log.info(f"Daily trade cap reached ({_cap_shown}) "
                      f"— managing open positions only, no new entries today")
             return []
         try:
@@ -535,8 +542,11 @@ class Ensemble:
                     continue
 
                 if len(approved) >= entries_remaining:
+                    _budget = f"{_cap}/day"
+                    if _after_10_limit is not None:
+                        _budget += f", after-10:00-ET limit {_after_10_limit}"
                     log.info(f"⏭  Daily entry budget exhausted this tick "
-                             f"({DAILY_TRADE_CAP}/day) — skipping remaining signals")
+                             f"({_budget}) — skipping remaining signals")
                     break
 
                 result = self.bridge.evaluate_signal(signal)
