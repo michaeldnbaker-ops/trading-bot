@@ -304,6 +304,13 @@ class AgentEvaluator:
         agg: dict[str, dict] = {}
 
         for t in all_trades:
+            # Closed trades only. Marking open winners into the 5d/20d
+            # windows is how a losing agent kept a full weight while its
+            # closed record bled (meta_agent already dropped unrealized
+            # for that reason). Rotation, FLAG, and size-tilt read this
+            # report, so an open mark must not vote.
+            if getattr(t, "is_open", False):
+                continue
             opened = _trade_opened_dt(t)
             pnl    = _pnl_for_trade(t)
             cost   = _ledger.round_trip_cost(t)

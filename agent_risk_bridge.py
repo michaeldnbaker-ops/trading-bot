@@ -295,6 +295,14 @@ class AgentRiskBridge:
             # change assumed all along.
             risk_budget    = self.account_balance * (RISK_PER_TRADE_PCT / 100)
             risk_budget    = min(risk_budget, dollar_risk)  # confidence scaling still applies
+            # RISK_PER_TRADE ($320) is the hard dollar cap. 0.5% of a
+            # $100k account is $500, which is how MSTR/AMD/MXL could be
+            # sized past the cap whenever the notional clamp did not bind.
+            try:
+                from risk_caps import risk_per_trade_usd
+                risk_budget = min(risk_budget, risk_per_trade_usd())
+            except Exception as e:
+                log.warning(f"RISK_PER_TRADE cap unavailable ({e})")
             shares_by_risk     = risk_budget / stop_distance
             max_notional       = self.account_balance * (MAX_POSITION_SIZE_PCT / 100)
             # Qualifying equity orders may size up to the tilted absolute

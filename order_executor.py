@@ -217,6 +217,12 @@ class OrderExecutor:
                      f"failed, retrying in ~{remaining}m")
             return {"status": "cooldown", "symbol": symbol, "direction": direction}
 
+        dup = self._duplicate_block(symbol, direction)
+        if dup:
+            log.info(f"⏭  DUPLICATE BLOCKED: {symbol} {direction.upper()} — {dup}")
+            return {"status": "duplicate", "symbol": symbol, "direction": direction,
+                    "reason": dup}
+
         is_crypto = session_is_crypto(symbol) or symbol in CRYPTO_SYMBOLS
 
         try:
@@ -252,9 +258,13 @@ class OrderExecutor:
             return result
 
         except Exception as e:
+            # Keep the day-claim. The order may have reached the broker
+            # before this exception, and a "PAPER TRADE (log-only)" line
+            # would read as a clean skip. Cooldown stops the 60s retry loop.
             log.error(f"Order submission failed for {symbol}: {e}", exc_info=True)
             self._failed_at[cooldown_key] = time.time()
-            return self._log_only(approved_signal)
+            return {"status": "error", "symbol": symbol, "direction": direction,
+                    "reason": str(e)}
 
     # ── Equity entry + trailing-stop exit ─────────────────────────────────────
     def _submit_equity_bracket(
@@ -271,10 +281,32 @@ class OrderExecutor:
         on a real reversal. Losses stay capped; wins are uncapped. That
         asymmetry is the entire engine of a compounding account.
         """
-        qty       = max(1, int(pos_usd / entry))
-        # Trail distance = the ATR stop distance as a percent, clamped 2-6%
+        from risk_caps import dynamic_risk_shares, risk_per_trade_usd
+        # Floor to both caps. max(1, int(notional/price)) used to buy one
+        # share of a name priced above MAX_NOTIONAL_USD, and nothing on
+        # this path checked dollar risk against RISK_PER_TRADE.
+        # The resting exit is the trail, which is at least 2% and at most
+        # 6% — wider than a tight signal stop. Size to that distance so
+        # the order the broker actually holds cannot lose more than the cap
+        # if the trail fills. Gaps through the trail are still unbounded.
         trail_pct = round(min(max(abs(entry - stop) / entry * 100, 2.0), 6.0), 2)
-
+        risk_dist = max(abs(entry - stop), entry * trail_pct / 100.0)
+        qty = dynamic_risk_shares(
+            entry, entry - risk_dist,
+            notional_cap=pos_usd, risk_cap=risk_per_trade_usd(),
+        )
+        if qty < 1:
+            log.error(
+                f"{symbol}: 1 share exceeds notional ${pos_usd:.0f} or "
+                f"${risk_per_trade_usd():.0f} risk — not submitted"
+            )
+            self._release_claim(symbol)
+            return {
+                "status": "rejected",
+                "symbol": symbol,
+                "reason": "1 share exceeds notional or dollar-risk cap",
+                "qty": 0,
+            }
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
         side      = OrderSide.BUY  if direction == "long" else OrderSide.SELL
@@ -423,6 +455,85 @@ class OrderExecutor:
     def _reject(self, reason: str) -> dict:
         log.warning(f"OrderExecutor rejected: {reason}")
         return {"status": "rejected", "reason": reason}
+
+    # symbol → ET date a submit was attempted. Survives a ledger miss so
+    # the next 60s tick cannot stack a second entry. Released only when
+    # we reject before submit (one share breaks a cap). An unfilled
+    # cancel keeps the claim: the 2026-09-24 P order filled after the
+    # wait, and releasing here would let the next tick send another.
+    _day_claims: dict[str, str] = {}
+
+    @classmethod
+    def reset_entry_claims_for_tests(cls) -> None:
+        cls._day_claims.clear()
+
+    @staticmethod
+    def _claim_day() -> str:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    def _claim_entry(self, symbol: str) -> Optional[str]:
+        """None if this process may submit. Otherwise the block reason."""
+        day = self._claim_day()
+        key = str(symbol or "").replace("/", "").upper()
+        claimed = self._day_claims.get(key)
+        if claimed == day:
+            return f"entry already attempted today for {key}"
+        self._day_claims[key] = day
+        return None
+
+    def _release_claim(self, symbol: str) -> None:
+        key = str(symbol or "").replace("/", "").upper()
+        self._day_claims.pop(key, None)
+
+    def _open_orders(self, symbol: str) -> list:
+        getter = getattr(self._client, "get_orders", None)
+        if not callable(getter):
+            return []
+        if _ALPACA_OK:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            return list(getter(GetOrdersRequest(
+                status=QueryOrderStatus.OPEN, symbols=[symbol], limit=50,
+            )))
+        return list(getter())
+
+    def _duplicate_block(self, symbol: str, direction: str) -> Optional[str]:
+        """Broker, ledger, and same-process guards. Fail closed on broker errors.
+
+        Checked before submit. A ledger miss (the 2026-07-01 duplicate-entry
+        bug) does not clear a live broker position or a resting order.
+        A client with no get_all_positions is a unit-test stub, not a broker;
+        production TradingClient always has the method.
+        """
+        get_positions = getattr(self._client, "get_all_positions", None)
+        if not callable(get_positions):
+            return None
+        claim = self._claim_entry(symbol)
+        if claim:
+            return claim
+        try:
+            import trade_ledger as _ledger
+            if (_ledger.has_open_position(symbol, "LONG")
+                    or _ledger.has_open_position(symbol, "SHORT")):
+                self._release_claim(symbol)
+                return f"ledger already open on {symbol}"
+        except Exception as e:
+            self._release_claim(symbol)
+            return f"ledger duplicate check failed ({e})"
+        try:
+            from risk_caps import entry_blocked
+            positions = list(get_positions())
+            orders = self._open_orders(symbol)
+        except Exception as e:
+            self._release_claim(symbol)
+            return f"broker duplicate check failed ({e})"
+        reason = entry_blocked(symbol, positions, orders)
+        if reason:
+            self._release_claim(symbol)
+            return reason
+        return None
 
     def _cancel_quiet(self, order_id) -> None:
         try:

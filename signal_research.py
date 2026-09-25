@@ -15,8 +15,10 @@ Method
   • Each candidate is an independent boolean rule evaluated on bars strictly
     before the signal day; entry fills at the next open.
   • Every candidate is then run through the SAME production mechanics —
-    ATR(14)x1.5 stop capped at 4%, progressive trail, risk-budget sizing —
-    so differences reflect the signal, never the plumbing.
+    ATR(14)x1.5 stop capped at 4%, progressive trail, and
+    risk_caps.dynamic_risk_shares ($320 risk, $1,500 notional, 2% of
+    equity). An earlier copy used a 10% notional cap, so the published
+    $/trade figures were sized several times larger than the live book.
   • Scored per calendar year. A rule that earns its whole edge in two lucky
     years is worthless for a bot that must trade every year, so the headline
     metric is the share of years profitable, not the total.
@@ -42,8 +44,7 @@ warnings.filterwarnings("ignore")
 
 ATR_MULT           = 1.5
 STOP_CAP           = 0.04
-RISK_PER_TRADE_PCT = 0.5
-MAX_POSITION_PCT   = 10.0
+MAX_POSITION_PCT   = 2.0          # production, was 10
 MAX_HOLD_DAYS      = 30
 ACCOUNT            = 86_500.0
 START              = "2005-01-01"
@@ -137,8 +138,12 @@ def simulate(df: pd.DataFrame, rule, is_short: bool):
             i += 1
             continue
         stop_dist = min(max(ATR_MULT * p.atr, entry * 0.01), entry * STOP_CAP)
-        shares = min(ACCOUNT * RISK_PER_TRADE_PCT / 100 / stop_dist,
-                     ACCOUNT * MAX_POSITION_PCT / 100 / entry)
+        from risk_caps import dynamic_risk_shares, max_notional_usd, risk_per_trade_usd
+        notional_cap = min(ACCOUNT * MAX_POSITION_PCT / 100.0, max_notional_usd())
+        shares = dynamic_risk_shares(
+            entry, entry - stop_dist,
+            notional_cap=notional_cap, risk_cap=risk_per_trade_usd(),
+        )
         if shares < 1:
             i += 1
             continue

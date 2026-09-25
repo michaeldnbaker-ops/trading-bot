@@ -272,9 +272,20 @@ def _trade_id(opened_at_et: str, symbol: str, side: str, entry: float) -> str:
     return hashlib.sha1(seed.encode()).hexdigest()[:12]
 
 
-def _shares_for_risk(risk_dollar: float, entry: float) -> float:
-    if entry <= 0:
+def _shares_for_risk(risk_dollar: float, entry: float, stop: float | None = None) -> float:
+    """Shares implied by a dollar risk budget and the stop distance.
+
+    Dividing risk by entry treated RISK_PER_TRADE as notional. On a 4%
+    stop that understated size (and therefore reconstructed P&L) by ~25x.
+    When the stop is missing, fall back to the old notional reading rather
+    than inventing a stop.
+    """
+    if risk_dollar <= 0 or entry <= 0:
         return 0.0
+    if stop is not None:
+        dist = abs(entry - float(stop))
+        if dist > 0:
+            return round(risk_dollar / dist, 4)
     return round(risk_dollar / entry, 4)
 
 
@@ -291,7 +302,7 @@ def parse_paper_trade_line(line: str) -> Optional[Trade]:
     stop      = float(m.group("stop"))
     primary, contribs = _parse_agent_field(m.group("agent"))
     risk      = DEFAULT_RISK_PER_TRADE
-    shares    = _shares_for_risk(risk, entry)
+    shares    = _shares_for_risk(risk, entry, stop)
     return Trade(
         trade_id      = _trade_id(ts, symbol, side, entry),
         opened_at_et  = ts,

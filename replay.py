@@ -16,7 +16,9 @@ the output:
 
   FAITHFUL (lifted from production, same formulas)
     • ATR(14) stop geometry and its cap        ensemble._normalize_geometry
-    • risk-budget sizing, notional cap         agent_risk_bridge
+    • risk-budget sizing, notional cap         risk_caps.dynamic_risk_shares
+      (RISK_PER_TRADE $320 and MAX_NOTIONAL_USD $1,500 — the live caps.
+       This file used to size at 10% of equity, about 5× production.)
     • progressive trail by profit tier         order_executor._trail_for_profit
     • max hold horizon                         trade_ledger.MAX_HOLD_DAYS
 
@@ -48,8 +50,7 @@ warnings.filterwarnings("ignore")
 
 # ── Production constants, mirrored ──────────────────────────────────────────
 ATR_MULT           = 1.5
-RISK_PER_TRADE_PCT = 0.5
-MAX_POSITION_PCT   = 10.0
+MAX_POSITION_PCT   = 2.0          # production MAX_POSITION_PCT, not 10
 MAX_HOLD_DAYS      = 30
 ACCOUNT            = 86_500.0
 
@@ -160,9 +161,12 @@ def run(stop_cap_pct: float | None, use_progressive_trail: bool,
             if stop_cap_pct is not None:
                 stop_dist = min(stop_dist, entry * stop_cap_pct)
 
-            risk_budget = ACCOUNT * RISK_PER_TRADE_PCT / 100
-            shares = min(risk_budget / stop_dist,
-                         ACCOUNT * MAX_POSITION_PCT / 100 / entry)
+            from risk_caps import dynamic_risk_shares, max_notional_usd, risk_per_trade_usd
+            notional_cap = min(ACCOUNT * MAX_POSITION_PCT / 100.0, max_notional_usd())
+            shares = dynamic_risk_shares(
+                entry, entry - stop_dist,
+                notional_cap=notional_cap, risk_cap=risk_per_trade_usd(),
+            )
             if shares < 1:
                 i += 1
                 continue

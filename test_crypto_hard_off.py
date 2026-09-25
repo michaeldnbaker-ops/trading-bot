@@ -74,7 +74,11 @@ class CryptoHardOff(unittest.TestCase):
     def test_equity_notional_clamp_unchanged_during_rth(self):
         from order_executor import MAX_NOTIONAL_USD, OrderExecutor
         ex = OrderExecutor()
-        ex._client = object()
+        ex.reset_entry_claims_for_tests()
+        client = MagicMock()
+        client.get_all_positions.return_value = []
+        client.get_orders.return_value = []
+        ex._client = client
         captured = {}
 
         def _fake_submit(symbol, direction, entry, stop, target, pos_usd):
@@ -84,7 +88,8 @@ class CryptoHardOff(unittest.TestCase):
 
         ex._submit_equity_bracket = _fake_submit
         ex._record_ledger = lambda *a, **k: None
-        with patch("session_gates.is_rth", return_value=True):
+        with patch("session_gates.is_rth", return_value=True), \
+             patch("trade_ledger.has_open_position", return_value=False):
             result = ex.execute(_equity_signal())
         self.assertEqual(result["status"], "submitted")
         self.assertEqual(captured["pos_usd"], MAX_NOTIONAL_USD)
