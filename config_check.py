@@ -46,7 +46,8 @@ def check_imports():
     """Every module must import cleanly — an undefined name here is fatal."""
     mods = ["ensemble", "meta_agent", "agent_risk_bridge", "order_executor",
             "trade_ledger", "invariants", "exposure", "regime_detector",
-            "agent_evaluator", "agent_rotator", "report_data", "daily_reporter"]
+            "agent_evaluator", "agent_rotator", "report_data", "daily_reporter",
+            "size_tilt"]
     for m in mods:
         try:
             __import__(m)

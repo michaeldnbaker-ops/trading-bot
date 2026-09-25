@@ -18,6 +18,9 @@ Position sizing is driven by the approved_signal dict from AgentRiskBridge.
   RISK_PER_TRADE       — dollar risk TO STOP per trade (default $320; not a notional cap)
   MAX_POSITION_PCT     — max % of live equity notional per trade (default 2.0)
   MAX_NOTIONAL_USD     — absolute notional hard-cap per trade (default 1500)
+  SIZE_TILT_ENABLED    — evidence-gated 1.5× notional for qualifying agents
+                         (default false). See size_tilt.py. Off leaves this
+                         clamp exactly as it is ($1,500 and the 2% cap).
 """
 
 from __future__ import annotations
@@ -145,15 +148,39 @@ class OrderExecutor:
         # stop distance (ATR ≤4% → ~$8k notional from a $320 risk budget).
         # MAX_POSITION_PCT and MAX_NOTIONAL_USD are the notional caps and must
         # bind here — the bridge total_cost path previously bypassed them.
+        #
+        # SIZE_TILT_ENABLED (default false): a leaf that cleared the
+        # after-cost expectancy bars may use 1.5× MAX_NOTIONAL_USD and may
+        # exceed the 2% cap, but only up to that tilted absolute ($2,250
+        # at the default). Crypto, benched, and pinned agents never take it.
+        # The flag-off path is the min() below with tilted=False.
         equity = self._portfolio_equity()
-        pct_cap = equity * (MAX_POSITION_PCT / 100.0)
         raw_pos = pos_usd
-        pos_usd = min(pos_usd, pct_cap, MAX_NOTIONAL_USD)
+        tilted = False
+        try:
+            import size_tilt
+            size_tilt.ensure_today()
+            tilted = size_tilt.order_is_tilted(
+                agent, symbol, approved_signal.get("contributing_agents", ""),
+            )
+            pos_usd, _tilt_pct, abs_cap = size_tilt.clamp_notional(
+                pos_usd, equity, tilted=tilted,
+                max_notional=MAX_NOTIONAL_USD,
+                max_position_pct=MAX_POSITION_PCT,
+            )
+        except Exception as e:
+            log.warning(f"size tilt clamp failed ({e}); using the $1,500 path")
+            tilted = False
+            pct_cap = equity * (MAX_POSITION_PCT / 100.0)
+            abs_cap = MAX_NOTIONAL_USD
+            pos_usd = min(pos_usd, pct_cap, MAX_NOTIONAL_USD)
         if pos_usd < raw_pos - 1e-6:
+            pct_shown = equity * (MAX_POSITION_PCT / 100.0)
+            extra = " size_tilt" if tilted else ""
             log.info(
                 f"NOTIONAL CLAMP: {symbol} ${raw_pos:.0f} → ${pos_usd:.0f} "
-                f"(pct_cap=${pct_cap:.0f} @ {MAX_POSITION_PCT}% of "
-                f"${equity:,.0f}; abs_cap=${MAX_NOTIONAL_USD:.0f})"
+                f"(pct_cap=${pct_shown:.0f} @ {MAX_POSITION_PCT}% of "
+                f"${equity:,.0f}; abs_cap=${abs_cap:.0f}{extra})"
             )
 
         if paper_only_violation():

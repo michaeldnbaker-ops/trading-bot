@@ -19,9 +19,15 @@ Used by ensemble.py:
       log_paper_trade(result)
 
 .env keys consumed:
-  MAX_POSITION_SIZE_PCT    default 1.5   (% of account per trade)
+  MAX_POSITION_SIZE_PCT    default 2.0   (% of account per trade)
   ACCOUNT_BALANCE          default 16000
   PAPER_TRADING            default true
+  SIZE_TILT_ENABLED        default false (see size_tilt.py). When a qualifying
+                           equity order is tilted, the notional ceiling is at
+                           least 1.5× MAX_NOTIONAL_USD so the 2% cap cannot
+                           hold the position under the tilted absolute. Risk
+                           budget (RISK_PER_TRADE_PCT) is unchanged. Options
+                           premium sizing is unchanged.
 """
 
 from __future__ import annotations
@@ -291,6 +297,20 @@ class AgentRiskBridge:
             risk_budget    = min(risk_budget, dollar_risk)  # confidence scaling still applies
             shares_by_risk     = risk_budget / stop_distance
             max_notional       = self.account_balance * (MAX_POSITION_SIZE_PCT / 100)
+            # Qualifying equity orders may size up to the tilted absolute
+            # ($2,250). order_executor still clamps there, including the
+            # exception to the 2% cap. Non-qualifiers keep this 2% ceiling.
+            try:
+                import size_tilt
+                if size_tilt.order_is_tilted(
+                    signal.get("agent", ""),
+                    signal.get("symbol", ""),
+                    signal.get("contributing_agents", ""),
+                    instrument_type,
+                ):
+                    max_notional = max(max_notional, size_tilt.tilted_absolute_cap())
+            except Exception as e:
+                log.warning(f"size tilt notional ceiling unchanged ({e})")
             shares_by_notional = max_notional / entry
             raw_shares         = min(shares_by_risk, shares_by_notional)
 

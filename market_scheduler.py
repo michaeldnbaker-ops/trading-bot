@@ -590,6 +590,13 @@ def run_eval_cycle():
         report    = evaluator.evaluate()
         evaluator.save_report(report)
         log.info("\n" + report.summary_text())
+        # Same eval windows as today (10:00 and 15:30 ET). Records the
+        # size-tilt qualifier list once per date; does not move the clock.
+        try:
+            from size_tilt import ensure_today
+            ensure_today(report)
+        except Exception as e:
+            log.warning(f"size tilt qualifier record failed: {e}")
 
         if report.flagged_agents:
             log.info(f"Flagged agents detected: {report.flagged_agents} — running rotation...")
