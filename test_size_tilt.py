@@ -307,18 +307,35 @@ class DailyRecord(SizeTiltHarness):
         self.assertEqual(size_tilt._cache["date"], second["date"])
         self.assertTrue(path.exists())
 
-    def test_partial_active_coverage_not_cached_and_next_call_recomputes(self):
+    def test_roster_agent_missing_from_reasons_not_cached_and_next_call_recomputes(self):
+        """A name on the evaluator roster with no reason is not saved.
+
+        Summary-only names are not the required set. This drops a roster
+        agent after the payload is built.
+        """
         report = _evaluate(_book(10, 20, pnl=10.0))
+        report.agents.append(AgentStats(
+            name="NewsAgent",
+            active=True,
+            trades_20d=10,
+            trades_total=30,
+            expectancy_after_costs_20d=1.0,
+            expectancy_after_costs=1.0,
+        ))
         path = self.tmp / "size_tilt_qualifiers.json"
-        partial = {
-            "BreakoutAgent": {"active": True},
-            "NewsAgent": {"active": True},
-        }
+        real = size_tilt._payload_from_report
+
+        def drop_news(report, summary, day):
+            payload = real(report, summary, day)
+            payload["reasons"].pop("NewsAgent", None)
+            payload["qualifiers"] = [
+                name for name in payload["qualifiers"] if name != "NewsAgent"
+            ]
+            return payload
+
         with self.assertLogs("SizeTilt", level="WARNING") as logs, \
-             patch.object(
-                 size_tilt, "_payload_from_report", wraps=size_tilt._payload_from_report,
-             ) as built:
-            first = size_tilt.ensure_today(report, summary=partial)
+             patch.object(size_tilt, "_payload_from_report", side_effect=drop_news) as built:
+            first = size_tilt.ensure_today(report, summary={})
             self.assertEqual(built.call_count, 1)
             self.assertEqual(first["qualifiers"], [])
             self.assertEqual(first["reasons"], {})
@@ -331,13 +348,58 @@ class DailyRecord(SizeTiltHarness):
                 self.assertFalse(size_tilt.order_is_tilted("BreakoutAgent", "AAPL"))
             self.assertIsNone(size_tilt._cache)
 
-            second = size_tilt.ensure_today(
-                report, summary={"BreakoutAgent": {"active": True}},
-            )
-            self.assertEqual(built.call_count, 2)
-        self.assertEqual(second["qualifiers"], ["BreakoutAgent"])
+        with patch.object(
+            size_tilt, "_payload_from_report", wraps=size_tilt._payload_from_report,
+        ) as built:
+            second = size_tilt.ensure_today(report, summary={})
+        self.assertEqual(built.call_count, 1)
+        self.assertEqual(second["qualifiers"], ["BreakoutAgent", "NewsAgent"])
+        self.assertIn("NewsAgent", second["reasons"])
         self.assertIsNotNone(size_tilt._cache)
         self.assertTrue(path.exists())
+
+    def test_live_summary_wrappers_and_earnings_do_not_block_save(self):
+        """Real agent_summary.json shape must still write the day file.
+
+        Active MetaAgent(...) rows and EarningsAgent (no trades, not scored)
+        are not required. A 0-trade evaluator row is "no trades", not missing.
+        """
+        report = _evaluate(_book(10, 20, pnl=10.0))
+        report.agents.append(AgentStats(name="QuietAgent", trades_total=0, active=True))
+        report.agents.append(AgentStats(
+            name="MetaAgent(BearishPatternAgent, MacroAgent, OptionsFlowAgent)",
+            trades_total=4,
+            active=True,
+        ))
+        summary = {
+            "BreakoutAgent": {"active": True},
+            "EarningsAgent": {"active": True},
+            "MetaAgent(BearishPatternAgent, MacroAgent, OptionsFlowAgent)": {"active": True},
+            "MetaAgent(BreakoutAgent, NewsAgent)": {"active": True},
+            "QuietAgent": {"active": True},
+        }
+        path = self.tmp / "size_tilt_qualifiers.json"
+        with self.assertNoLogs("SizeTilt", level="WARNING"):
+            payload = size_tilt.ensure_today(report, summary=summary)
+        self.assertEqual(payload["qualifiers"], ["BreakoutAgent"])
+        self.assertEqual(payload["reasons"]["QuietAgent"], "no trades")
+        self.assertNotIn("EarningsAgent", payload["reasons"])
+        self.assertNotIn(
+            "MetaAgent(BearishPatternAgent, MacroAgent, OptionsFlowAgent)",
+            payload["reasons"],
+        )
+        self.assertTrue(path.exists())
+        disk = json.loads(path.read_text())
+        self.assertEqual(disk["qualifiers"], ["BreakoutAgent"])
+        self.assertEqual(disk["reasons"]["QuietAgent"], "no trades")
+        self.assertIsNotNone(size_tilt._cache)
+
+        # Restart must reuse the file even when the live summary still has wrappers.
+        size_tilt._cache = None
+        with self.assertNoLogs("SizeTilt", level="WARNING"):
+            again = size_tilt.ensure_today(summary=summary)
+        self.assertEqual(again["qualifiers"], ["BreakoutAgent"])
+        self.assertEqual(again["reasons"]["QuietAgent"], "no trades")
 
 
 class NotionalClamp(SizeTiltHarness):

@@ -19,10 +19,13 @@ Benched agents (logs/agent_summary.json active:false) and pinned agents
 order on any crypto symbol is never tilted.
 
 The day's list is logged at INFO and written to logs/size_tilt_qualifiers.json
-(date, flag, qualifiers, per-agent reason). An empty qualifier list is valid
-when every active agent has a reason. An empty reason map, or one that skips
-an active agent, is not saved: that call returns no qualifiers and the next
-call computes again.
+(date, flag, qualifiers, per-agent reason). An empty qualifier list is valid.
+Reasons are required only for the evaluator's own non-wrapper roster.
+MetaAgent(...) wrappers (trade_ledger.is_wrapper_agent_name) and names that
+appear only in agent_summary.json do not block the save. An evaluator row
+with 0 trades is recorded as "no trades" and does not qualify. An empty
+reason map, or a roster name missing from reasons, is not saved: that call
+returns no qualifiers and the next call computes again.
 
 With SIZE_TILT_ENABLED off, order entry does not compute or write that file.
 The daily eval (10:00 ET, 9:00 CT) does.
@@ -202,16 +205,28 @@ def decide(stats, summary_row: Optional[dict] = None) -> tuple[bool, str]:
 
 
 def _payload_from_report(report, summary: dict, day: str) -> dict:
+    """Reasons for the evaluator roster. Wrappers are omitted.
+
+    A roster agent with 0 trades gets the reason "no trades" and does not
+    qualify. Summary-only names are not added here.
+    """
+    from trade_ledger import is_wrapper_agent_name
     reasons: dict[str, str] = {}
     qualifiers: list[str] = []
     for stats in sorted(getattr(report, "agents", []) or [], key=lambda s: s.name):
-        row = summary.get(stats.name) if isinstance(summary, dict) else None
+        name = str(getattr(stats, "name", "") or "")
+        if not name or is_wrapper_agent_name(name):
+            continue
+        if int(getattr(stats, "trades_total", 0) or 0) == 0:
+            reasons[name] = "no trades"
+            continue
+        row = summary.get(name) if isinstance(summary, dict) else None
         if not isinstance(row, dict):
             row = {}
         ok, reason = decide(stats, row)
-        reasons[stats.name] = reason
+        reasons[name] = reason
         if ok:
-            qualifiers.append(stats.name)
+            qualifiers.append(name)
     qualifiers.sort()
     return {
         "date": day,
@@ -235,46 +250,29 @@ def _remember(payload: dict) -> dict:
     return payload
 
 
-def _summary_active_names(summary: Optional[dict]) -> set[str]:
-    """Agents whose agent_summary.json row is active (missing active → active)."""
+def _roster_names(report) -> set[str]:
+    """Individual agents the evaluator scored. Wrappers are not required."""
+    from trade_ledger import is_wrapper_agent_name
     names: set[str] = set()
-    for name, row in (summary or {}).items():
-        if isinstance(row, dict) and bool(row.get("active", True)):
-            names.add(str(name))
-    return names
-
-
-def _active_agent_names(report, summary: Optional[dict]) -> set[str]:
-    """Active agents from the evaluator and from agent_summary.json.
-
-    A summary row with active:false is benched and is not required. Any other
-    summary row is active. Evaluator rows are active when stats.active is true
-    and the summary does not bench them.
-    """
-    summary = summary or {}
-    names = _summary_active_names(summary)
     for stats in getattr(report, "agents", []) or []:
-        name = str(getattr(stats, "name", "") or "")
-        if not name:
+        name = str(getattr(stats, "name", "") or "").strip()
+        if not name or is_wrapper_agent_name(name):
             continue
-        row = summary.get(name)
-        if isinstance(row, dict) and "active" in row:
-            if row.get("active"):
-                names.add(name)
-            else:
-                names.discard(name)
-        elif getattr(stats, "active", True):
-            names.add(name)
+        names.add(name)
     return names
 
 
-def _coverage_problem(reasons: dict, active: set[str]) -> Optional[str]:
-    """None when this result may be cached. Empty or partial reasons may not."""
+def _coverage_problem(reasons: dict, roster: set[str]) -> Optional[str]:
+    """None when this result may be cached.
+
+    Empty reasons, or a non-wrapper roster name with no reason, may not.
+    Summary-only names are not in ``roster`` and do not block.
+    """
     if not isinstance(reasons, dict) or not reasons:
         return "per-agent reasons are empty"
-    missing = sorted(active - set(reasons))
+    missing = sorted(roster - set(reasons))
     if missing:
-        return "per-agent reasons missing active agents: " + ", ".join(missing)
+        return "per-agent reasons missing evaluator roster: " + ", ".join(missing)
     return None
 
 
@@ -307,12 +305,14 @@ def ensure_today(report=None, summary: Optional[dict] = None) -> dict:
 
     Pass the evaluator report when the caller just built one (the 10:00 ET /
     9:00 CT eval, and the 15:30 ET repeat). Otherwise this reads the ledger
-    via AgentEvaluator. A complete file already written for today is reused
+    via AgentEvaluator. A same-day file with a non-empty reason map is reused
     so a restart does not re-log. The first complete compute locks the day.
 
-    Empty reasons, or reasons that skip an active agent, are not cached and
-    not written. That call returns no qualifiers so the next call recomputes.
-    Order entry must not call this when SIZE_TILT_ENABLED is off.
+    The required set is the evaluator roster minus wrapper names. Agents that
+    exist only in agent_summary.json are ignored. Empty reasons, or a roster
+    name missing from reasons, are not cached and not written. That call
+    returns no qualifiers so the next call recomputes. Order entry must not
+    call this when SIZE_TILT_ENABLED is off.
     """
     day = today_iso()
     if _cache is not None and _cache.get("date") == day:
@@ -327,14 +327,15 @@ def ensure_today(report=None, summary: Optional[dict] = None) -> dict:
             try:
                 data = json.loads(path.read_text())
                 if isinstance(data, dict) and data.get("date") == day:
-                    problem = _coverage_problem(
-                        data.get("reasons") or {},
-                        _summary_active_names(summary),
-                    )
-                    if problem is None:
+                    # Day lock: a non-empty same-day map is enough. Do not
+                    # re-check agent_summary.json — wrapper and summary-only
+                    # rows are not part of the required set.
+                    reasons = data.get("reasons") or {}
+                    if isinstance(reasons, dict) and reasons:
                         return _remember(data)
                     log.warning(
-                        f"size tilt qualifier file ignored ({problem}); recomputing"
+                        "size tilt qualifier file ignored "
+                        "(per-agent reasons are empty); recomputing"
                     )
             except Exception as e:
                 log.warning(f"size tilt qualifier file unreadable ({e}); recomputing")
@@ -346,7 +347,7 @@ def ensure_today(report=None, summary: Optional[dict] = None) -> dict:
     payload = _payload_from_report(report, summary or {}, day)
     problem = _coverage_problem(
         payload.get("reasons") or {},
-        _active_agent_names(report, summary),
+        _roster_names(report),
     )
     if problem is not None:
         return _refused(day, problem)
