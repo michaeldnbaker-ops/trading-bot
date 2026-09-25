@@ -153,27 +153,35 @@ class OrderExecutor:
         # after-cost expectancy bars may use 1.5× MAX_NOTIONAL_USD and may
         # exceed the 2% cap, but only up to that tilted absolute ($2,250
         # at the default). Crypto, benched, and pinned agents never take it.
-        # The flag-off path is the min() below with tilted=False.
+        # Flag off is the original min() and does not evaluate or write
+        # logs/size_tilt_qualifiers.json. That file is the 9:00 CT eval's.
         equity = self._portfolio_equity()
         raw_pos = pos_usd
         tilted = False
+        abs_cap = MAX_NOTIONAL_USD
         try:
             import size_tilt
-            size_tilt.ensure_today()
-            tilted = size_tilt.order_is_tilted(
-                agent, symbol, approved_signal.get("contributing_agents", ""),
-            )
-            pos_usd, _tilt_pct, abs_cap = size_tilt.clamp_notional(
-                pos_usd, equity, tilted=tilted,
-                max_notional=MAX_NOTIONAL_USD,
-                max_position_pct=MAX_POSITION_PCT,
-            )
+            if not size_tilt.enabled():
+                pos_usd = min(
+                    pos_usd, equity * (MAX_POSITION_PCT / 100.0), MAX_NOTIONAL_USD,
+                )
+            else:
+                size_tilt.ensure_today()
+                tilted = size_tilt.order_is_tilted(
+                    agent, symbol, approved_signal.get("contributing_agents", ""),
+                )
+                pos_usd, _tilt_pct, abs_cap = size_tilt.clamp_notional(
+                    pos_usd, equity, tilted=tilted,
+                    max_notional=MAX_NOTIONAL_USD,
+                    max_position_pct=MAX_POSITION_PCT,
+                )
         except Exception as e:
             log.warning(f"size tilt clamp failed ({e}); using the $1,500 path")
             tilted = False
-            pct_cap = equity * (MAX_POSITION_PCT / 100.0)
             abs_cap = MAX_NOTIONAL_USD
-            pos_usd = min(pos_usd, pct_cap, MAX_NOTIONAL_USD)
+            pos_usd = min(
+                pos_usd, equity * (MAX_POSITION_PCT / 100.0), MAX_NOTIONAL_USD,
+            )
         if pos_usd < raw_pos - 1e-6:
             pct_shown = equity * (MAX_POSITION_PCT / 100.0)
             extra = " size_tilt" if tilted else ""

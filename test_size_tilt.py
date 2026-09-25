@@ -280,6 +280,65 @@ class DailyRecord(SizeTiltHarness):
         self.assertEqual(again["qualifiers"], [])
         self.assertEqual(again["reasons"]["BreakoutAgent"], payload["reasons"]["BreakoutAgent"])
 
+    def test_empty_reasons_not_cached_and_next_call_recomputes(self):
+        empty = EvalReport(generated_at="t", agents=[])
+        path = self.tmp / "size_tilt_qualifiers.json"
+        with self.assertLogs("SizeTilt", level="WARNING") as logs:
+            first = size_tilt.ensure_today(empty, summary={})
+        self.assertTrue(any("empty" in line for line in logs.output))
+        self.assertEqual(first["qualifiers"], [])
+        self.assertEqual(first["reasons"], {})
+        self.assertIsNone(size_tilt._cache)
+        self.assertFalse(path.exists())
+
+        os.environ["SIZE_TILT_ENABLED"] = "true"
+        with patch.object(size_tilt, "ensure_today", return_value=first):
+            self.assertFalse(size_tilt.order_is_tilted("BreakoutAgent", "AAPL"))
+        self.assertIsNone(size_tilt._cache)
+        self.assertFalse(path.exists())
+
+        full = _evaluate(_book(10, 20, pnl=10.0))
+        with patch.object(
+            size_tilt, "_payload_from_report", wraps=size_tilt._payload_from_report,
+        ) as built:
+            second = size_tilt.ensure_today(full, summary={})
+        self.assertEqual(built.call_count, 1)
+        self.assertEqual(second["qualifiers"], ["BreakoutAgent"])
+        self.assertEqual(size_tilt._cache["date"], second["date"])
+        self.assertTrue(path.exists())
+
+    def test_partial_active_coverage_not_cached_and_next_call_recomputes(self):
+        report = _evaluate(_book(10, 20, pnl=10.0))
+        path = self.tmp / "size_tilt_qualifiers.json"
+        partial = {
+            "BreakoutAgent": {"active": True},
+            "NewsAgent": {"active": True},
+        }
+        with self.assertLogs("SizeTilt", level="WARNING") as logs, \
+             patch.object(
+                 size_tilt, "_payload_from_report", wraps=size_tilt._payload_from_report,
+             ) as built:
+            first = size_tilt.ensure_today(report, summary=partial)
+            self.assertEqual(built.call_count, 1)
+            self.assertEqual(first["qualifiers"], [])
+            self.assertEqual(first["reasons"], {})
+            self.assertIsNone(size_tilt._cache)
+            self.assertFalse(path.exists())
+            self.assertTrue(any("NewsAgent" in line for line in logs.output))
+
+            os.environ["SIZE_TILT_ENABLED"] = "true"
+            with patch.object(size_tilt, "ensure_today", return_value=first):
+                self.assertFalse(size_tilt.order_is_tilted("BreakoutAgent", "AAPL"))
+            self.assertIsNone(size_tilt._cache)
+
+            second = size_tilt.ensure_today(
+                report, summary={"BreakoutAgent": {"active": True}},
+            )
+            self.assertEqual(built.call_count, 2)
+        self.assertEqual(second["qualifiers"], ["BreakoutAgent"])
+        self.assertIsNotNone(size_tilt._cache)
+        self.assertTrue(path.exists())
+
 
 class NotionalClamp(SizeTiltHarness):
     def _execute(self, signal, equity=100_000.0):
@@ -332,6 +391,35 @@ class NotionalClamp(SizeTiltHarness):
         self._seed_breakout()
         captured = self._execute(_signal(agent="BreakoutAgent"))
         self.assertEqual(captured["pos_usd"], 1500.0)
+
+    def test_flag_off_order_path_does_not_evaluate_or_write(self):
+        """Orders must not call ensure_today or the evaluator when the flag is off."""
+        from agent_risk_bridge import AgentRiskBridge
+        os.environ["SIZE_TILT_ENABLED"] = "false"
+        path = self.tmp / "size_tilt_qualifiers.json"
+        with patch.object(AgentRiskBridge, "_live_equity", return_value=None):
+            bridge = AgentRiskBridge(account_balance=100_000)
+        bridge.account_balance = 100_000
+        equity = {
+            "symbol": "AAPL",
+            "direction": "long",
+            "confidence": 0.90,
+            "entry_price": 10.0,
+            "stop_loss_price": 9.60,
+            "target_price": 12.0,
+            "agent": "BreakoutAgent",
+            "instrument_type": "equity",
+        }
+        with patch.object(size_tilt, "ensure_today") as ensure, \
+             patch("agent_evaluator.AgentEvaluator.evaluate") as evaluate:
+            captured = self._execute(_signal(agent="BreakoutAgent"))
+            sizing = bridge._compute_position_size(equity, "standard")
+        ensure.assert_not_called()
+        evaluate.assert_not_called()
+        self.assertEqual(captured["pos_usd"], 1500.0)
+        self.assertEqual(sizing["total_cost"], 2000.0)
+        self.assertFalse(path.exists())
+        self.assertIsNone(size_tilt._cache)
 
     def test_two_percent_cap_still_binds_non_qualifiers(self):
         # $50k × 2% = $1,000, which is tighter than the $1,500 absolute.
@@ -391,6 +479,7 @@ class BridgeCeiling(SizeTiltHarness):
             "agent": "BreakoutAgent",
             "instrument_type": "equity",
         }
+        os.environ["SIZE_TILT_ENABLED"] = "true"
         with patch("size_tilt.order_is_tilted", return_value=False):
             plain = bridge._compute_position_size(sig, "standard")
         self.assertEqual(plain["total_cost"], 2000.0)

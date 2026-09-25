@@ -19,7 +19,13 @@ Benched agents (logs/agent_summary.json active:false) and pinned agents
 order on any crypto symbol is never tilted.
 
 The day's list is logged at INFO and written to logs/size_tilt_qualifiers.json
-(date, flag, qualifiers, per-agent reason). An empty qualifier list is valid.
+(date, flag, qualifiers, per-agent reason). An empty qualifier list is valid
+when every active agent has a reason. An empty reason map, or one that skips
+an active agent, is not saved: that call returns no qualifiers and the next
+call computes again.
+
+With SIZE_TILT_ENABLED off, order entry does not compute or write that file.
+The daily eval (10:00 ET, 9:00 CT) does.
 
 .env keys consumed:
   SIZE_TILT_ENABLED   default false   ("1" / "true" / "yes" / "on" enable it)
@@ -229,6 +235,49 @@ def _remember(payload: dict) -> dict:
     return payload
 
 
+def _summary_active_names(summary: Optional[dict]) -> set[str]:
+    """Agents whose agent_summary.json row is active (missing active → active)."""
+    names: set[str] = set()
+    for name, row in (summary or {}).items():
+        if isinstance(row, dict) and bool(row.get("active", True)):
+            names.add(str(name))
+    return names
+
+
+def _active_agent_names(report, summary: Optional[dict]) -> set[str]:
+    """Active agents from the evaluator and from agent_summary.json.
+
+    A summary row with active:false is benched and is not required. Any other
+    summary row is active. Evaluator rows are active when stats.active is true
+    and the summary does not bench them.
+    """
+    summary = summary or {}
+    names = _summary_active_names(summary)
+    for stats in getattr(report, "agents", []) or []:
+        name = str(getattr(stats, "name", "") or "")
+        if not name:
+            continue
+        row = summary.get(name)
+        if isinstance(row, dict) and "active" in row:
+            if row.get("active"):
+                names.add(name)
+            else:
+                names.discard(name)
+        elif getattr(stats, "active", True):
+            names.add(name)
+    return names
+
+
+def _coverage_problem(reasons: dict, active: set[str]) -> Optional[str]:
+    """None when this result may be cached. Empty or partial reasons may not."""
+    if not isinstance(reasons, dict) or not reasons:
+        return "per-agent reasons are empty"
+    missing = sorted(active - set(reasons))
+    if missing:
+        return "per-agent reasons missing active agents: " + ", ".join(missing)
+    return None
+
+
 def _log_payload(payload: dict) -> None:
     names = ", ".join(payload.get("qualifiers") or []) or "(none)"
     log.info(
@@ -239,16 +288,38 @@ def _log_payload(payload: dict) -> None:
     )
 
 
+def _refused(day: str, problem: str) -> dict:
+    """This call qualifies nobody and must not lock the day."""
+    log.warning(
+        "SIZE TILT daily date=%s not saved (%s); no qualifiers, will recompute",
+        day, problem,
+    )
+    return {
+        "date": day,
+        "SIZE_TILT_ENABLED": enabled(),
+        "qualifiers": [],
+        "reasons": {},
+    }
+
+
 def ensure_today(report=None, summary: Optional[dict] = None) -> dict:
     """Return today's qualifier payload, computing it at most once per ET date.
 
-    Pass the evaluator report when the caller just built one (the 10:00 / 15:30
-    eval cycle). Otherwise this reads the ledger via AgentEvaluator. A file
-    already written for today is reused so a restart does not re-log.
+    Pass the evaluator report when the caller just built one (the 10:00 ET /
+    9:00 CT eval, and the 15:30 ET repeat). Otherwise this reads the ledger
+    via AgentEvaluator. A complete file already written for today is reused
+    so a restart does not re-log. The first complete compute locks the day.
+
+    Empty reasons, or reasons that skip an active agent, are not cached and
+    not written. That call returns no qualifiers so the next call recomputes.
+    Order entry must not call this when SIZE_TILT_ENABLED is off.
     """
     day = today_iso()
     if _cache is not None and _cache.get("date") == day:
         return _cache
+
+    if summary is None:
+        summary = load_summary()
 
     if report is None:
         path = qualifiers_path()
@@ -256,22 +327,33 @@ def ensure_today(report=None, summary: Optional[dict] = None) -> dict:
             try:
                 data = json.loads(path.read_text())
                 if isinstance(data, dict) and data.get("date") == day:
-                    return _remember(data)
+                    problem = _coverage_problem(
+                        data.get("reasons") or {},
+                        _summary_active_names(summary),
+                    )
+                    if problem is None:
+                        return _remember(data)
+                    log.warning(
+                        f"size tilt qualifier file ignored ({problem}); recomputing"
+                    )
             except Exception as e:
                 log.warning(f"size tilt qualifier file unreadable ({e}); recomputing")
-
-    if summary is None:
-        summary = load_summary()
 
     if report is None:
         from agent_evaluator import AgentEvaluator
         report = AgentEvaluator().evaluate()
 
     payload = _payload_from_report(report, summary or {}, day)
+    problem = _coverage_problem(
+        payload.get("reasons") or {},
+        _active_agent_names(report, summary),
+    )
+    if problem is not None:
+        return _refused(day, problem)
     try:
         _write(payload)
     except Exception as e:
-        log.warning(f"size tilt qualifier file not written ({e})")
+        return _refused(day, f"qualifier file not written ({e})")
     _log_payload(payload)
     return _remember(payload)
 

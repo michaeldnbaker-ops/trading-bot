@@ -300,9 +300,10 @@ class AgentRiskBridge:
             # Qualifying equity orders may size up to the tilted absolute
             # ($2,250). order_executor still clamps there, including the
             # exception to the 2% cap. Non-qualifiers keep this 2% ceiling.
+            # Flag off returns before ensure_today: no eval, no qualifier file.
             try:
                 import size_tilt
-                if size_tilt.order_is_tilted(
+                if size_tilt.enabled() and size_tilt.order_is_tilted(
                     signal.get("agent", ""),
                     signal.get("symbol", ""),
                     signal.get("contributing_agents", ""),
