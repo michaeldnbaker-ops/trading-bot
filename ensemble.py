@@ -140,6 +140,23 @@ except Exception as _e:
     _ALPACA_OK = False
 
 
+def _halt_cuts_symbol(sym: str, unrealized_pl: float) -> bool:
+    """Daily-loss de-risk flattens losing equities only.
+
+    Options close on +100% / -50% / CLOSE_DTE or the broker protective
+    stop, not because the book hit a daily loss. Crypto has its own
+    scheduler. Winners stay on their trails. L-2026-10-01b.
+    """
+    if unrealized_pl >= 0:
+        return False
+    if str(sym).endswith("USD") and len(str(sym)) > 5:
+        return False
+    from invariants import is_option_symbol
+    if is_option_symbol(sym):
+        return False
+    return True
+
+
 def _load_benched_agent_names() -> set[str]:
     try:
         if not AGENT_SUMMARY_PATH.exists():
@@ -717,8 +734,11 @@ class Ensemble:
                 sym, pl = str(p.symbol), float(p.unrealized_pl)
                 if sym.endswith("USD") and len(sym) > 5:
                     continue                      # crypto: own scheduler
-                if pl >= 0:
-                    kept.append(sym)
+                if not _halt_cuts_symbol(sym, pl):
+                    # Winners stay. Losing options stay too — premium
+                    # rules and the protective stop own that exit.
+                    if pl >= 0:
+                        kept.append(sym)
                     continue
                 try:
                     for o in client.get_orders(GetOrdersRequest(

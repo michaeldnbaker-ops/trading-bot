@@ -26,12 +26,22 @@ Risk model:
   • Only signals at or above OPTIONS_MIN_CONFIDENCE route here; everything
     else still trades shares. Options are the conviction expression, not
     the default.
+
+CHANGE LOG (L-2026-10-01b):
+  A long option closes only on +100% of premium, -50% of premium,
+  CLOSE_DTE, or the broker protective stop filling. Equity trailing
+  stops, ATR stops, and hold-time expiry do not apply. The exit mark
+  is the quote mid, else the mark implied by dollar P&L — not a last
+  print sitting on the bid. The protective stop is cancelled only when
+  one of those rules is actually closing the contract, so Alpaca does
+  not reject the close as uncovered.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import date, timedelta
 
 from dotenv import load_dotenv
@@ -47,6 +57,95 @@ CLOSE_DTE              = 10          # exit before theta accelerates
 MAX_SPREAD_PCT         = 15.0        # skip illiquid contracts
 PROFIT_TAKE_MULT       = 2.0         # close at +100% premium
 STOP_LOSS_MULT         = 0.50        # close at -50% premium
+_OCC_EXPIRY            = re.compile(r"(\d{6})[CP]")
+
+
+def occ_expiry(symbol: str) -> date | None:
+    """Expiration date embedded in an OCC symbol, or None."""
+    m = _OCC_EXPIRY.search(str(symbol or ""))
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        return date(2000 + int(raw[:2]), int(raw[2:4]), int(raw[4:6]))
+    except ValueError:
+        return None
+
+
+def occ_dte(symbol: str, today: date | None = None) -> int | None:
+    exp = occ_expiry(symbol)
+    if exp is None:
+        return None
+    return (exp - (today or date.today())).days
+
+
+def premium_mark(position, quote_mid: float | None = None) -> float | None:
+    """Per-share premium for the +100% / -50% rules.
+
+    Quote mid wins. Otherwise the mark implied by dollar P&L, which
+    stays in premium units. ``current_price`` is the last print: on a
+    wide spread it sits on the bid and looks like a -50% stop while
+    the position is only slightly red. That is the check that fired
+    on CCL261030C00026000 at 15:50 ET on 2026-09-30.
+    """
+    if quote_mid is not None:
+        try:
+            mid = float(quote_mid)
+        except (TypeError, ValueError):
+            mid = 0.0
+        if mid > 0:
+            return mid
+    try:
+        qty = abs(float(getattr(position, "qty", 0) or 0))
+        basis = abs(float(getattr(position, "avg_entry_price", 0) or 0))
+    except (TypeError, ValueError):
+        qty, basis = 0.0, 0.0
+    upl_raw = getattr(position, "unrealized_pl", None)
+    if qty > 0 and basis > 0 and upl_raw is not None:
+        try:
+            cost = basis * qty * 100.0
+            if cost > 0:
+                mark = basis * (1.0 + float(upl_raw) / cost)
+                if mark > 0:
+                    return mark
+        except (TypeError, ValueError):
+            pass
+    try:
+        cur = float(getattr(position, "current_price", 0) or 0)
+    except (TypeError, ValueError):
+        cur = 0.0
+    return cur if cur > 0 else None
+
+
+def option_exit_reason(symbol: str, entry_premium: float, mark: float | None,
+                       today: date | None = None) -> str | None:
+    """Why this long option must be closed, or None to keep holding it.
+
+    Software closes are only +100% of premium, -50% of premium, and
+    CLOSE_DTE. Equity trailing stops, ATR stops, and MAX_HOLD_DAYS are
+    not reasons. A filled broker protective stop is already flat at the
+    broker; this function does not invent that fill.
+    """
+    try:
+        entry = float(entry_premium)
+    except (TypeError, ValueError):
+        entry = 0.0
+    ratio = None
+    if entry > 0 and mark is not None:
+        try:
+            px = float(mark)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            ratio = px / entry
+    if ratio is not None and ratio >= PROFIT_TAKE_MULT:
+        return f"profit target +{(ratio - 1) * 100:.0f}%"
+    if ratio is not None and ratio <= STOP_LOSS_MULT:
+        return f"stop -{(1 - ratio) * 100:.0f}%"
+    dte = occ_dte(symbol, today)
+    if dte is not None and dte <= CLOSE_DTE:
+        return f"{dte}d to expiry — theta guard"
+    return None
 
 
 def _clients():
@@ -268,12 +367,47 @@ def submit_option_protective_stop(client, position) -> dict:
     }
 
 
-def manage_options_exits() -> None:
+def _cancel_symbol_orders(client, sym: str) -> None:
+    """Cancel resting orders so a close is not an extra uncovered sell.
+
+    Alpaca rejects close_position with 40310000 ("account not eligible
+    to trade uncovered option contracts") when a protective stop already
+    sells the full quantity. Cancel that stop first, and only when a
+    premium rule is actually exiting.
+    """
+    orders = []
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        orders = list(client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, symbols=[sym], limit=50)))
+    except Exception:
+        try:
+            orders = list(client.get_orders())
+        except Exception as e:
+            log.warning(f"options: could not list orders for {sym}: {e}")
+            return
+    for o in orders:
+        if str(getattr(o, "symbol", "")) != sym:
+            continue
+        try:
+            client.cancel_order_by_id(o.id)
+        except Exception as e:
+            log.warning(f"options: cancel {sym} before exit failed: {e}")
+
+
+def _flatten_option(client, sym: str) -> None:
+    _cancel_symbol_orders(client, sym)
+    client.close_position(sym)
+
+
+def manage_options_exits(today: date | None = None) -> None:
     """Exit rules for open option positions.
 
     Options can't use Alpaca trailing stops, so exits are managed here:
     take profit at +100%, cut at -50%, and always close before theta
-    accelerates in the final days.
+    accelerates in the final days. Nothing else — not the underlying's
+    stop, not a time stop, not a small mark-to-market loss.
     """
     if not OPTIONS_ENABLED:
         return
@@ -290,38 +424,39 @@ def manage_options_exits() -> None:
 
     for p in positions:
         sym = str(p.symbol)
+        flattened = False
         try:
             cost_basis = abs(float(p.avg_entry_price))
-            cur = float(p.current_price or 0)
-            if cost_basis <= 0 or cur <= 0:
+            if cost_basis <= 0:
                 continue
-            ratio = cur / cost_basis
-            # Expiry embedded in OCC symbol: ROOT + YYMMDD + C/P + strike
-            dte = None
-            try:
-                import re
-                m = re.search(r"(\d{6})[CP]", sym)
-                if m:
-                    y, mo, d = int(m.group(1)[:2]) + 2000, int(m.group(1)[2:4]), int(m.group(1)[4:6])
-                    dte = (date(y, mo, d) - date.today()).days
-            except Exception:
-                pass
-
-            reason = None
-            if ratio >= PROFIT_TAKE_MULT:
-                reason = f"profit target +{(ratio-1)*100:.0f}%"
-            elif ratio <= STOP_LOSS_MULT:
-                reason = f"stop -{(1-ratio)*100:.0f}%"
-            elif dte is not None and dte <= CLOSE_DTE:
-                reason = f"{dte}d to expiry — theta guard"
+            quote_mid = None
+            if data_client is not None:
+                try:
+                    q = _quote(data_client, sym)
+                    if q:
+                        quote_mid = q[2]
+                except Exception:
+                    quote_mid = None
+            mark = premium_mark(p, quote_mid=quote_mid)
+            reason = option_exit_reason(sym, cost_basis, mark, today=today)
             if not reason:
                 continue
 
-            client.close_position(sym)
+            flattened = True
+            _flatten_option(client, sym)
+            shown = mark if mark is not None else 0.0
             log.info(f"🎯 OPTIONS EXIT {sym}: {reason} "
-                     f"(entry ${cost_basis:.2f} now ${cur:.2f}, P&L {float(p.unrealized_pl):+,.0f})")
+                     f"(entry ${cost_basis:.2f} now ${shown:.2f}, "
+                     f"P&L {float(p.unrealized_pl):+,.0f})")
         except Exception as e:
             log.warning(f"options: exit check failed for {sym}: {e}")
+            if flattened:
+                # The protective stop was cancelled so the close could
+                # land. The close did not. Put the stop back.
+                try:
+                    submit_option_protective_stop(client, p)
+                except Exception as re_err:
+                    log.warning(f"options: could not restore stop on {sym}: {re_err}")
 
 
 if __name__ == "__main__":
