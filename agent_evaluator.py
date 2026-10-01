@@ -1,8 +1,18 @@
 """
-agent_evaluator.py — v2.1 (2026-09-20)
-──────────────────────────────────────
-Ranks leaf agents by P&L after paper friction. Ledger is the source of
-truth. MetaAgent(...) wrappers are unwrapped before anything is judged.
+agent_evaluator.py — v2.2 (L-2026-10-01b)
+──────────────────────────────────────────
+Ranks leaf agents by P&L after paper friction. MetaAgent(...) wrappers
+are unwrapped before anything is judged.
+
+CHANGE LOG (L-2026-10-01b):
+  • Scoring dollars are broker-fill realized P&L per closed round trip,
+    after the one paper-friction cost, split 1/N across leaf agents on
+    the ticket. The rotator benches off this same EvalReport (it does
+    not recompute). Ledger realized is used only when no fill matches,
+    and that trade is logged.
+  • CryptoAgent is gated (inactive, excluded from the ensemble average,
+    FLAG, and rotation) while CRYPTO_TRADING_ENABLED is false. The
+    sleeve is not turned on.
 
 CHANGE LOG (v2.1):
   • Leaf unwrap uses trade_ledger.expand_agent_names / leaf_agents so
@@ -65,12 +75,16 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import trade_ledger as _ledger
+from broker_fills import ScoreSlice, prepare_scoring_book, slices_for_trade
+
+log = logging.getLogger("AgentEvaluator")
 
 # ── Tuning knobs ────────────────────────────────────────────────────────────
 UNDERPERFORM_THRESHOLD = 0.20   # 20 % below ensemble avg triggers flag
@@ -121,6 +135,8 @@ class AgentStats:
     active:       bool  = True
     flagged:      bool  = False
     flag_reason:  str   = ""
+    gated:        bool  = False
+    gate_reason:  str   = ""
 
     @property
     def win_rate(self) -> Optional[float]:
@@ -150,10 +166,12 @@ class EvalReport:
     top_agent:      Optional[str] = None
     ensemble_avg_5d:  float = 0.0
     ensemble_avg_20d: float = 0.0
+    scoring_note:   str = ""
 
     def summary_text(self) -> str:
         lines = [
             f"=== Agent Performance Evaluation — {self.generated_at} ===",
+            self.scoring_note or "Scoring: ledger realized (broker fills not loaded).",
             f"Ensemble avg P&L  │  5-day: ${self.ensemble_avg_5d:,.2f}  │  20-day: ${self.ensemble_avg_20d:,.2f}",
             "",
             f"{'Agent':<20} {'5d net':>10} {'20d net':>11} {'E[20d]':>9} {'All-Time':>11} {'Trades':>7} {'Win%':>7} {'Status':>10}",
@@ -161,7 +179,14 @@ class EvalReport:
         ]
         for a in sorted(self.agents, key=lambda x: x.pnl_20d_after_costs, reverse=True):
             win_pct = f"{a.win_rate*100:.0f}%" if a.win_rate is not None else "—"
-            status  = "⚠ FLAG" if a.flagged else ("✓ active" if a.active else "● bench")
+            if a.gated:
+                status = "⊘ gated"
+            elif a.flagged:
+                status = "⚠ FLAG"
+            elif a.active:
+                status = "✓ active"
+            else:
+                status = "● bench"
             exp = (
                 f"{a.expectancy_after_costs_20d:>+9.2f}"
                 if a.expectancy_after_costs_20d is not None else f"{'—':>9}"
@@ -170,6 +195,8 @@ class EvalReport:
                 f"{a.name:<20} {a.pnl_5d_after_costs:>+10,.2f} {a.pnl_20d_after_costs:>+11,.2f} "
                 f"{exp} {a.pnl_alltime_after_costs:>+11,.2f} {a.trades_total:>7} {win_pct:>7} {status:>10}"
             )
+            if a.gate_reason:
+                lines.append(f"  └─ {a.gate_reason}")
             if a.flag_reason:
                 lines.append(f"  └─ {a.flag_reason}")
         if self.top_agent:
@@ -282,17 +309,74 @@ def _agent_active_state() -> dict[str, dict]:
         return {}
 
 
+def _crypto_gated(name: str) -> bool:
+    """True when this leaf cannot trade and must not be scored.
+
+    CRYPTO_TRADING_ENABLED stays false. This only changes the display
+    and whether the sleeve votes on FLAG / rotation / the ensemble average.
+    """
+    if name != "CryptoAgent":
+        return False
+    try:
+        from session_gates import CRYPTO_TRADING_ENABLED
+        return not CRYPTO_TRADING_ENABLED
+    except Exception:
+        return True
+
+
+def _accumulate_slice(agg: dict, sl: ScoreSlice, opened, cutoff_5d, cutoff_20d) -> None:
+    """Add one agent's 1/N share. Win/loss follows the whole round trip."""
+    d = agg.setdefault(sl.agent, {
+        "pnl_5d":       0.0, "pnl_20d":      0.0, "pnl_alltime":  0.0,
+        "cost_5d":      0.0, "cost_20d":     0.0, "cost_total":   0.0,
+        "trades_5d":    0,   "trades_20d":   0,   "trades_total": 0,
+        "wins_total":   0,   "losses_total": 0,
+    })
+    d["pnl_alltime"]  += sl.pnl
+    d["cost_total"]   += sl.cost
+    d["trades_total"] += 1
+    if sl.trade_pnl >= 0:
+        d["wins_total"] += 1
+    else:
+        d["losses_total"] += 1
+    if opened is None:
+        return
+    if opened >= cutoff_5d:
+        d["pnl_5d"]    += sl.pnl
+        d["cost_5d"]   += sl.cost
+        d["trades_5d"] += 1
+    if opened >= cutoff_20d:
+        d["pnl_20d"]    += sl.pnl
+        d["cost_20d"]   += sl.cost
+        d["trades_20d"] += 1
+
+
 # ── Main evaluator ──────────────────────────────────────────────────────────
 class AgentEvaluator:
     """Reads the ledger and produces a ranked EvalReport."""
 
-    def evaluate(self) -> EvalReport:
+    def evaluate(self, round_trips=None) -> EvalReport:
         # Epoch-filtered: pre-2026-07-02 trades were distorted by the
         # duplicate-entry bug, so they'd have agents benched for the bug's
         # sins rather than their own. Full history remains in the ledger
         # and in reports; it just doesn't vote on rotation anymore.
         all_trades = _ledger.epoch_trades()
         active_state = _agent_active_state()
+        book, broker_available = prepare_scoring_book(round_trips)
+        assignment: dict[str, list] = {}
+        if broker_available:
+            from broker_fills import assign_round_trips
+            assignment = assign_round_trips(all_trades, book)
+            scoring_note = (
+                "Scoring: broker-fill realized P&L after costs, co-signed 1/N. "
+                "Unmatched closed trades use ledger realized and are logged."
+            )
+        else:
+            scoring_note = (
+                "Scoring: ledger realized after costs, co-signed 1/N "
+                "(broker fills not loaded)."
+            )
+            log.info("broker fills unavailable — evaluator scoring from ledger realized")
 
         # ── Window cutoffs (calendar days, ET) ────────────────────────────
         today_midnight = _today_et_date()
@@ -300,57 +384,27 @@ class AgentEvaluator:
         cutoff_20d = today_midnight - timedelta(days=20)
 
         # ── Per-agent aggregation ─────────────────────────────────────────
-        # Leaf names only — same unwrap as trade_ledger.per_agent_attribution.
+        # Leaf names only. Dollars are 1/N of the round trip, not a full
+        # copy on every co-signer (that double-counted a shared loss).
         agg: dict[str, dict] = {}
 
         for t in all_trades:
             # Closed trades only. Marking open winners into the 5d/20d
             # windows is how a losing agent kept a full weight while its
             # closed record bled (meta_agent already dropped unrealized
-            # for that reason). Rotation, FLAG, and size-tilt read this
-            # report, so an open mark must not vote.
+            # for that reason; PR #14). Rotation, FLAG, and size-tilt read
+            # this report, so an open mark must not vote.
             if getattr(t, "is_open", False):
                 continue
             opened = _trade_opened_dt(t)
-            pnl    = _pnl_for_trade(t)
-            cost   = _ledger.round_trip_cost(t)
-            _names = list(getattr(t, "leaf_agents", None) or [])
-            if not _names:
-                # Older Trade stubs / tests without leaf_agents.
-                _names = _ledger.leaf_agent_names(
-                    getattr(t, "primary_agent", ""),
-                    getattr(t, "contributors", ""),
+            if broker_available:
+                slices = slices_for_trade(
+                    t, assignment.get(str(t.trade_id)) or [], warn_unmatched=True,
                 )
-            for agent in _names:
-                d = agg.setdefault(agent, {
-                    "pnl_5d":       0.0, "pnl_20d":      0.0, "pnl_alltime":  0.0,
-                    "cost_5d":      0.0, "cost_20d":     0.0, "cost_total":   0.0,
-                    "trades_5d":    0,   "trades_20d":   0,   "trades_total": 0,
-                    "wins_total":   0,   "losses_total": 0,
-                })
-
-                d["pnl_alltime"]  += pnl
-                d["cost_total"]   += cost
-                d["trades_total"] += 1
-
-                # Win/loss only counts CLOSED trades — open positions are
-                # too noisy to call wins or losses yet.
-                if not t.is_open:
-                    if t.realized_pnl >= 0:
-                        d["wins_total"] += 1
-                    else:
-                        d["losses_total"] += 1
-
-                if opened is None:
-                    continue
-                if opened >= cutoff_5d:
-                    d["pnl_5d"]    += pnl
-                    d["cost_5d"]   += cost
-                    d["trades_5d"] += 1
-                if opened >= cutoff_20d:
-                    d["pnl_20d"]    += pnl
-                    d["cost_20d"]   += cost
-                    d["trades_20d"] += 1
+            else:
+                slices = slices_for_trade(t, None, warn_unmatched=False)
+            for sl in slices:
+                _accumulate_slice(agg, sl, opened, cutoff_5d, cutoff_20d)
 
         # ── Build AgentStats list ─────────────────────────────────────────
         stats_list: list[AgentStats] = []
@@ -390,15 +444,23 @@ class AgentEvaluator:
                 trades_total = d["trades_total"],
                 wins_total   = d["wins_total"],
                 losses_total = d["losses_total"],
-                active       = active_info.get("active", True),
+                active       = False if _crypto_gated(name) else active_info.get("active", True),
+                gated        = _crypto_gated(name),
+                gate_reason  = (
+                    "crypto sleeve off (CRYPTO_TRADING_ENABLED=false); "
+                    "excluded from scoring"
+                    if _crypto_gated(name) else ""
+                ),
             )
             stats_list.append(st)
 
         # ── Ensemble averages (active leaf agents only) ───────────────────
         # After-cost P&L so FLAG/PROMOTE and the scorecard share one number.
+        # Gated CryptoAgent is not a voice: it does not move the average
+        # and it is not FLAG'd.
         active = [
             s for s in stats_list
-            if s.active and not _ledger.is_wrapper_agent_name(s.name)
+            if s.active and not s.gated and not _ledger.is_wrapper_agent_name(s.name)
         ]
         n = len(active) or 1
         avg_5d  = sum(s.pnl_5d_after_costs  for s in active) / n
@@ -427,6 +489,7 @@ class AgentEvaluator:
             top_agent        = top,
             ensemble_avg_5d  = round(avg_5d,  2),
             ensemble_avg_20d = round(avg_20d, 2),
+            scoring_note     = scoring_note,
         )
 
     def save_report(self, report: EvalReport) -> Path:
@@ -460,6 +523,8 @@ class AgentEvaluator:
                     "losses_total":  a.losses_total,
                     "win_rate":      a.win_rate,
                     "active":        a.active,
+                    "gated":         a.gated,
+                    "gate_reason":   a.gate_reason,
                     "flagged":       a.flagged,
                     "flag_reason":   a.flag_reason,
                 }

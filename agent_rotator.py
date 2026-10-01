@@ -1,7 +1,15 @@
 """
-agent_rotator.py — v1.5 (2026-09-25)
-────────────────────────────────────
+agent_rotator.py — v1.6 (L-2026-10-01b)
+───────────────────────────────────────
 Rotates underperforming agents out and promotes better alternatives.
+
+CHANGE LOG (L-2026-10-01b):
+  • Bench text quotes the evaluator's 20d after-cost P&L and trade count
+    from the same EvalReport. run_rotation(report=...) does not score
+    the book a second time, so the bench line and the eval table cannot
+    disagree inside one cycle.
+  • CryptoAgent is not counted, benched, promoted, or reactivated while
+    CRYPTO_TRADING_ENABLED is false. The gate itself is unchanged.
 
 CHANGE LOG (v1.5, 2026-09-25):
   • NewsAgent and SentimentAgent were unprotected per L-2026-09-25a.
@@ -162,6 +170,28 @@ def is_pinned_bench(info: dict, benched_at: datetime, now: datetime) -> bool:
     return False
 
 
+def _crypto_gated(name: str) -> bool:
+    """Display/scoring gate only. Does not flip CRYPTO_TRADING_ENABLED."""
+    if name != "CryptoAgent":
+        return False
+    try:
+        from session_gates import CRYPTO_TRADING_ENABLED
+        return not CRYPTO_TRADING_ENABLED
+    except Exception:
+        return True
+
+
+def _score_suffix(stats) -> str:
+    """The evaluator's 20d after-cost figure, so the bench log matches it."""
+    if stats is None:
+        return ""
+    pnl = getattr(stats, "pnl_20d_after_costs", None)
+    n = getattr(stats, "trades_20d", None)
+    if pnl is None or n is None:
+        return ""
+    return f" (20d after-cost ${float(pnl):+,.2f} over {int(n)} trades)"
+
+
 def reactivation_decision(stats, min_trades: int | None = None) -> tuple[bool, str]:
     """(reactivate, reason) from the evaluator's 20d after-cost expectancy.
 
@@ -203,13 +233,18 @@ class AgentRotator:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def run_rotation(self, dry_run: bool = False) -> dict:
+    def run_rotation(self, dry_run: bool = False, report: EvalReport | None = None) -> dict:
         """
         Execute one rotation cycle.
         dry_run=True: prints what would happen without modifying anything.
         Returns a dict summarising actions taken (or planned if dry_run).
+
+        Pass the EvalReport the evaluator just printed. A second evaluate()
+        would re-window the book and the bench line could cite a different
+        20d number than the table above it (L-2026-10-01b).
         """
-        report  = self.evaluator.evaluate()
+        if report is None:
+            report = self.evaluator.evaluate()
         summary = self.logger.get_summary()
         now     = datetime.now(timezone.utc)
 
@@ -230,6 +265,19 @@ class AgentRotator:
         # days the gate cannot pass. That hold is permanent until a new
         # variant or an Edge Research spec replaces the agent.
         for name, info in summary.items():
+            if _crypto_gated(name):
+                # Never flip the summary back to active. The eval report
+                # already shows this leaf as gated. A hold is recorded only
+                # when the row is benched, so an active=true summary does
+                # not look like a rotation.
+                if isinstance(info, dict) and not info.get("active", True):
+                    hold = (
+                        f"GATED {name} — CRYPTO_TRADING_ENABLED is false; "
+                        f"not scored, not reactivated"
+                    )
+                    holds.append(hold)
+                    log.info(hold)
+                continue
             if info.get("active", True):
                 continue
             benched_at_str = info.get("benched_at")
@@ -266,7 +314,11 @@ class AgentRotator:
         # is at default-active", but summary.values() would count zero —
         # tripping the MIN_ACTIVE_AGENTS floor on the first flagged agent.
         # Use the EvalReport roster (excluding the MetaAgent wrapper).
-        real_agents = [a for a in report.agents if a.name != "MetaAgent"]
+        real_agents = [
+            a for a in report.agents
+            if a.name != "MetaAgent" and not getattr(a, "gated", False)
+            and not _crypto_gated(a.name)
+        ]
         active_count = sum(1 for a in real_agents if a.active)
 
         # Bench worst-first: spend the bench-budget on the biggest 20-day
@@ -284,6 +336,11 @@ class AgentRotator:
         newly_benched: set[str] = set()
 
         for agent_name in flagged_sorted:
+            if _crypto_gated(agent_name):
+                actions.append(
+                    f"GATED {agent_name} — crypto sleeve off, not scored or benched"
+                )
+                continue
             # Never bench protected core agents
             if agent_name in PROTECTED_AGENTS:
                 actions.append(f"PROTECTED {agent_name} — core agent, reducing weight instead of benching")
@@ -317,10 +374,11 @@ class AgentRotator:
                     summary[replacement]["benched_at"] = None
 
             newly_benched.add(agent_name)
+            score = _score_suffix(agent_stats.get(agent_name))
             action = (
-                f"BENCHED {agent_name} → PROMOTED {replacement}"
+                f"BENCHED {agent_name} → PROMOTED {replacement}{score}"
                 if replacement else
-                f"BENCHED {agent_name} (no replacement available; ensemble running short)"
+                f"BENCHED {agent_name} (no replacement available; ensemble running short){score}"
             )
             actions.append(action)
             self._write_rotation_event(agent_name, "BENCHED", action, dry_run, replacement=replacement)

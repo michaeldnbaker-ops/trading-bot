@@ -576,12 +576,18 @@ class ExpectancyReactivation(unittest.TestCase):
 
 
 class ReconcileAndSchedule(unittest.TestCase):
-    def test_options_day_pnl_is_removed_from_the_gap(self):
-        from report_data import unexplained_day_gap
-        # Broker day +1000, ledger realized +100, option intraday +800.
-        # Without the option term the gap is $900 and looks like drift.
-        self.assertAlmostEqual(unexplained_day_gap(1000, 100, 800), 100)
-        self.assertAlmostEqual(unexplained_day_gap(1000, 100, 0), 900)
+    def test_reconcile_compares_realized_with_realized(self):
+        from report_data import reconcile_line, unexplained_day_gap
+        # Unrealized marks do not enter the booking gap. The old formula
+        # treated day equity change minus lifetime realized as drift.
+        self.assertAlmostEqual(unexplained_day_gap(900, 914, -110), 14)
+        self.assertAlmostEqual(unexplained_day_gap(0, 0, -374), 0)
+        line = reconcile_line(-358, 914, 914, -110)
+        self.assertIn("broker realized today", line)
+        self.assertIn("ledger realized today", line)
+        self.assertIn("Unrealized change today", line)
+        self.assertIn("gap $0", line)
+        self.assertNotIn("unexplained booking gap", line)
 
     def test_ghost_close_exit_at_is_et(self):
         # No network, no wall clock, no dotenv. The old test patched

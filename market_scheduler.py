@@ -603,7 +603,9 @@ def run_eval_cycle():
         if report.flagged_agents:
             log.info(f"Flagged agents detected: {report.flagged_agents} — running rotation...")
             rotator = AgentRotator()
-            result  = rotator.run_rotation()
+            # Same report the table just printed. A second evaluate()
+            # re-windows the book (L-2026-10-01b).
+            result  = rotator.run_rotation(report=report)
             log.info(f"Rotation actions: {result['actions']}")
         else:
             log.info("All agents within performance threshold — no rotation needed.")
