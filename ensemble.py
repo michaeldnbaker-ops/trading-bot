@@ -419,13 +419,20 @@ class Ensemble:
                     agent.watchlist = agent._base_watchlist + [
                         s for s in dynamic if s not in agent._base_watchlist]
 
-        # Step 3: gather signals from active agents
+        # Step 3: gather signals from the turnaround book only.
+        # L-2026-10-01b: NewsAgent and BreakoutAgent. Code-disabled names
+        # and previously pinned names fail agent_may_signal, so a summary
+        # row cannot put them back on the book.
+        from agent_rotator import agent_may_signal
         benched = _load_benched_agent_names()
         skipped: list[str] = []
         all_raw_signals: list[dict] = []
         _fail_log: dict[str, tuple[float, str]] = Ensemble._agent_fail_at
 
         for agent in self.agents:
+            if not agent_may_signal(agent.name):
+                skipped.append(agent.name)
+                continue
             if agent.name in benched:
                 skipped.append(agent.name)
                 continue
@@ -596,6 +603,12 @@ class Ensemble:
 
     def _scan_surges(self, risk_status: dict) -> list[dict]:
         """Use Alpaca real-time data to catch surges/drops ≥ 3%."""
+        # AlpacaSurgeAgent / AlpacaSurgeDetector are code-disabled
+        # (L-2026-10-01b). The scanner is not an ensemble member, so the
+        # agent loop above does not cover it.
+        from agent_rotator import agent_may_signal
+        if not agent_may_signal("AlpacaSurgeAgent") and not agent_may_signal("AlpacaSurgeDetector"):
+            return []
         if not (_ALPACA_OK and alpaca_stream.is_streaming()):
             return []
         if risk_status.get("halt_trading"):

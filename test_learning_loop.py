@@ -352,17 +352,13 @@ class DrainFlagFlowsToBench(unittest.TestCase):
 
 
 class ProtectedAgents(unittest.TestCase):
-    """L-2026-09-25a: closed-trade evidence decides News and Sentiment."""
+    """L-2026-10-01b: protection set is empty. Shorts are code-disabled."""
 
-    def test_news_and_sentiment_unprotected_shorts_stay(self):
+    def test_protected_agents_empty(self):
+        self.assertEqual(PROTECTED_AGENTS, set())
         self.assertNotIn("NewsAgent", PROTECTED_AGENTS)
-        self.assertNotIn("SentimentAgent", PROTECTED_AGENTS)
-        self.assertIn("BearishPatternAgent", PROTECTED_AGENTS)
-        self.assertIn("ShortMomentumAgent", PROTECTED_AGENTS)
-        self.assertEqual(
-            PROTECTED_AGENTS,
-            {"BearishPatternAgent", "ShortMomentumAgent"},
-        )
+        self.assertNotIn("BearishPatternAgent", PROTECTED_AGENTS)
+        self.assertNotIn("ShortMomentumAgent", PROTECTED_AGENTS)
 
 
 class PaperOnlyUntouched(unittest.TestCase):
