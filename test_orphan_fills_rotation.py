@@ -661,8 +661,11 @@ class ReconcileAndSchedule(unittest.TestCase):
         self.assertIs(session_gates.PAPER_ONLY, True)
         src = inspect.getsource(order_executor.OrderExecutor.__init__)
         self.assertIn("paper=True", src)
-        self.assertNotIn("DISABLED_AGENTS", inspect.getsource(
-            __import__("agent_rotator")))
+        # L-2026-10-01b: the roster disable set lives in agent_rotator.
+        # It does not touch the paper hardwire or the crypto gate above.
+        from agent_rotator import DISABLED_AGENTS
+        self.assertIn("ShortMomentumAgent", DISABLED_AGENTS)
+        self.assertNotIn("paper", " ".join(DISABLED_AGENTS).lower())
 
 
 if __name__ == "__main__":

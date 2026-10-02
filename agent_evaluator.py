@@ -61,7 +61,8 @@ Learning Loop thresholds (paper only — FLAG → rotator BENCH / PROMOTE):
       commission; kill/PROMOTE still use after-cost numbers.
 
   MIN_ACTIVE_AGENTS = 2 lives in agent_rotator. Drain FLAGs are real;
-      the rotator skips BENCH only at that floor / PROTECTED_AGENTS.
+      the rotator skips BENCH at that floor. PROTECTED_AGENTS is empty
+      (L-2026-10-01b). Code-disabled names are not reactivated to fill it.
       No silent override of a drain FLAG.
 
 Usage:
