@@ -14,6 +14,17 @@ Deploy on Google Cloud VM (see CLOUD_SETUP.md):
 
 Or run as a systemd service so it auto-starts on VM reboot:
   see cloud_setup_guide.md for the unit file
+
+CHANGE LOG (L-2026-10-01b):
+  Option contracts are not ledger rows (options_executor never calls
+  record_trade; sync_from_broker skips len>12). reconcile_orphan_positions
+  therefore classified every contract as an orphan and, at 15:55 ET,
+  _close_losing_orphan market-sold any of them with unrealized P&L <= 0,
+  logging "ledger already exited it". That closed CCL261030C00026000 on
+  2026-09-30 and NOK261016C00010000 on 2026-09-25. A ledger-tracked option
+  is not an orphan. An option with no ledger row closes only on +100%
+  premium, -50% premium, or CLOSE_DTE. A small loss keeps the contract
+  and its protective stop.
 """
 
 from __future__ import annotations
@@ -339,13 +350,32 @@ def _closing_orders(orders, signed_qty: float) -> list:
     return out
 
 
-def reconcile_orphan_positions(client, ledger_open: set[str]) -> list[dict]:
-    """Close losing broker positions the ledger already exited.
+def _order_may_book_ledger_exit(symbol: str) -> bool:
+    """Closed-order sync must not stamp an option row exited.
 
-    Winning orphans are kept. Their open exit orders are not cancelled
-    before that decision — cancelling first is what left kept names with
-    no stop while the log said the trailing stop was still active.
+    The entry buy is itself a closed order. Matching it to the open long
+    books the contract closed the day it was bought, and the 15:55
+    reconcile then treats the still-open broker position as an orphan.
+    L-2026-10-01b.
+    """
+    from invariants import is_option_symbol
+    return not is_option_symbol(symbol)
 
+
+def reconcile_orphan_positions(client, ledger_open: set[str], today=None) -> list[dict]:
+    """Close broker positions the ledger already exited.
+
+    A symbol still open in the ledger is not an orphan. That includes a
+    ledger-tracked option: equity reconcile must not market-close it.
+
+    Winning equity orphans are kept. Their open exit orders are not
+    cancelled before that decision — cancelling first is what left kept
+    names with no stop while the log said the trailing stop was still
+    active.
+
+    Option orphans (broker contract, no ledger row) are not "losing, so
+    sell". They close only on +100% premium, -50% premium, or CLOSE_DTE.
+    Anything else is kept, and a missing protective stop is replaced.
     A kept orphan that is not fully covered gets a protective exit
     re-placed: an equity trailing stop sized to the broker qty, or an
     options stop. If the broker rejects the options stop, the log says
@@ -376,7 +406,12 @@ def reconcile_orphan_positions(client, ledger_open: set[str]) -> list[dict]:
         except (TypeError, ValueError):
             continue
         sym_orders = by_sym.get(sym, [])
-        if upl > 0:
+        if is_option_symbol(sym):
+            action = _reconcile_option_orphan(
+                client, p, sym, signed, upl, sym_orders, today,
+                position_is_protected, is_option_symbol,
+            )
+        elif upl > 0:
             action = _keep_winning_orphan(
                 client, p, sym, signed, upl, sym_orders, position_is_protected,
                 is_option_symbol,
@@ -486,6 +521,47 @@ def _reprotect_option(client, position, sym, upl) -> dict:
             "replaced": False, "level": "warning", "message": msg}
 
 
+def _reconcile_option_orphan(client, position, sym, signed, upl, sym_orders,
+                             today, position_is_protected, is_option_symbol) -> dict:
+    """Option with no open ledger row.
+
+    True-orphan safety stays: we still see the broker contract. The
+    equity rule (unrealized P&L <= 0 → cancel stop, market sell) does
+    not. Premium rules do.
+    """
+    from options_executor import option_exit_reason, premium_mark
+    try:
+        basis = abs(float(getattr(position, "avg_entry_price", 0) or 0))
+    except (TypeError, ValueError):
+        basis = 0.0
+    reason = option_exit_reason(sym, basis, premium_mark(position), today=today)
+    if reason:
+        return _close_option_for_rule(client, sym, sym_orders, reason)
+    action = _keep_winning_orphan(
+        client, position, sym, signed, upl, sym_orders,
+        position_is_protected, is_option_symbol,
+    )
+    if upl <= 0:
+        action["message"] = (
+            action["message"]
+            .replace("KEEPING winning option orphan", "KEEPING option")
+            .replace("KEEPING winning orphan", "KEEPING option")
+            .replace(f"(+${upl:.0f})", f"(${upl:.0f})")
+        )
+    return action
+
+
+def _close_option_for_rule(client, sym, sym_orders, reason: str) -> dict:
+    for o in sym_orders:
+        try:
+            client.cancel_order_by_id(o.id)
+        except Exception:
+            pass
+    client.close_position(sym)
+    msg = f"Reconcile: closed option {sym} — {reason}"
+    return {"symbol": sym, "action": "closed", "message": msg, "reason": reason}
+
+
 def _close_losing_orphan(client, sym, sym_orders) -> dict:
     for o in sym_orders:
         try:
@@ -520,6 +596,8 @@ def sync_alpaca_positions():
         updated = 0
         for order in orders:
             sym  = str(order.symbol)
+            if not _order_may_book_ledger_exit(sym):
+                continue
             side = "LONG" if str(order.side) == "buy" else "SHORT"
             for tid, t in trades.items():
                 if t.symbol == sym and t.side == side and t.is_open:
@@ -545,12 +623,18 @@ def sync_alpaca_positions():
         # simulation closes first, the real position lingers and consumes
         # buying power invisibly (this froze the account on 2026-07-08).
         #
-        # Only liquidate LOSERS. A profitable orphan means the ledger's
-        # price simulation closed early while the broker's exit is still
-        # riding a winner — killing those forfeits the runners the
-        # asymmetry design exists to capture (2026-07-27: GPC +$1,060,
+        # Only liquidate LOSING EQUITIES. A profitable orphan means the
+        # ledger's price simulation closed early while the broker's exit
+        # is still riding a winner — killing those forfeits the runners
+        # the asymmetry design exists to capture (2026-07-27: GPC +$1,060,
         # NFLX +$877). Exit orders are cancelled only on the liquidate
         # path. A kept orphan keeps, or is given, a real protective exit.
+        #
+        # Options are not in that equity rule. A contract the ledger does
+        # not list is still not sold just because its premium is red.
+        # +100% / -50% / CLOSE_DTE are the only reconcile closes. A
+        # contract the ledger still has open is not an orphan at all
+        # (L-2026-10-01b).
         try:
             ledger_open = {t.symbol.replace("/", "") for t in _ledger.open_positions()}
             reconcile_orphan_positions(client, ledger_open)
