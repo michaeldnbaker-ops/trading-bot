@@ -11,29 +11,48 @@ Setup — add these to your .env file:
     GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx   ← 16-char App Password
     REPORT_TO_EMAIL=your@gmail.com           ← where to send the report (can be same)
 
-To generate + send immediately (manual trigger):
-    python weekly_reporter.py --send-now
+The Monday cron still calls this with --send-now. That send is a no-op
+unless LEGACY_WEEKLY_EMAIL=1. The Friday after-close email (daily_reporter.py)
+already covers the week, so the Monday note would be a second weekly email.
 
-To run as a weekly cron job (add to crontab on your cloud VM):
-    0 7 * * 1  /usr/bin/python3 /home/user/trading-bot/weekly_reporter.py --send-now
+To send the old Monday email anyway:
+    LEGACY_WEEKLY_EMAIL=1 python weekly_reporter.py --send-now
 """
 
 from __future__ import annotations
 
 import os
-import smtplib
 import sys
+
+
+def legacy_weekly_send_enabled() -> bool:
+    """The Monday weekly email stays off unless this is exactly \"1\"."""
+    return os.getenv("LEGACY_WEEKLY_EMAIL", "").strip() == "1"
+
+
+if __name__ == "__main__" and "--send-now" in sys.argv and not legacy_weekly_send_enabled():
+    print(
+        "Weekly email is off. The after-close email on the last trading day "
+        "of the week covers it. Set LEGACY_WEEKLY_EMAIL=1 to send this older email."
+    )
+    raise SystemExit(0)
+
+import json
+import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from agent_evaluator import AgentEvaluator
 from performance_logger import PerformanceLogger, LOGS_DIR
 
-load_dotenv()
 ET = ZoneInfo("America/New_York")
 
 
@@ -212,6 +231,10 @@ class WeeklyReporter:
     def _get_benchmark_returns(week_start: datetime, week_end: datetime) -> dict:
         """Fetch SPY and QQQ returns for the same week period."""
         results = {}
+        try:
+            import yfinance as yf
+        except Exception:
+            return {"SPY": None, "QQQ": None}
         for ticker in ["SPY", "QQQ"]:
             try:
                 df = yf.Ticker(ticker).history(
