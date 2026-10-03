@@ -460,7 +460,12 @@ def standing_line(as_of: date, view: MarketView) -> str:
             f"the $75,000 line"
         )
     if view.positions is None:
-        positions = "open positions unavailable"
+        # A past-date preview does not load the live book. A live fetch that
+        # failed is a different sentence, so a missing book is not shown as $0.
+        if view.live_equity:
+            positions = "open positions unavailable"
+        else:
+            positions = "open positions not loaded for past dates"
     else:
         count = len(view.positions)
         noun = "position" if count == 1 else "positions"
@@ -750,15 +755,27 @@ def _load_account(headers: dict) -> tuple[float | None, float | None]:
 
 
 def _load_history(headers: dict) -> dict[date, float]:
-    try:
-        payload = _get_json(
-            f"{PAPER_API}/v2/account/portfolio/history",
-            headers,
-            {"start": "2025-01-01", "timeframe": "1D"},
-        )
-        return equity_from_history_payload(payload)
-    except Exception:
-        return {}
+    """Official daily closes. period=1A, not a start date before the account.
+
+    GET .../portfolio/history?start=2025-01-01&timeframe=1D returns a short
+    run of 0.0 equity and base_value null when the start is before the
+    account existed. period=1A returns the real year (base_value 100000).
+    If that parse is empty, try period=3M. Zero equity is dropped by
+    equity_from_history_payload, and 1D stamps shift back one UTC day.
+    """
+    for period in ("1A", "3M"):
+        try:
+            payload = _get_json(
+                f"{PAPER_API}/v2/account/portfolio/history",
+                headers,
+                {"period": period, "timeframe": "1D"},
+            )
+        except Exception:
+            continue
+        parsed = equity_from_history_payload(payload if isinstance(payload, dict) else {})
+        if parsed:
+            return parsed
+    return {}
 
 
 def _load_positions(headers: dict) -> list[dict] | None:

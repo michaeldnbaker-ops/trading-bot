@@ -30,6 +30,7 @@ from plain_report import (
     closed_trades_from_books,
     direction_dollars,
     direction_pts,
+    _load_history,
     equity_from_history_payload,
     go_no_go_status,
     is_alert_text,
@@ -177,6 +178,9 @@ class SubjectWording(unittest.TestCase):
             self.assertEqual(a.subject, b.subject)
             for word in ("provisional", "estimate", "unofficial", "intraday", "last_equity"):
                 self.assertNotIn(word, b.body.lower())
+            self.assertIn("equity $78,671.07", b.body)
+            self.assertIn("$3,671.07 above the $75,000 line", b.body)
+            self.assertIn("All-time drawdown from the $100,000 start: $21,328.93.", b.body)
 
     def test_missing_broker_does_not_invent_numbers(self):
         email = build_email(date(2026, 10, 1), "daily", MarketView())
@@ -399,7 +403,40 @@ class AlertsAndStanding(unittest.TestCase):
             ),
         )
         self.assertIn("$1,000.00 below the $75,000 line", below.body)
-        self.assertIn("open positions unavailable", below.body)
+        self.assertIn("open positions not loaded for past dates", below.body)
+        live_missing = build_email(
+            FRI, "daily", fixture_view(positions=None, live_equity=True),
+        )
+        self.assertIn("open positions unavailable", live_missing.body)
+        self.assertNotIn("not loaded for past dates", live_missing.body)
+
+
+def _utc(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+
+
+def real_history_payload() -> dict:
+    """Shaped like Alpaca period=1A: leading zeros, then the real closes.
+
+    The last three points are the closes the paper account actually returned,
+    stamped on the next UTC day. base_value is the account start, not a bar.
+    """
+    return {
+        "timestamp": [
+            _utc(date(2026, 5, 1)),
+            _utc(date(2026, 5, 2)),
+            *[_utc(date(2026, 5, 3))] * 19,
+            _utc(date(2026, 10, 1)),
+            _utc(date(2026, 10, 2)),
+            _utc(date(2026, 10, 3)),
+        ],
+        "equity": [0.0, 0.0, *([0.0] * 19), 78466.63, 78131.09, 78671.07],
+        "profit_loss": [0.0, 0.0, *([0.0] * 19), -1533.37, -1868.91, -1328.93],
+        "profit_loss_pct": [0.0, 0.0, *([0.0] * 19), -0.015, -0.019, -0.013],
+        "base_value": 100000.0,
+        "base_value_asof": "2026-04-30",
+        "timeframe": "1D",
+    }
 
 
 class PortfolioStamp(unittest.TestCase):
@@ -417,6 +454,80 @@ class PortfolioStamp(unittest.TestCase):
             spy_from_bars([{"t": "2026-10-02T04:00:00Z", "c": 769.64}])[FRI],
             769.64,
         )
+
+    def test_real_history_payload_drops_zeros(self):
+        got = equity_from_history_payload(real_history_payload())
+        self.assertEqual(got, {
+            date(2026, 9, 30): 78466.63,
+            THU: 78131.09,
+            FRI: 78671.07,
+        })
+        self.assertNotIn(date(2026, 4, 30), got)
+        self.assertEqual(equity_from_history_payload({
+            "timestamp": [_utc(date(2026, 10, 3))] * 21,
+            "equity": [0.0] * 21,
+            "base_value": None,
+            "timeframe": "1D",
+        }), {})
+
+    def test_history_requests_one_year_then_three_months(self):
+        calls = []
+
+        def fake_get(url, headers, params=None):
+            calls.append(dict(params or {}))
+            self.assertNotIn("start", params or {})
+            if params.get("period") == "1A":
+                return {
+                    "timestamp": [_utc(date(2026, 10, 3))] * 21,
+                    "equity": [0.0] * 21,
+                    "base_value": None,
+                    "timeframe": "1D",
+                }
+            return real_history_payload()
+
+        with patch("plain_report._get_json", side_effect=fake_get):
+            got = _load_history({"APCA-API-KEY-ID": "x"})
+        self.assertEqual(calls, [
+            {"period": "1A", "timeframe": "1D"},
+            {"period": "3M", "timeframe": "1D"},
+        ])
+        self.assertEqual(got[FRI], 78671.07)
+        self.assertNotIn(date(2026, 4, 30), got)
+
+        calls.clear()
+
+        def one_year(url, headers, params=None):
+            calls.append(dict(params or {}))
+            return real_history_payload()
+
+        with patch("plain_report._get_json", side_effect=one_year):
+            got = _load_history({"APCA-API-KEY-ID": "x"})
+        self.assertEqual(calls, [{"period": "1A", "timeframe": "1D"}])
+        self.assertEqual(got[FRI], 78671.07)
+
+    def test_past_date_preview_uses_the_history_close(self):
+        view = MarketView(
+            equity_by_day=equity_from_history_payload(real_history_payload()) | {
+                PRIOR_FRI: 78967.12,
+            },
+            spy_by_day={THU: 763.99, FRI: 769.64, PRIOR_FRI: 771.35},
+            positions=None,
+            account_equity=None,
+            last_equity=None,
+            live_equity=False,
+        )
+        email = build_email(FRI, "weekly", view)
+        self.assertEqual(
+            email.subject,
+            "Trading [PAPER] Weekly 10/2/2026: DOWN $296, BEHIND S&P by 0.15 pts",
+        )
+        self.assertIn(
+            "Today's standing: equity $78,671.07, $3,671.07 above the $75,000 line, "
+            "open positions not loaded for past dates.",
+            email.body,
+        )
+        self.assertIn("All-time drawdown from the $100,000 start: $21,328.93.", email.body)
+        self.assertNotIn("unavailable", email.subject)
 
 
 class MonthlyShape(unittest.TestCase):
