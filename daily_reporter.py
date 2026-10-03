@@ -26,6 +26,10 @@ v2 — fixed the critical "report shows 0 trades while bot fires 50+/day" bug:
 
 Cron entry (no change required):
     35 16 * * 1-5  /usr/bin/python3 /home/mddnnbr/tading-bot/daily_reporter.py --send-now
+
+The cron email is the plain-English note in plain_report.py (one a day:
+daily, weekly on the last session of the week, monthly on the last
+session of the month). --preview YYYY-MM-DD prints it and does not send.
 """
 
 from __future__ import annotations
@@ -1705,23 +1709,25 @@ def _crash_log(exc: BaseException) -> None:
 
 if __name__ == "__main__":
     try:
+        # The 4:35 PM cron (--send-now) and --preview use the one plain-English
+        # note (daily / weekly / monthly). The older HTML dump stays available
+        # when neither flag is passed.
+        if "--preview" in sys.argv or "--send-now" in sys.argv:
+            from plain_report import main as plain_main
+            code = plain_main(sys.argv[1:])
+            if code:
+                _crash_log(RuntimeError(
+                    f"plain report exit {code}. "
+                    f"GMAIL_ADDRESS empty: {not GMAIL_ADDRESS}. "
+                    f"GMAIL_APP_PW empty: {not GMAIL_APP_PW}."
+                ))
+            sys.exit(code)
         reporter = DailyReporter()
         data     = reporter.build_report()
         html     = reporter.format_email_html(data)
         reporter.save_html(html)
-        if "--send-now" in sys.argv:
-            ok = reporter.send(html)
-            if not ok:
-                # Send returned False — credential or SMTP problem. Log it.
-                _crash_log(RuntimeError(
-                    f"reporter.send() returned False. "
-                    f"GMAIL_ADDRESS empty: {not GMAIL_ADDRESS}. "
-                    f"GMAIL_APP_PW empty: {not GMAIL_APP_PW}. "
-                    f".env path checked: {BASE_DIR / '.env'}"
-                ))
-                sys.exit(1)
-        else:
-            print("Report generated (HTML saved). Pass --send-now to email it.")
+        print("Report generated (HTML saved). Pass --send-now to email it, "
+              "or --preview YYYY-MM-DD to print the plain note.")
     except Exception as e:
         _crash_log(e)
         print(f"❌  Reporter crashed: {e}", file=sys.stderr)
