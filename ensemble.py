@@ -140,6 +140,23 @@ except Exception as _e:
     _ALPACA_OK = False
 
 
+def _halt_cuts_symbol(sym: str, unrealized_pl: float) -> bool:
+    """Daily-loss de-risk flattens losing equities only.
+
+    Options close on +100% / -50% / CLOSE_DTE or the broker protective
+    stop, not because the book hit a daily loss. Crypto has its own
+    scheduler. Winners stay on their trails. L-2026-10-01b.
+    """
+    if unrealized_pl >= 0:
+        return False
+    if str(sym).endswith("USD") and len(str(sym)) > 5:
+        return False
+    from invariants import is_option_symbol
+    if is_option_symbol(sym):
+        return False
+    return True
+
+
 def _load_benched_agent_names() -> set[str]:
     try:
         if not AGENT_SUMMARY_PATH.exists():
@@ -419,13 +436,20 @@ class Ensemble:
                     agent.watchlist = agent._base_watchlist + [
                         s for s in dynamic if s not in agent._base_watchlist]
 
-        # Step 3: gather signals from active agents
+        # Step 3: gather signals from the turnaround book only.
+        # L-2026-10-01b: NewsAgent and BreakoutAgent. Code-disabled names
+        # and previously pinned names fail agent_may_signal, so a summary
+        # row cannot put them back on the book.
+        from agent_rotator import agent_may_signal
         benched = _load_benched_agent_names()
         skipped: list[str] = []
         all_raw_signals: list[dict] = []
         _fail_log: dict[str, tuple[float, str]] = Ensemble._agent_fail_at
 
         for agent in self.agents:
+            if not agent_may_signal(agent.name):
+                skipped.append(agent.name)
+                continue
             if agent.name in benched:
                 skipped.append(agent.name)
                 continue
@@ -596,6 +620,12 @@ class Ensemble:
 
     def _scan_surges(self, risk_status: dict) -> list[dict]:
         """Use Alpaca real-time data to catch surges/drops ≥ 3%."""
+        # AlpacaSurgeAgent / AlpacaSurgeDetector are code-disabled
+        # (L-2026-10-01b). The scanner is not an ensemble member, so the
+        # agent loop above does not cover it.
+        from agent_rotator import agent_may_signal
+        if not agent_may_signal("AlpacaSurgeAgent") and not agent_may_signal("AlpacaSurgeDetector"):
+            return []
         if not (_ALPACA_OK and alpaca_stream.is_streaming()):
             return []
         if risk_status.get("halt_trading"):
@@ -717,8 +747,11 @@ class Ensemble:
                 sym, pl = str(p.symbol), float(p.unrealized_pl)
                 if sym.endswith("USD") and len(sym) > 5:
                     continue                      # crypto: own scheduler
-                if pl >= 0:
-                    kept.append(sym)
+                if not _halt_cuts_symbol(sym, pl):
+                    # Winners stay. Losing options stay too — premium
+                    # rules and the protective stop own that exit.
+                    if pl >= 0:
+                        kept.append(sym)
                     continue
                 try:
                     for o in client.get_orders(GetOrdersRequest(

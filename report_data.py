@@ -20,6 +20,14 @@ The rule enforced here:
     BROKER is truth for money.  LEDGER is truth for attribution.
 Nothing downstream gets to decide.
 
+CHANGE LOG (L-2026-10-01b):
+    The RECONCILE line used to subtract ledger lifetime realized (and
+    option intraday marks) from broker day equity change. Those are
+    different numbers: day change is today's mark-to-market, ledger
+    realized is the full life of trades that closed today. The line now
+    compares broker realized today (round trips exited today) with
+    ledger realized today, and prints unrealized change on its own.
+
 And critically: this SELF-VALIDATES. If ledger P&L and broker equity
 disagree beyond tolerance, the snapshot carries a loud discrepancy that
 the report prints at the top. A wrong number that announces itself is
@@ -48,16 +56,60 @@ START_EQUITY = 100_000.0
 RECONCILE_TOLERANCE = 250.0     # $ gap that triggers a visible warning
 
 
-def unexplained_day_gap(day_pnl, ledger_realized, options_day_pnl=0.0) -> float:
-    """Broker day P&L minus ledger realized, after option marks.
+def unexplained_day_gap(broker_realized, ledger_realized, unrealized_change=0.0) -> float:
+    """Booking gap: broker realized today vs ledger realized today.
 
-    Options are placed by options_executor and are not ledger rows, so
-    their intraday P&L sits inside broker day P&L and used to inflate
-    the RECONCILE gap. Pass today's option P&L (unrealized_intraday_pl
-    on open contracts, not lifetime unrealized — that would subtract
-    marks from prior days that are not in today's day_pnl).
+    Both sides are the full round-trip P&L of positions that closed
+    today (broker from fills, ledger from ledger rows). `unrealized_change`
+    is today's mark on positions still open. It is accepted so callers
+    can pass it and is deliberately not part of the gap — mixing it in
+    was the old formula (day equity change minus lifetime realized minus
+    option marks), which flagged a definitional difference as drift.
+
+    Sep 30: no closes, both realized sides 0, gap 0; the -$374 day is
+    unrealized. Oct 1: the +$914 ledger number is lifetime realized of
+    the closes, not today's -$358 mark.
     """
-    return abs(float(day_pnl) - float(ledger_realized) - float(options_day_pnl or 0))
+    del unrealized_change  # reported beside the gap, never inside it
+    return abs(float(broker_realized) - float(ledger_realized))
+
+
+def reconcile_line(broker_day_pnl, broker_realized, ledger_realized,
+                   unrealized_change, *, tolerance: float = RECONCILE_TOLERANCE) -> str:
+    """One scorecard line. Realized vs realized, unrealized beside it."""
+    gap = unexplained_day_gap(broker_realized, ledger_realized, unrealized_change)
+    if gap > tolerance:
+        head = (
+            f"RECONCILE: broker realized today ${float(broker_realized):+,.0f} vs "
+            f"ledger realized today ${float(ledger_realized):+,.0f} — "
+            f"${gap:,.0f} unexplained booking gap."
+        )
+    else:
+        head = (
+            f"RECONCILE: broker realized today ${float(broker_realized):+,.0f} vs "
+            f"ledger realized today ${float(ledger_realized):+,.0f} "
+            f"(gap ${gap:,.0f})."
+        )
+    return (
+        f"{head} Unrealized change today ${float(unrealized_change):+,.0f} "
+        f"is separate. Broker day mark-to-market ${float(broker_day_pnl):+,.0f} "
+        f"is not lifetime realized."
+    )
+
+
+def _broker_realized_today(day: str):
+    """Full round-trip P&L of broker fills that exited on `day` (ET).
+
+    None when the paper book cannot be read. Never raises.
+    """
+    try:
+        from broker_fills import fetch_round_trips, network_scoring_enabled, realized_on_date
+        if not network_scoring_enabled():
+            return None
+        return realized_on_date(fetch_round_trips(), day)
+    except Exception as e:
+        log.warning("broker realized today unavailable (%s)", e)
+        return None
 
 
 def _hdr() -> dict:
@@ -159,26 +211,40 @@ def snapshot() -> dict:
         d["ledger_realized_today"] = None
 
     # ── SELF-VALIDATION — the point of this module ────────────────────
-    # Ledger realized + change in open marks should roughly equal the
-    # broker's day P&L. A large gap means positions exist that the ledger
-    # cannot see (the drift that hid $19,908 of losses). Say so loudly.
+    # Like with like: broker realized today (round trips that exited
+    # today) vs ledger realized today. Unrealized change is printed
+    # beside that, not subtracted. Day equity change stays on the money
+    # line; it is mark-to-market and is not the booking check.
     if d.get("ledger_realized_today") is not None and d.get("day_pnl") is not None:
+        unrealized_change = sum(
+            float(p.get("unrl_intraday") or 0) for p in d.get("positions", [])
+        )
+        d["unrealized_change"] = round(unrealized_change, 2)
         options_day = sum(
             float(p.get("unrl_intraday") or 0)
             for p in d.get("positions", [])
             if p.get("is_option")
         )
         d["options_day_pnl"] = round(options_day, 2)
-        gap = unexplained_day_gap(
-            d["day_pnl"], d["ledger_realized_today"], options_day)
-        d["reconcile_gap"] = gap
-        if gap > RECONCILE_TOLERANCE:
+        broker_realized = _broker_realized_today(d["today"])
+        d["broker_realized_today"] = broker_realized
+        if broker_realized is None:
+            d["reconcile_gap"] = None
             d["warnings"].append(
-                f"RECONCILE: broker day P&L ${d['day_pnl']:+,.0f} vs ledger realized "
-                f"${d['ledger_realized_today']:+,.0f} plus option day marks "
-                f"${options_day:+,.0f} — ${gap:,.0f} unexplained. "
-                f"Broker figure is authoritative; the gap is open equity marks "
-                f"and/or positions missing from the ledger.")
+                "RECONCILE: broker realized today unavailable — not comparing "
+                "day mark-to-market to lifetime ledger realized. "
+                f"Ledger realized today ${d['ledger_realized_today']:+,.0f}. "
+                f"Unrealized change today ${unrealized_change:+,.0f}. "
+                f"Broker day mark-to-market ${d['day_pnl']:+,.0f}."
+            )
+        else:
+            gap = unexplained_day_gap(
+                broker_realized, d["ledger_realized_today"], unrealized_change)
+            d["reconcile_gap"] = gap
+            d["warnings"].append(reconcile_line(
+                d["day_pnl"], broker_realized, d["ledger_realized_today"],
+                unrealized_change,
+            ))
 
     # Positions the ledger does not know about — the drift that has
     # repeatedly consumed buying power invisibly.

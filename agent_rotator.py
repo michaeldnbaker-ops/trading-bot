@@ -1,7 +1,30 @@
 """
-agent_rotator.py — v1.5 (2026-09-25)
+agent_rotator.py — v1.6 (2026-10-01)
 ────────────────────────────────────
 Rotates underperforming agents out and promotes better alternatives.
+
+CHANGE LOG (v1.6, 2026-10-01, L-2026-10-01b turnaround):
+  • Active book is NewsAgent and BreakoutAgent only
+    (ACTIVE_SIGNAL_AGENTS). The ensemble will not call anyone else.
+  • DISABLED_AGENTS (shorts, sector, intermarket, macro, volatility,
+    Alpaca surge) cannot be reactivated or promoted. A name comes back
+    only by a code edit: drop it from DISABLED_AGENTS and add it to
+    ACTIVE_SIGNAL_AGENTS. PROTECTED_AGENTS is empty — protection was
+    how those shorts stayed in the book.
+  • The MIN_ACTIVE_AGENTS floor for an on-book agent counts only agents
+    the ensemble may run. Two live agents do not halt the cycle, and a
+    short book does not promote a code-disabled name to fill the slot.
+  • MetaAgent thresholds are unchanged. Breakout still clears the solo
+    bar at raw confidence >= 0.65, and News plus Breakout still pass
+    when they agree. NewsAgent still cannot trade alone
+    (REQUIRE_CORROBORATION). That does not leave the two-agent book
+    unable to signal.
+  • Bench text quotes the evaluator's 20d after-cost P&L and trade count
+    from the same EvalReport. run_rotation(report=...) does not score
+    the book a second time, so the bench line and the eval table cannot
+    disagree inside one cycle.
+  • CryptoAgent is not counted, benched, promoted, or reactivated while
+    CRYPTO_TRADING_ENABLED is false. The gate itself is unchanged.
 
 CHANGE LOG (v1.5, 2026-09-25):
   • NewsAgent and SentimentAgent were unprotected per L-2026-09-25a.
@@ -49,8 +72,9 @@ Rotation logic:
   1. Read the latest EvalReport from agent_evaluator.
   2. For each flagged agent (relative underperform OR N<10 absolute
      drain — see agent_evaluator thresholds), bench it for BENCH_DAYS.
-     MIN_ACTIVE_AGENTS is the only bench skip besides PROTECTED_AGENTS.
-     Drain FLAGs are not silently overridden.
+     On-book agents stop at MIN_ACTIVE_AGENTS. PROTECTED_AGENTS is
+     empty. DISABLED_AGENTS are not benched into a promotion and are
+     not reactivated. Drain FLAGs are not silently overridden.
   3. PROMOTE is variant substitution only. Prefer the inactive variant
      with the best 20d expectancy-after-costs. A known negative-
      expectancy variant is never promoted (bench without replacement).
@@ -95,9 +119,51 @@ BENCH_DAYS          = 3      # how long a flagged agent sits out
 # Resting BENCH_DAYS is not evidence; reactivation needs a real sample.
 REACTIVATION_MIN_TRADES = MIN_TRADES_TO_EVALUATE
 ROTATION_LOG        = LOGS_DIR / "rotation_log.jsonl"
-MIN_ACTIVE_AGENTS   = 2      # never bench below this count (safety floor)
+MIN_ACTIVE_AGENTS   = 2      # never bench an on-book agent below this count
 # Drain FLAGs (N<10 absolute-drain) use this same floor. There is no
 # second override path that looks like a bench and then no-ops.
+# The floor does not promote anyone, and it does not halt the bot when
+# only ACTIVE_SIGNAL_AGENTS are live. "ensemble running short" is a
+# bench-without-replacement note, not a request to fill the slot.
+
+# L-2026-10-01b turnaround. The ensemble runs this set and nothing else.
+# Previously pinned names (Movers, Technical, Sentiment, Earnings,
+# OptionsFlow, Momentum, Premarket, MeanReversion) are not in it, so a
+# summary reactivation does not put them back on the book.
+ACTIVE_SIGNAL_AGENTS = frozenset({"NewsAgent", "BreakoutAgent"})
+
+# Hard off. Expectancy, BENCH_DAYS, promotion, and the active-count floor
+# cannot turn these on. AlpacaSurgeDetector is the name _scan_surges
+# emits; AlpacaSurgeAgent is the roster name from the turnaround note.
+DISABLED_AGENTS = frozenset({
+    "ShortMomentumAgent",
+    "BearishPatternAgent",
+    "SectorRotationAgent",
+    "IntermarketAgent",
+    "MacroAgent",
+    "VolatilityAgent",
+    "AlpacaSurgeAgent",
+    "AlpacaSurgeDetector",
+})
+
+
+def agent_may_signal(name: str) -> bool:
+    """True only for the turnaround book. A code edit is required to widen it."""
+    if name in DISABLED_AGENTS:
+        return False
+    return name in ACTIVE_SIGNAL_AGENTS
+
+
+def roster_lines() -> list[str]:
+    """Code roster. A dry run prints this; summary pins do not change it."""
+    active = ", ".join(sorted(ACTIVE_SIGNAL_AGENTS))
+    disabled = ", ".join(sorted(DISABLED_AGENTS))
+    protected = ", ".join(sorted(PROTECTED_AGENTS)) or "(none)"
+    return [
+        f"Roster — active: {active}",
+        f"Roster — code-disabled: {disabled}",
+        f"Roster — protected: {protected}",
+    ]
 
 # ── Full 12-agent roster with cross-substitution logic ──────────────────────
 # When an agent underperforms, the rotator promotes its best substitute.
@@ -131,21 +197,11 @@ AGENT_VARIANTS: dict[str, list[str]] = {
     "MeanReversionAgent":  [],
 }
 
-# Agents that are NEVER benched — they provide critical infrastructure.
-# NOTE (v1.1): TechnicalAgent was removed — its 9% win rate didn't justify
-# protection.
-# NOTE (2026-09-25, L-2026-09-25a): NewsAgent and SentimentAgent were
-# unprotected. Closed-trade evidence decides whether the rotator benches
-# them. BearishPatternAgent and ShortMomentumAgent stay protected so
-# short consensus remains possible.
-# Short specialists are PROTECTED. On 2026-07-29 the market fell ~1000pts
-# and the book was 100% long with zero shorts — because rotation had
-# benched BearishPatternAgent AND ShortMomentumAgent on P&L earned under
-# the old broken geometry. Benching every short-capable agent also makes
-# the 2-agent short-consensus rule unsatisfiable, so the ensemble becomes
-# structurally long-only exactly when downside protection matters most.
-# Weight them down if they underperform; never bench them to zero.
-PROTECTED_AGENTS = {"BearishPatternAgent", "ShortMomentumAgent"}
+# L-2026-10-01b: empty on purpose. BearishPatternAgent and
+# ShortMomentumAgent used to live here so a drawdown could not bench
+# the short book. They are in DISABLED_AGENTS now. An empty set means
+# the floor is the only bench skip for agents the ensemble may run.
+PROTECTED_AGENTS: set[str] = set()
 
 
 def is_pinned_bench(info: dict, benched_at: datetime, now: datetime) -> bool:
@@ -160,6 +216,44 @@ def is_pinned_bench(info: dict, benched_at: datetime, now: datetime) -> bool:
     if benched_at - now >= timedelta(days=365):
         return True
     return False
+
+
+def _crypto_gated(name: str) -> bool:
+    """Display/scoring gate only. Does not flip CRYPTO_TRADING_ENABLED."""
+    if name != "CryptoAgent":
+        return False
+    try:
+        from session_gates import CRYPTO_TRADING_ENABLED
+        return not CRYPTO_TRADING_ENABLED
+    except Exception:
+        return True
+
+
+def _score_suffix(stats) -> str:
+    """The evaluator's 20d after-cost figure, so the bench log matches it."""
+    if stats is None:
+        return ""
+    pnl = getattr(stats, "pnl_20d_after_costs", None)
+    n = getattr(stats, "trades_20d", None)
+    if pnl is None or n is None:
+        return ""
+    return f" (20d after-cost ${float(pnl):+,.2f} over {int(n)} trades)"
+
+
+def _summary_row_is_pinned(info: dict, now: datetime) -> bool:
+    """Pin check for a summary row that may not have a parseable timestamp."""
+    if str(info.get("pinned_reason") or "").strip():
+        return True
+    raw = info.get("benched_at")
+    if not raw:
+        return False
+    try:
+        benched_at = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return False
+    if benched_at.tzinfo is None:
+        benched_at = benched_at.replace(tzinfo=timezone.utc)
+    return is_pinned_bench(info, benched_at, now)
 
 
 def reactivation_decision(stats, min_trades: int | None = None) -> tuple[bool, str]:
@@ -203,13 +297,18 @@ class AgentRotator:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def run_rotation(self, dry_run: bool = False) -> dict:
+    def run_rotation(self, dry_run: bool = False, report: EvalReport | None = None) -> dict:
         """
         Execute one rotation cycle.
         dry_run=True: prints what would happen without modifying anything.
         Returns a dict summarising actions taken (or planned if dry_run).
+
+        Pass the EvalReport the evaluator just printed. A second evaluate()
+        would re-window the book and the bench line could cite a different
+        20d number than the table above it (L-2026-10-01b).
         """
-        report  = self.evaluator.evaluate()
+        if report is None:
+            report = self.evaluator.evaluate()
         summary = self.logger.get_summary()
         now     = datetime.now(timezone.utc)
 
@@ -230,7 +329,30 @@ class AgentRotator:
         # days the gate cannot pass. That hold is permanent until a new
         # variant or an Edge Research spec replaces the agent.
         for name, info in summary.items():
+            if _crypto_gated(name):
+                # Never flip the summary back to active. The eval report
+                # already shows this leaf as gated. A hold is recorded only
+                # when the row is benched, so an active=true summary does
+                # not look like a rotation.
+                if isinstance(info, dict) and not info.get("active", True):
+                    hold = (
+                        f"GATED {name} — CRYPTO_TRADING_ENABLED is false; "
+                        f"not scored, not reactivated"
+                    )
+                    holds.append(hold)
+                    log.info(hold)
+                continue
             if info.get("active", True):
+                continue
+            # Code-disabled names stay off even with a positive sample.
+            # Do this before the bench timer so expectancy cannot win.
+            if name in DISABLED_AGENTS:
+                hold = (
+                    f"BENCHED {name} stays benched — code-disabled "
+                    f"(L-2026-10-01b); rotator cannot reactivate"
+                )
+                holds.append(hold)
+                log.info(hold)
                 continue
             benched_at_str = info.get("benched_at")
             if not benched_at_str:
@@ -266,8 +388,24 @@ class AgentRotator:
         # is at default-active", but summary.values() would count zero —
         # tripping the MIN_ACTIVE_AGENTS floor on the first flagged agent.
         # Use the EvalReport roster (excluding the MetaAgent wrapper).
-        real_agents = [a for a in report.agents if a.name != "MetaAgent"]
-        active_count = sum(1 for a in real_agents if a.active)
+        real_agents = [
+            a for a in report.agents
+            if a.name != "MetaAgent" and not getattr(a, "gated", False)
+            and not _crypto_gated(a.name)
+        ]
+        # reported_active: everyone the summary still calls active, except
+        # code-disabled names (they must not inflate the floor).
+        # eligible_active: agents the ensemble will actually run. The floor
+        # for News/Breakout uses this count, so a report full of pinned or
+        # disabled "active" rows cannot bench the two-agent book, and a
+        # short book does not reach back and reactivate a disabled name.
+        reported_active = sum(
+            1 for a in real_agents
+            if a.active and a.name not in DISABLED_AGENTS
+        )
+        eligible_active = sum(
+            1 for a in real_agents if a.active and agent_may_signal(a.name)
+        )
 
         # Bench worst-first: spend the bench-budget on the biggest 20-day
         # losers, not on whatever order the flagged dict happened to use.
@@ -284,12 +422,35 @@ class AgentRotator:
         newly_benched: set[str] = set()
 
         for agent_name in flagged_sorted:
+            if _crypto_gated(agent_name):
+                actions.append(
+                    f"GATED {agent_name} — crypto sleeve off, not scored or benched"
+                )
+                continue
+            # Disabled names are not benched into a promotion. Benching
+            # them used to offer their sibling (the other short, sector,
+            # macro) as a replacement — that is a reactivation.
+            if agent_name in DISABLED_AGENTS:
+                hold = (
+                    f"BENCHED {agent_name} stays off — code-disabled "
+                    f"(L-2026-10-01b); rotator cannot reactivate"
+                )
+                holds.append(hold)
+                log.info(hold)
+                continue
+
             # Never bench protected core agents
             if agent_name in PROTECTED_AGENTS:
                 actions.append(f"PROTECTED {agent_name} — core agent, reducing weight instead of benching")
                 continue
 
-            if active_count <= MIN_ACTIVE_AGENTS:
+            # On-book agents (News, Breakout) use the eligible count so
+            # the floor is "2 voices that can trade", not "2 rows in the
+            # report". Off-book names still use the wider count so a
+            # flagged sibling can be benched without pretending the
+            # disabled set is filling seats.
+            floor_count = eligible_active if agent_may_signal(agent_name) else reported_active
+            if floor_count <= MIN_ACTIVE_AGENTS:
                 actions.append(
                     f"SKIPPED bench of {agent_name} — already at minimum active agents ({MIN_ACTIVE_AGENTS})"
                 )
@@ -317,14 +478,18 @@ class AgentRotator:
                     summary[replacement]["benched_at"] = None
 
             newly_benched.add(agent_name)
+            score = _score_suffix(agent_stats.get(agent_name))
             action = (
-                f"BENCHED {agent_name} → PROMOTED {replacement}"
+                f"BENCHED {agent_name} → PROMOTED {replacement}{score}"
                 if replacement else
-                f"BENCHED {agent_name} (no replacement available; ensemble running short)"
+                f"BENCHED {agent_name} (no replacement available; ensemble running short){score}"
             )
             actions.append(action)
             self._write_rotation_event(agent_name, "BENCHED", action, dry_run, replacement=replacement)
-            active_count -= 1
+            if agent_name not in DISABLED_AGENTS:
+                reported_active -= 1
+            if agent_may_signal(agent_name):
+                eligible_active -= 1
 
         # ── Step 3: Persist updated summary ───────────────────────────────
         # Holds do not count. A pinned-only cycle must not touch the file.
@@ -353,6 +518,8 @@ class AgentRotator:
             print("  Holds — still benched, no state change:")
             for h in holds:
                 print(f"  • {h}")
+        for line in roster_lines():
+            print(f"  {line}")
 
         return result
 
@@ -377,10 +544,13 @@ class AgentRotator:
         exclude = exclude or set()
         variants = AGENT_VARIANTS.get(agent_name, [])
         candidates: list[str] = []
+        now = datetime.now(timezone.utc)
         for variant in variants:
-            if variant in exclude:
+            if variant in exclude or variant in DISABLED_AGENTS:
                 continue
             entry = summary.get(variant)
+            if entry is not None and _summary_row_is_pinned(entry, now):
+                continue
             if entry is None or not entry.get("active", False):
                 candidates.append(variant)
         if not candidates:

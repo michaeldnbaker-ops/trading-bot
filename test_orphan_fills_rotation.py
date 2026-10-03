@@ -10,7 +10,7 @@ import sys
 import types
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -79,16 +79,22 @@ class _Broker:
 
 
 class OrphanExits(unittest.TestCase):
-    def _run(self, positions, orders=None, ledger=None, trail=None, opt=None):
+    def _run(self, positions, orders=None, ledger=None, trail=None, opt=None,
+             today=None):
         from market_scheduler import reconcile_orphan_positions
         client = _Broker(positions, orders)
         trail = trail or MagicMock(return_value=(SimpleNamespace(id="trail"), None))
         opt = opt or MagicMock(return_value={
             "placed": False, "error": "unsupported", "stop_price": 0.5, "qty": 1,
         })
+        # Pin the session so CLOSE_DTE does not depend on the wall clock.
+        # 2026-09-30 is the day CCL was market-sold.
+        if today is None:
+            today = date(2026, 9, 30)
         with patch("order_executor._submit_trail_with_retry", trail), \
              patch("options_executor.submit_option_protective_stop", opt):
-            actions = reconcile_orphan_positions(client, set(ledger or []))
+            actions = reconcile_orphan_positions(
+                client, set(ledger or []), today=today)
         return client, actions, trail, opt
 
     def test_kept_winner_does_not_cancel_a_live_trail(self):
@@ -180,6 +186,96 @@ class OrphanExits(unittest.TestCase):
         self.assertEqual(actions, [])
         self.assertEqual(client.closed, [])
         trail.assert_not_called()
+
+    def test_ccl_small_loss_next_day_is_not_sold(self):
+        """CCL261030C00026000: entered 2026-09-29, small loss at the
+        2026-09-30 15:55 reconcile. The old path cancelled the protective
+        stop and market-sold. A small premium loss is not an exit.
+        """
+        sym = "CCL261030C00026000"
+        pos = _pos(sym, 3, -30, avg=0.93)
+        pos.current_price = 0.37  # bid/last that the market sell printed
+        client, actions, trail, opt = self._run(
+            [pos],
+            [_ord(sym, "sell", 3, oid="ostop", order_type="stop")],
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.cancelled, [])
+        trail.assert_not_called()
+        opt.assert_not_called()
+        self.assertNotEqual(actions[0]["action"], "closed")
+        self.assertNotIn("ledger already exited it", actions[0]["message"])
+        self.assertIn("protective exit still active", actions[0]["message"])
+
+    def test_true_option_orphan_small_loss_is_reprotected_not_sold(self):
+        sym = "CCL261030C00026000"
+        placed = MagicMock(return_value={
+            "placed": True, "stop_price": 0.47, "qty": 3, "error": "",
+        })
+        client, actions, trail, opt = self._run(
+            [_pos(sym, 3, -25, avg=0.93)], opt=placed,
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.closed, [])
+        trail.assert_not_called()
+        opt.assert_called_once()
+        self.assertNotIn("ledger already exited it", actions[0]["message"])
+        self.assertIn("options stop", actions[0]["message"])
+
+    def test_option_plus_100_closes(self):
+        sym = "CCL261030C00026000"
+        # cost = 3 * 0.93 * 100 = 279; +279 is +100% of premium
+        client, actions, trail, _opt = self._run(
+            [_pos(sym, 3, 279, avg=0.93)],
+            [_ord(sym, "sell", 3, oid="ostop", order_type="stop")],
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.cancelled, ["ostop"])
+        self.assertEqual(client.closed, [sym])
+        trail.assert_not_called()
+        self.assertEqual(actions[0]["action"], "closed")
+        self.assertIn("profit", actions[0]["message"])
+        self.assertNotIn("ledger already exited it", actions[0]["message"])
+
+    def test_option_minus_50_closes(self):
+        sym = "CCL261030C00026000"
+        # -140 / 279 debit is just through -50% of premium
+        client, actions, _trail, _opt = self._run(
+            [_pos(sym, 3, -140, avg=0.93)],
+            [_ord(sym, "sell", 3, oid="ostop", order_type="stop")],
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.cancelled, ["ostop"])
+        self.assertEqual(client.closed, [sym])
+        self.assertEqual(actions[0]["action"], "closed")
+        self.assertIn("stop", actions[0]["message"])
+
+    def test_close_dte_closes_a_small_winner(self):
+        # 2026-10-08 is 8 DTE on 2026-09-30, inside CLOSE_DTE (10).
+        sym = "CCL261008C00026000"
+        client, actions, _trail, _opt = self._run(
+            [_pos(sym, 3, 20, avg=0.93)],
+            [_ord(sym, "sell", 3, oid="ostop", order_type="stop")],
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.closed, [sym])
+        self.assertEqual(client.cancelled, ["ostop"])
+        self.assertIn("theta", actions[0]["message"])
+
+    def test_ledger_tracked_option_is_not_an_orphan_even_at_a_loss(self):
+        sym = "CCL261030C00026000"
+        client, actions, trail, opt = self._run(
+            [_pos(sym, 3, -200, avg=0.93)],
+            [_ord(sym, "sell", 3, oid="ostop", order_type="stop")],
+            ledger=[sym],
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(actions, [])
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.cancelled, [])
+        trail.assert_not_called()
+        opt.assert_not_called()
 
 
 class UnfilledEntries(unittest.TestCase):
@@ -576,12 +672,18 @@ class ExpectancyReactivation(unittest.TestCase):
 
 
 class ReconcileAndSchedule(unittest.TestCase):
-    def test_options_day_pnl_is_removed_from_the_gap(self):
-        from report_data import unexplained_day_gap
-        # Broker day +1000, ledger realized +100, option intraday +800.
-        # Without the option term the gap is $900 and looks like drift.
-        self.assertAlmostEqual(unexplained_day_gap(1000, 100, 800), 100)
-        self.assertAlmostEqual(unexplained_day_gap(1000, 100, 0), 900)
+    def test_reconcile_compares_realized_with_realized(self):
+        from report_data import reconcile_line, unexplained_day_gap
+        # Unrealized marks do not enter the booking gap. The old formula
+        # treated day equity change minus lifetime realized as drift.
+        self.assertAlmostEqual(unexplained_day_gap(900, 914, -110), 14)
+        self.assertAlmostEqual(unexplained_day_gap(0, 0, -374), 0)
+        line = reconcile_line(-358, 914, 914, -110)
+        self.assertIn("broker realized today", line)
+        self.assertIn("ledger realized today", line)
+        self.assertIn("Unrealized change today", line)
+        self.assertIn("gap $0", line)
+        self.assertNotIn("unexplained booking gap", line)
 
     def test_ghost_close_exit_at_is_et(self):
         # No network, no wall clock, no dotenv. The old test patched
@@ -655,8 +757,180 @@ class ReconcileAndSchedule(unittest.TestCase):
         self.assertIs(session_gates.PAPER_ONLY, True)
         src = inspect.getsource(order_executor.OrderExecutor.__init__)
         self.assertIn("paper=True", src)
-        self.assertNotIn("DISABLED_AGENTS", inspect.getsource(
-            __import__("agent_rotator")))
+        # L-2026-10-01b: the roster disable set lives in agent_rotator.
+        # It does not touch the paper hardwire or the crypto gate above.
+        from agent_rotator import DISABLED_AGENTS
+        self.assertIn("ShortMomentumAgent", DISABLED_AGENTS)
+        self.assertNotIn("paper", " ".join(DISABLED_AGENTS).lower())
+
+
+class _Bars:
+    def __init__(self, rows):
+        self._rows = rows
+        self.empty = not rows
+
+    def iterrows(self):
+        yield from self._rows
+
+
+def _option_trade(**kw):
+    import trade_ledger as tl
+    fields = dict(
+        trade_id="opt1", opened_at_et="2026-09-29 10:46:17",
+        symbol="CCL261030C00026000", side="LONG",
+        primary_agent="MetaAgent", contributors="BreakoutAgent",
+        entry_price=0.93, target_price=30.0, stop_price=24.0,
+        risk_dollar=279.0, shares=3,
+    )
+    fields.update(kw)
+    return tl.Trade(**fields)
+
+
+class OptionPremiumExits(unittest.TestCase):
+    """L-2026-10-01b: premium rules only. Equity bars do not close options."""
+
+    def test_exit_reasons(self):
+        from options_executor import option_exit_reason
+        sym = "CCL261030C00026000"
+        day = date(2026, 9, 30)
+        self.assertIsNone(option_exit_reason(sym, 0.93, 0.80, today=day))
+        self.assertIn("profit", option_exit_reason(sym, 0.93, 1.86, today=day))
+        self.assertIn("stop", option_exit_reason(sym, 0.93, 0.465, today=day))
+        self.assertIsNone(option_exit_reason(sym, 0.93, 0.50, today=day))
+        self.assertIn("theta", option_exit_reason(
+            "CCL261008C00026000", 0.93, 0.90, today=day))
+        self.assertIn("theta", option_exit_reason(
+            "CCL261010C00026000", 0.93, 0.90, today=day))  # exactly 10 DTE
+        self.assertIsNone(option_exit_reason(
+            "CCL261011C00026000", 0.93, 0.90, today=day))  # 11 DTE
+
+    def test_dollar_pnl_beats_a_bid_print(self):
+        from options_executor import premium_mark, option_exit_reason
+        pos = SimpleNamespace(
+            symbol="CCL261030C00026000", qty=3, avg_entry_price=0.93,
+            current_price=0.37, unrealized_pl=-30.0,
+        )
+        mark = premium_mark(pos)
+        self.assertGreater(mark, 0.70)
+        self.assertIsNone(option_exit_reason(
+            pos.symbol, 0.93, mark, today=date(2026, 9, 30)))
+        # A real mid at the bid is still a stop.
+        self.assertIn("stop", option_exit_reason(
+            pos.symbol, 0.93, premium_mark(pos, quote_mid=0.37),
+            today=date(2026, 9, 30)))
+
+    def test_equity_bars_do_not_exit_an_option_row(self):
+        import trade_ledger as tl
+        opt = _option_trade()
+        eq = tl.Trade(
+            trade_id="eq1", opened_at_et="2026-09-29 10:46:17",
+            symbol="CCL", side="LONG", primary_agent="MetaAgent",
+            contributors="", entry_price=26.0, target_price=30.0,
+            stop_price=24.0, risk_dollar=279.0, shares=10,
+        )
+        bars = _Bars([(
+            datetime(2026, 9, 30, 15, 55, tzinfo=tl.ET),
+            {"High": 25.0, "Low": 20.0, "Close": 22.0},
+        )])
+        self.assertFalse(tl.equity_simulation_applies(opt.symbol))
+        self.assertTrue(tl.equity_simulation_applies("CCL"))
+        self.assertEqual(tl._check_hits(opt, bars), (None, None, None))
+        status, px, _when = tl._check_hits(eq, bars)
+        self.assertEqual(status, "stop")
+        self.assertEqual(px, 24.0)
+        # Held at the broker the next day, even though the underlying
+        # pierced the equity stop and the row is inside MAX_HOLD_DAYS.
+        self.assertEqual(
+            tl._resolve_option_ledger_row(
+                opt, broker_open={opt.symbol}, broker_fills={},
+                now_iso="2026-09-30 15:55:05",
+            ),
+            "open",
+        )
+        self.assertTrue(opt.is_open)
+        self.assertEqual(opt.exit_reason, "")
+
+    def test_broker_flat_books_the_protective_stop(self):
+        import trade_ledger as tl
+        opt = _option_trade(opened_at_et="2026-09-20 10:00:00")
+        self.assertEqual(
+            tl._resolve_option_ledger_row(
+                opt, broker_open=set(),
+                broker_fills={opt.symbol: (0.40, "2026-09-30T19:55:05Z")},
+                now_iso="2026-09-30 15:55:05",
+            ),
+            "closed",
+        )
+        self.assertFalse(opt.is_open)
+        self.assertEqual(opt.exit_reason, "broker fill (protective stop)")
+        self.assertEqual(opt.exit_price, 0.40)
+
+    def test_closed_order_sync_skips_option_symbols(self):
+        from market_scheduler import _order_may_book_ledger_exit
+        self.assertFalse(_order_may_book_ledger_exit("CCL261030C00026000"))
+        self.assertTrue(_order_may_book_ledger_exit("CCL"))
+
+    def test_halt_does_not_cut_options(self):
+        from ensemble import _halt_cuts_symbol
+        self.assertFalse(_halt_cuts_symbol("CCL261030C00026000", -40))
+        self.assertFalse(_halt_cuts_symbol("BTCUSD", -40))
+        self.assertFalse(_halt_cuts_symbol("CCL", 10))
+        self.assertTrue(_halt_cuts_symbol("CCL", -40))
+
+    def test_manage_keeps_small_loss_when_last_print_is_the_bid(self):
+        from options_executor import manage_options_exits
+        sym = "CCL261030C00026000"
+        pos = SimpleNamespace(
+            symbol=sym, qty=3, avg_entry_price=0.93,
+            current_price=0.37, unrealized_pl=-30.0,
+            asset_class="us_option",
+        )
+        client = _Broker([pos], [_ord(sym, "sell", 3, oid="ostop", order_type="stop")])
+        with patch("options_executor.OPTIONS_ENABLED", True), \
+             patch("options_executor._clients", return_value=(client, object())), \
+             patch("options_executor._quote", return_value=(0.70, 0.95, 0.825, 14.0)):
+            manage_options_exits(today=date(2026, 9, 30))
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.cancelled, [])
+
+    def test_manage_minus_50_cancels_stop_then_closes(self):
+        from options_executor import manage_options_exits
+        sym = "CCL261030C00026000"
+        pos = SimpleNamespace(
+            symbol=sym, qty=3, avg_entry_price=0.93,
+            current_price=0.90, unrealized_pl=-10.0,
+            asset_class="us_option",
+        )
+        client = _Broker([pos], [_ord(sym, "sell", 3, oid="ostop", order_type="stop")])
+        events = []
+        client.cancel_order_by_id = lambda oid: events.append(("cancel", oid))
+        client.close_position = lambda s: events.append(("close", s))
+        with patch("options_executor.OPTIONS_ENABLED", True), \
+             patch("options_executor._clients", return_value=(client, object())), \
+             patch("options_executor._quote", return_value=(0.35, 0.45, 0.40, 12.0)):
+            manage_options_exits(today=date(2026, 9, 30))
+        self.assertEqual(events, [("cancel", "ostop"), ("close", sym)])
+
+    def test_manage_plus_100_and_close_dte(self):
+        from options_executor import manage_options_exits
+        winner = "CCL261030C00026000"
+        theta = "CCL261008C00026000"
+        positions = [
+            SimpleNamespace(symbol=winner, qty=1, avg_entry_price=1.0,
+                            current_price=1.1, unrealized_pl=5.0,
+                            asset_class="us_option"),
+            SimpleNamespace(symbol=theta, qty=1, avg_entry_price=1.0,
+                            current_price=1.1, unrealized_pl=5.0,
+                            asset_class="us_option"),
+        ]
+        client = _Broker(positions, [])
+        with patch("options_executor.OPTIONS_ENABLED", True), \
+             patch("options_executor._clients", return_value=(client, object())), \
+             patch("options_executor._quote", side_effect=lambda _c, sym: (
+                 (2.1, 2.3, 2.2, 5.0) if sym == winner else (1.0, 1.2, 1.1, 5.0)
+             )):
+            manage_options_exits(today=date(2026, 9, 30))
+        self.assertEqual(client.closed, [winner, theta])
 
 
 if __name__ == "__main__":

@@ -29,6 +29,13 @@ Status values:
 
 Idempotency: trade_id = sha1(opened_at_et + symbol + side + entry_price)[:12]
 Re-running parse_log() never duplicates a row.
+
+CHANGE LOG (L-2026-10-01b):
+  Equity target/stop simulation and MAX_HOLD_DAYS do not close option
+  symbols. An option row stays open while the broker holds the contract.
+  It is booked closed only when the broker is flat (protective stop
+  filled, or a premium-rule close already happened there). Underlying
+  bars must not mark the option exited.
 """
 
 from __future__ import annotations
@@ -443,9 +450,60 @@ def _fetch_price_path(symbol: str, since_iso_et: str, yf) -> Optional[object]:
         return None
 
 
+def equity_simulation_applies(symbol: str) -> bool:
+    """Equity target, stop, ATR path, and MAX_HOLD_DAYS.
+
+    Option contracts close only on +100% premium, -50% premium, CLOSE_DTE,
+    or a broker protective-stop fill. A yfinance path of the underlying
+    must not book the option exited. L-2026-10-01b.
+    """
+    from invariants import is_option_symbol
+    return not is_option_symbol(symbol)
+
+
+def _resolve_option_ledger_row(trade: Trade, broker_open, broker_fills,
+                               now_iso: str) -> str:
+    """Keep or close one option ledger row. Returns 'open' or 'closed'.
+
+    Equity target/stop/hold-time are not consulted. The row stays open
+    while the broker holds the contract, including the day after entry
+    on a small premium loss. A flat broker book means the protective
+    stop filled or a premium rule already closed it.
+    """
+    trade.last_updated_et = now_iso
+    if broker_open is None:
+        return "open"
+    key = trade.symbol.replace("/", "")
+    if key in broker_open or trade.symbol in broker_open:
+        return "open"
+    if _recently_opened(trade):
+        return "open"
+    fill = (broker_fills or {}).get(key) or (broker_fills or {}).get(trade.symbol)
+    if fill is not None:
+        px, when = fill
+        trade.status = "stop"
+        trade.exit_price = px
+        trade.exit_at_et = broker_time_to_et(when)
+        trade.exit_reason = "broker fill (protective stop)"
+    else:
+        trade.status = "stop"
+        trade.exit_price = trade.current_price or trade.entry_price
+        trade.exit_at_et = now_iso
+        trade.exit_reason = "broker flat (option close)"
+    trade.realized_pnl = _pnl_for(trade, float(trade.exit_price or trade.entry_price))
+    trade.unrealized_pnl = 0.0
+    return "closed"
+
+
 def _check_hits(trade: Trade, df) -> tuple[Optional[str], Optional[float], Optional[str]]:
     """Walk price bars in time order. First bar that touches target/stop wins.
-    Returns (status, exit_price, exit_at_et) or (None, None, None) if still open."""
+    Returns (status, exit_price, exit_at_et) or (None, None, None) if still open.
+
+    Option symbols always stay open here. Their premium rules live in
+    options_executor; this walker is the equity stop/target engine.
+    """
+    if not equity_simulation_applies(trade.symbol):
+        return (None, None, None)
     if df is None or df.empty:
         return (None, None, None)
     is_long = trade.side == "LONG"
@@ -804,6 +862,15 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                 last_price = None
 
         for t in by_symbol[symbol]:
+            if not equity_simulation_applies(t.symbol):
+                outcome = _resolve_option_ledger_row(
+                    t, broker_open, broker_fills, now_iso)
+                if outcome == "closed":
+                    expired += 1
+                else:
+                    still_open += 1
+                trades[t.trade_id] = t
+                continue
             # Filter df to bars at/after this trade's open
             t_df = None
             if df is not None and not df.empty:

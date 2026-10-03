@@ -197,8 +197,29 @@ def _attribution_by_leaf(d: dict | None = None) -> dict:
     return by_name
 
 
+def _crypto_gated(name: str) -> bool:
+    """Scorecard display only. Does not enable the crypto sleeve."""
+    if name != "CryptoAgent":
+        return False
+    try:
+        from session_gates import CRYPTO_TRADING_ENABLED
+        return not CRYPTO_TRADING_ENABLED
+    except Exception:
+        return True
+
+
 def _leaf_pnl_from_sources(info: dict, ev: dict, attr: dict | None) -> float:
-    """Real leaf P&L. Ignore rotator-seeded summary zeros with no trades."""
+    """Real leaf P&L. The rotator's number wins when the eval has trades.
+
+    pnl_20d_after_costs is what FLAG / BENCH just used (L-2026-10-01b).
+    Lifetime attribution is the fallback when that sample is absent.
+    Rotator-seeded summary zeros with no trades still do not count.
+    """
+    trades = 0
+    if ev:
+        trades = int(ev.get("trades_20d") or ev.get("trades_total") or 0)
+    if ev and trades > 0 and ev.get("pnl_20d_after_costs") is not None:
+        return float(ev["pnl_20d_after_costs"])
     if attr:
         for key in ("pnl_after_costs", "total_pnl"):
             if attr.get(key) is not None:
@@ -274,13 +295,16 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
             info = {}
         ev = eval_agents.get(name) or {}
         attr = attribution.get(name)
-        if "active" in info:
+        gated = _crypto_gated(name) or bool(ev.get("gated"))
+        if gated:
+            status = "gated"
+        elif "active" in info:
             status = "active" if info.get("active", True) else "benched"
         elif "active" in ev:
             status = "active" if ev.get("active", True) else "benched"
         else:
             status = "active"
-        if ev.get("flagged"):
+        if ev.get("flagged") and not gated:
             status = "FLAG"
         pnl = _leaf_pnl_from_sources(info, ev, attr)
         exp = ev.get("expectancy_after_costs_20d")
@@ -289,9 +313,11 @@ def scorecard_agent_roster(d: dict | None = None) -> list[dict]:
         w = weights.get(name)
         if w is None:
             w = defaults.get(name)
-        if w is None:
+        if w is None and not gated:
             # Do not invent 1.00 for leftover compound labels.
             continue
+        if w is None:
+            w = 0.0
         roster.append({
             "name": name,
             "status": status,
