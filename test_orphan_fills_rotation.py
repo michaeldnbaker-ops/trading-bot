@@ -46,10 +46,13 @@ def _pos(symbol, qty, upl, plpc=0.0, avg=1.0, order_type=""):
     )
 
 
-def _ord(symbol, side, qty, oid="o1", order_type="trailing_stop"):
-    return SimpleNamespace(
+def _ord(symbol, side, qty, oid="o1", order_type="trailing_stop", stop_price=None):
+    order = SimpleNamespace(
         symbol=symbol, side=side, qty=qty, id=oid, order_type=order_type,
     )
+    if stop_price is not None:
+        order.stop_price = stop_price
+    return order
 
 
 class _Broker:
@@ -80,7 +83,7 @@ class _Broker:
 
 class OrphanExits(unittest.TestCase):
     def _run(self, positions, orders=None, ledger=None, trail=None, opt=None,
-             today=None):
+             today=None, trades=None):
         from market_scheduler import reconcile_orphan_positions
         client = _Broker(positions, orders)
         trail = trail or MagicMock(return_value=(SimpleNamespace(id="trail"), None))
@@ -94,7 +97,7 @@ class OrphanExits(unittest.TestCase):
         with patch("order_executor._submit_trail_with_retry", trail), \
              patch("options_executor.submit_option_protective_stop", opt):
             actions = reconcile_orphan_positions(
-                client, set(ledger or []), today=today)
+                client, set(ledger or []), today=today, ledger_trades=trades)
         return client, actions, trail, opt
 
     def test_kept_winner_does_not_cancel_a_live_trail(self):
@@ -223,20 +226,65 @@ class OrphanExits(unittest.TestCase):
         self.assertNotIn("ledger already exited it", actions[0]["message"])
         self.assertIn("options stop", actions[0]["message"])
 
-    def test_option_plus_100_closes(self):
-        sym = "CCL261030C00026000"
-        # cost = 3 * 0.93 * 100 = 279; +279 is +100% of premium
-        client, actions, trail, _opt = self._run(
+    def test_option_plus_100_ratchets_stop_to_entry(self):
+        sym = "FPS261016C00035000"
+        # cost = 3 * 0.93 * 100 = 279; +279 is +100% of premium.
+        # The -50% stop is replaced. The contract is not market-sold.
+        placed = MagicMock(return_value={
+            "placed": True, "stop_price": 0.93, "qty": 3, "error": "",
+        })
+        client, actions, trail, opt = self._run(
             [_pos(sym, 3, 279, avg=0.93)],
-            [_ord(sym, "sell", 3, oid="ostop", order_type="stop")],
+            [_ord(sym, "sell", 3, oid="ostop", order_type="stop", stop_price=0.47)],
+            opt=placed,
             today=date(2026, 9, 30),
         )
+        self.assertEqual(client.closed, [])
         self.assertEqual(client.cancelled, ["ostop"])
-        self.assertEqual(client.closed, [sym])
         trail.assert_not_called()
-        self.assertEqual(actions[0]["action"], "closed")
-        self.assertIn("profit", actions[0]["message"])
+        self.assertEqual(opt.call_count, 1)
+        self.assertAlmostEqual(opt.call_args.kwargs["stop_price"], 0.93)
+        self.assertEqual(actions[0]["action"], "kept")
+        self.assertIn("ratcheted", actions[0]["message"])
         self.assertNotIn("ledger already exited it", actions[0]["message"])
+
+    def test_option_plus_150_locks_half_and_does_not_ratchet_down(self):
+        sym = "PTC261016C00020000"
+        # entry $2, mark $5 = 2.5× → stop $3. A later +100% mark must
+        # not walk that $3 stop back to entry.
+        from options_executor import long_option_stop_target, ratchet_floor
+        self.assertAlmostEqual(long_option_stop_target(2.0, 5.0), 3.0)
+        self.assertAlmostEqual(ratchet_floor(3.0, 2.0), 3.0)
+        placed = MagicMock(return_value={
+            "placed": True, "stop_price": 3.0, "qty": 1, "error": "",
+        })
+        # cost = 2 * 1 * 100 = 200; mark 5 → unrealized +300
+        client, actions, _trail, opt = self._run(
+            [_pos(sym, 1, 300, avg=2.0)],
+            [_ord(sym, "sell", 1, oid="low", order_type="stop", stop_price=1.0)],
+            opt=placed,
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.cancelled, ["low"])
+        self.assertAlmostEqual(opt.call_args.kwargs["stop_price"], 3.0)
+        self.assertIn("ratcheted", actions[0]["message"])
+
+        held = MagicMock(return_value={
+            "placed": True, "stop_price": 2.0, "qty": 1, "error": "",
+        })
+        # Same contract, stop already at the +50% lock, mark only +100%.
+        # upl for mark 4.0: 2 * (1 + upl/200) = 4 → upl = 200
+        client, actions, _trail, opt = self._run(
+            [_pos(sym, 1, 200, avg=2.0)],
+            [_ord(sym, "sell", 1, oid="lock", order_type="stop", stop_price=3.0)],
+            opt=held,
+            today=date(2026, 9, 30),
+        )
+        self.assertEqual(client.cancelled, [])
+        self.assertEqual(client.closed, [])
+        opt.assert_not_called()
+        self.assertIn("still active", actions[0]["message"])
 
     def test_option_minus_50_closes(self):
         sym = "CCL261030C00026000"
@@ -276,6 +324,36 @@ class OrphanExits(unittest.TestCase):
         self.assertEqual(client.cancelled, [])
         trail.assert_not_called()
         opt.assert_not_called()
+
+    def test_split_closed_and_open_lot_is_flagged_not_sold(self):
+        """Learning Loop 2026-10-05: SPY 88374c40e400 closed while the
+        same 11-share lot was still open. Symbol-level reconcile sees
+        the open row and stays quiet. This flags it and does not sell.
+        """
+        from test_learning_loop import _trade
+        closed = _trade(
+            "BreakoutAgent", 258.57, symbol="SPY", shares=11, entry=729.79,
+        )
+        closed.trade_id = "88374c40e400"
+        closed.status = "target"
+        closed.exit_price = 753.30
+        twin = _trade(
+            "BreakoutAgent", 0.0, symbol="SPY", shares=11, entry=729.79, open_=True,
+        )
+        twin.trade_id = "openlotopen1"
+        client, actions, trail, _opt = self._run(
+            [_pos("SPY", 11, 80, avg=729.79)],
+            ledger=["SPY"],
+            trades=[closed, twin],
+        )
+        self.assertEqual(client.closed, [])
+        self.assertEqual(client.cancelled, [])
+        trail.assert_not_called()
+        flags = [a for a in actions if a.get("action") == "flag"]
+        self.assertEqual(len(flags), 1)
+        self.assertIn("CRITICAL", flags[0]["message"])
+        self.assertIn("88374c40e400", flags[0]["message"])
+        self.assertNotIn("ledger already exited", flags[0]["message"])
 
 
 class UnfilledEntries(unittest.TestCase):
@@ -786,6 +864,61 @@ def _option_trade(**kw):
     return tl.Trade(**fields)
 
 
+class OptionProfitRatchet(unittest.TestCase):
+    """Threshold math and the don't-ratchet-down rule. No broker."""
+
+    def test_thresholds(self):
+        from options_executor import (
+            long_option_stop_target, ratchet_floor, ratchet_observation,
+            stop_replace_decision,
+        )
+        self.assertAlmostEqual(long_option_stop_target(1.0, 1.99), 0.50)
+        self.assertAlmostEqual(long_option_stop_target(1.0, 2.0), 1.0)
+        self.assertAlmostEqual(long_option_stop_target(1.0, 2.49), 1.0)
+        self.assertAlmostEqual(long_option_stop_target(1.0, 2.50), 1.50)
+        self.assertAlmostEqual(long_option_stop_target(1.0, None), 0.50)
+        # 0.93 * 1.5 = 1.395 → $1.40
+        self.assertAlmostEqual(long_option_stop_target(0.93, 0.93 * 2.5), 1.40)
+        self.assertAlmostEqual(ratchet_floor(0.50, 1.50), 1.50)
+        self.assertAlmostEqual(ratchet_floor(1.50, 1.00), 1.50)
+        self.assertAlmostEqual(ratchet_floor(None, 1.00), 1.00)
+        self.assertEqual(stop_replace_decision(1.50, True, 1.00), "keep")
+        self.assertEqual(stop_replace_decision(0.50, True, 1.50), "raise")
+        self.assertEqual(stop_replace_decision(1.50, True, 1.50), "keep")
+        self.assertEqual(stop_replace_decision(None, True, 1.50), "keep")
+        self.assertEqual(stop_replace_decision(None, False, 1.00), "place")
+        # Last print can qualify when the dollar mark has not.
+        pos = SimpleNamespace(
+            qty=1, avg_entry_price=1.0, current_price=2.60, unrealized_pl=10.0,
+        )
+        self.assertAlmostEqual(ratchet_observation(pos), 2.60)
+        self.assertAlmostEqual(long_option_stop_target(1.0, ratchet_observation(pos)), 1.50)
+
+    def test_rejected_raise_puts_the_old_stop_back(self):
+        from options_executor import sync_option_protective_stop
+        sym = "FPS261016C00035000"
+        pos = SimpleNamespace(
+            symbol=sym, qty=1, avg_entry_price=1.0,
+            current_price=2.60, unrealized_pl=160.0,
+        )
+        orders = [_ord(sym, "sell", 1, oid="low", order_type="stop", stop_price=0.50)]
+        client = _Broker([pos], orders)
+        calls = []
+
+        def _submit(_client, _position, stop_price=None, mark=None):
+            calls.append(stop_price)
+            if len(calls) == 1:
+                return {"placed": False, "error": "rejected", "stop_price": stop_price, "qty": 1}
+            return {"placed": True, "error": "", "stop_price": stop_price, "qty": 1}
+
+        with patch("options_executor.submit_option_protective_stop", side_effect=_submit):
+            result = sync_option_protective_stop(client, pos, orders, mark=2.60)
+        self.assertEqual(client.cancelled, ["low"])
+        self.assertEqual(calls, [1.5, 0.50])
+        self.assertEqual(result["action"], "refused")
+        self.assertTrue(result.get("restored"))
+
+
 class OptionPremiumExits(unittest.TestCase):
     """L-2026-10-01b: premium rules only. Equity bars do not close options."""
 
@@ -794,7 +927,8 @@ class OptionPremiumExits(unittest.TestCase):
         sym = "CCL261030C00026000"
         day = date(2026, 9, 30)
         self.assertIsNone(option_exit_reason(sym, 0.93, 0.80, today=day))
-        self.assertIn("profit", option_exit_reason(sym, 0.93, 1.86, today=day))
+        # +100% ratchets the stop; it is not a market flatten.
+        self.assertIsNone(option_exit_reason(sym, 0.93, 1.86, today=day))
         self.assertIn("stop", option_exit_reason(sym, 0.93, 0.465, today=day))
         self.assertIsNone(option_exit_reason(sym, 0.93, 0.50, today=day))
         self.assertIn("theta", option_exit_reason(
@@ -911,9 +1045,9 @@ class OptionPremiumExits(unittest.TestCase):
             manage_options_exits(today=date(2026, 9, 30))
         self.assertEqual(events, [("cancel", "ostop"), ("close", sym)])
 
-    def test_manage_plus_100_and_close_dte(self):
+    def test_manage_plus_100_ratchets_and_close_dte_still_flattens(self):
         from options_executor import manage_options_exits
-        winner = "CCL261030C00026000"
+        winner = "FPS261016C00035000"
         theta = "CCL261008C00026000"
         positions = [
             SimpleNamespace(symbol=winner, qty=1, avg_entry_price=1.0,
@@ -924,13 +1058,19 @@ class OptionPremiumExits(unittest.TestCase):
                             asset_class="us_option"),
         ]
         client = _Broker(positions, [])
+        placed = MagicMock(return_value={
+            "placed": True, "stop_price": 1.0, "qty": 1, "error": "",
+        })
         with patch("options_executor.OPTIONS_ENABLED", True), \
              patch("options_executor._clients", return_value=(client, object())), \
+             patch("options_executor.submit_option_protective_stop", placed), \
              patch("options_executor._quote", side_effect=lambda _c, sym: (
                  (2.1, 2.3, 2.2, 5.0) if sym == winner else (1.0, 1.2, 1.1, 5.0)
              )):
             manage_options_exits(today=date(2026, 9, 30))
-        self.assertEqual(client.closed, [winner, theta])
+        self.assertEqual(client.closed, [theta])
+        self.assertEqual(placed.call_count, 1)
+        self.assertAlmostEqual(placed.call_args.kwargs["stop_price"], 1.0)
 
 
 if __name__ == "__main__":

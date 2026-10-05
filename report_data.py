@@ -173,12 +173,22 @@ def snapshot() -> dict:
     # ── POSITIONS: broker only ────────────────────────────────────────
     try:
         ps = requests.get(f"{PAPER_API}/v2/positions", headers=_hdr(), timeout=15).json()
+        def _entry(raw):
+            try:
+                if raw in (None, ""):
+                    return None
+                px = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return px if px > 0 else None
+
         d["positions"] = [{
             "symbol": p["symbol"], "qty": float(p["qty"]),
             "is_option": len(p["symbol"]) > 12,
             "side": "LONG" if float(p["qty"]) > 0 else "SHORT",
             "mv": float(p["market_value"]), "unrl": float(p["unrealized_pl"]),
             "unrl_intraday": float(p.get("unrealized_intraday_pl") or 0),
+            "avg_entry_price": _entry(p.get("avg_entry_price")),
         } for p in ps]
         d["unrealized"] = sum(p["unrl"] for p in d["positions"])
         d["gross_exposure"] = sum(abs(p["mv"]) for p in d["positions"])
@@ -190,10 +200,23 @@ def snapshot() -> dict:
     # ── ATTRIBUTION: ledger only (never money-of-record) ──────────────
     try:
         import trade_ledger as _tl
+        from broker_fills import scoring_skip_reason
         today = d["today"]
-        opened = [t for t in _tl.trades_on_date(today) ]
-        closed = [t for t in _tl.all_trades()
-                  if not t.is_open and (t.exit_at_et or "")[:10] == today]
+        book = list(_tl.all_trades())
+        opened = [t for t in book if (t.opened_at_et or "")[:10] == today]
+        broker_lots = d.get("positions") or []
+        closed = []
+        for t in book:
+            if t.is_open or (t.exit_at_et or "")[:10] != today:
+                continue
+            reason = scoring_skip_reason(t, book, broker_lots)
+            if reason:
+                d["warnings"].append(
+                    "CRITICAL: phantom closed lot excluded from realized "
+                    f"today — {reason}"
+                )
+                continue
+            closed.append(t)
         d["opened_today"] = [{
             "time": (t.opened_at_et or "")[11:19], "symbol": t.symbol,
             "side": t.side,

@@ -247,6 +247,20 @@ def check_all() -> list[dict]:
              f"{', '.join(sorted(set(dbl))[:8])} — reported profit is inflated",
              "re-open those rows; the gain is unrealized")
 
+    # ── 3b. One closed ledger row and one open row (or the broker lot)
+    #      for the same shares. Symbol-level orphan/ghost checks miss
+    #      this: the open row makes the symbol look reconciled while the
+    #      closed row has already booked a gain. Learning Loop 2026-10-05,
+    #      SPY 88374c40e400, 11 shares, false +$258.57 at $753.30.
+    #      Flag only. Do not delete the closed row.
+    try:
+        from broker_fills import split_lot_flags
+        for flag in split_lot_flags(all_trades, positions):
+            fail("CRITICAL", "phantom_closed_lot", flag["detail"],
+                 "scoring ignores the closed row; do not delete the ledger history")
+    except Exception as e:
+        fail("WARN", "phantom_closed_lot", f"split-lot check failed: {e}")
+
     # ── 4. Every equity position needs a live exit order, or it is
     #      unprotected — no stop, unbounded downside.
     # Crypto is excluded by design: Alpaca supports no exit orders on

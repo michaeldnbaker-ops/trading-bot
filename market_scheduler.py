@@ -22,9 +22,10 @@ CHANGE LOG (L-2026-10-01b):
   _close_losing_orphan market-sold any of them with unrealized P&L <= 0,
   logging "ledger already exited it". That closed CCL261030C00026000 on
   2026-09-30 and NOK261016C00010000 on 2026-09-25. A ledger-tracked option
-  is not an orphan. An option with no ledger row closes only on +100%
-  premium, -50% premium, or CLOSE_DTE. A small loss keeps the contract
-  and its protective stop.
+  is not an orphan. An option with no ledger row market-closes only on
+  -50% premium or CLOSE_DTE. +100% / +150% ratchet its sell stop
+  (break-even, then lock +50%) and never stack a second stop under it.
+  A small loss keeps the contract and its protective stop.
 """
 
 from __future__ import annotations
@@ -362,7 +363,8 @@ def _order_may_book_ledger_exit(symbol: str) -> bool:
     return not is_option_symbol(symbol)
 
 
-def reconcile_orphan_positions(client, ledger_open: set[str], today=None) -> list[dict]:
+def reconcile_orphan_positions(client, ledger_open: set[str], today=None,
+                               ledger_trades=None) -> list[dict]:
     """Close broker positions the ledger already exited.
 
     A symbol still open in the ledger is not an orphan. That includes a
@@ -374,12 +376,18 @@ def reconcile_orphan_positions(client, ledger_open: set[str], today=None) -> lis
     active.
 
     Option orphans (broker contract, no ledger row) are not "losing, so
-    sell". They close only on +100% premium, -50% premium, or CLOSE_DTE.
+    sell". They market-close only on -50% premium or CLOSE_DTE. +100%
+    and +150% ratchet the sell stop (replace a lower one; never stack).
     Anything else is kept, and a missing protective stop is replaced.
     A kept orphan that is not fully covered gets a protective exit
     re-placed: an equity trailing stop sized to the broker qty, or an
     options stop. If the broker rejects the options stop, the log says
     so. It does not claim a trailing stop is active.
+
+    ``ledger_trades``, when passed, also flags a closed ledger row that
+    still matches an open ledger lot or the broker lot. That is a
+    phantom realized gain (Learning Loop 2026-10-05, SPY 88374c40e400).
+    The flag does not sell the shares and does not delete the row.
     """
     from invariants import is_option_symbol, position_is_protected
 
@@ -419,8 +427,42 @@ def reconcile_orphan_positions(client, ledger_open: set[str], today=None) -> lis
         else:
             action = _close_losing_orphan(client, sym, sym_orders)
         actions.append(action)
-        (log.warning if action.get("level") == "warning" else log.info)(action["message"])
+        _log_reconcile(action)
+    if ledger_trades:
+        for action in _flag_split_lots(ledger_trades, positions):
+            actions.append(action)
+            _log_reconcile(action)
     return actions
+
+
+def _log_reconcile(action: dict) -> None:
+    level = action.get("level")
+    if level == "critical":
+        log.critical(action["message"])
+    elif level == "warning":
+        log.warning(action["message"])
+    else:
+        log.info(action["message"])
+
+
+def _flag_split_lots(trades, positions) -> list[dict]:
+    """CRITICAL flags for closed rows that still match a live lot.
+
+    Reconcile used to look only at symbol sets: one open ledger row made
+    the symbol "known", so a second closed row booking the same shares
+    never showed up next to the ghost/naked alerts.
+    """
+    from broker_fills import split_lot_flags
+    out = []
+    for flag in split_lot_flags(trades, positions):
+        out.append({
+            "symbol": flag["symbol"],
+            "action": "flag",
+            "level": "critical",
+            "trade_id": flag["trade_id"],
+            "message": flag["message"],
+        })
+    return out
 
 
 def _keep_winning_orphan(client, position, sym, signed, upl, sym_orders,
@@ -521,15 +563,36 @@ def _reprotect_option(client, position, sym, upl) -> dict:
             "replaced": False, "level": "warning", "message": msg}
 
 
+def _option_stop_message(sym, upl, result) -> dict:
+    """Reconcile line after a ratchet place, raise, or refusal."""
+    if result.get("placed") and result.get("action") in {"placed", "raised"}:
+        verb = "ratcheted" if result.get("action") == "raised" else "re-placed"
+        msg = (f"Reconcile: KEEPING winning option orphan {sym} (+${upl:.0f}) — "
+               f"{verb} options stop ${result.get('stop_price')} "
+               f"on {result.get('qty')} contract(s)")
+        return {"symbol": sym, "action": "kept", "protected": True,
+                "replaced": True, "message": msg,
+                "stop_price": result.get("stop_price")}
+    msg = (f"Reconcile: KEEPING winning option orphan {sym} (+${upl:.0f}) — "
+           f"NO protective exit; broker refused an options stop "
+           f"({result.get('error')}). manage_options_exits is the only backstop")
+    return {"symbol": sym, "action": "kept", "protected": False,
+            "replaced": False, "level": "warning", "message": msg}
+
+
 def _reconcile_option_orphan(client, position, sym, signed, upl, sym_orders,
                              today, position_is_protected, is_option_symbol) -> dict:
     """Option with no open ledger row.
 
     True-orphan safety stays: we still see the broker contract. The
     equity rule (unrealized P&L <= 0 → cancel stop, market sell) does
-    not. Premium rules do.
+    not. -50% and CLOSE_DTE still market-close. A profit ratchet
+    replaces a lower sell stop and does not stack a second one.
     """
-    from options_executor import option_exit_reason, premium_mark
+    from options_executor import (
+        option_exit_reason, premium_mark, ratchet_observation,
+        sync_option_protective_stop,
+    )
     try:
         basis = abs(float(getattr(position, "avg_entry_price", 0) or 0))
     except (TypeError, ValueError):
@@ -537,10 +600,15 @@ def _reconcile_option_orphan(client, position, sym, signed, upl, sym_orders,
     reason = option_exit_reason(sym, basis, premium_mark(position), today=today)
     if reason:
         return _close_option_for_rule(client, sym, sym_orders, reason)
-    action = _keep_winning_orphan(
-        client, position, sym, signed, upl, sym_orders,
-        position_is_protected, is_option_symbol,
-    )
+    mark = ratchet_observation(position)
+    result = sync_option_protective_stop(client, position, sym_orders, mark=mark)
+    if result.get("action") == "keep":
+        action = _keep_winning_orphan(
+            client, position, sym, signed, upl, sym_orders,
+            position_is_protected, is_option_symbol,
+        )
+    else:
+        action = _option_stop_message(sym, upl, result)
     if upl <= 0:
         action["message"] = (
             action["message"]
@@ -632,12 +700,16 @@ def sync_alpaca_positions():
         #
         # Options are not in that equity rule. A contract the ledger does
         # not list is still not sold just because its premium is red.
-        # +100% / -50% / CLOSE_DTE are the only reconcile closes. A
-        # contract the ledger still has open is not an orphan at all
-        # (L-2026-10-01b).
+        # -50% / CLOSE_DTE are the only option reconcile market-closes.
+        # +100% / +150% ratchet the sell stop. A contract the ledger
+        # still has open is not an orphan at all (L-2026-10-01b).
+        # A closed row that still matches that open lot is flagged, not
+        # deleted (Learning Loop 2026-10-05).
         try:
             ledger_open = {t.symbol.replace("/", "") for t in _ledger.open_positions()}
-            reconcile_orphan_positions(client, ledger_open)
+            reconcile_orphan_positions(
+                client, ledger_open, ledger_trades=list(trades.values()),
+            )
         except Exception as e:
             log.warning(f"Orphan reconcile failed: {e}")
     except Exception as e:

@@ -453,9 +453,10 @@ def _fetch_price_path(symbol: str, since_iso_et: str, yf) -> Optional[object]:
 def equity_simulation_applies(symbol: str) -> bool:
     """Equity target, stop, ATR path, and MAX_HOLD_DAYS.
 
-    Option contracts close only on +100% premium, -50% premium, CLOSE_DTE,
-    or a broker protective-stop fill. A yfinance path of the underlying
-    must not book the option exited. L-2026-10-01b.
+    Option contracts market-close only on -50% premium, CLOSE_DTE, or a
+    broker protective-stop fill. +100% / +150% ratchet that stop; they
+    do not book the option exited from an equity bar. A yfinance path of
+    the underlying must not book the option exited. L-2026-10-01b.
     """
     from invariants import is_option_symbol
     return not is_option_symbol(symbol)

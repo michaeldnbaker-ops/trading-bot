@@ -22,7 +22,9 @@ from broker_fills import (
     compare_ledger,
     realized_on_date,
     realized_pnl,
+    scoring_skip_reason,
     split_amount,
+    split_lot_flags,
 )
 from report_data import reconcile_line, unexplained_day_gap
 from test_learning_loop import TODAY, _trade
@@ -360,6 +362,104 @@ class DiagnosticReadOnly(unittest.TestCase):
         )
         self.assertAlmostEqual(realized_on_date([trip], "2026-10-01"), 447.0)
         self.assertAlmostEqual(realized_on_date([trip], "2026-09-30"), 0.0)
+
+
+class PhantomClosedLot(unittest.TestCase):
+    """SPY 88374c40e400 and the durable closed+open lot rule.
+
+    Learning Loop 2026-10-05. The ledger row is not deleted.
+    """
+
+    def _phantom(self, pnl=258.57, entry=729.79, shares=11, symbol="SPY"):
+        trade = _trade(
+            "BreakoutAgent", pnl, days_ago=1, symbol=symbol, shares=shares, entry=entry,
+        )
+        trade.trade_id = "88374c40e400"
+        trade.status = "target"
+        trade.exit_price = 753.30
+        return trade
+
+    def _eval(self, trades, round_trips=None, broker_positions=None):
+        ev = AgentEvaluator()
+        kwargs = {}
+        if round_trips is not None:
+            kwargs["round_trips"] = round_trips
+        if broker_positions is not None:
+            kwargs["broker_positions"] = broker_positions
+        with patch("agent_evaluator._today_et_date", return_value=TODAY), \
+             patch("trade_ledger.epoch_trades", return_value=trades), \
+             patch("agent_evaluator._agent_active_state", return_value={}):
+            return ev.evaluate(**kwargs)
+
+    def test_flagged_spy_row_is_excluded_even_if_a_fill_matches(self):
+        phantom = self._phantom()
+        real = _trade("NewsAgent", 50.0, days_ago=1, symbol="AMD")
+        trip = RoundTrip(
+            symbol="SPY", side="LONG", qty=11, entry_price=729.79, exit_price=753.30,
+            entry_time="2026-09-19T14:00:00Z", exit_time="2026-09-19T18:00:00Z",
+            realized_pnl=258.57,
+        )
+        report = self._eval([phantom, real], round_trips=[trip])
+        by = {a.name: a for a in report.agents}
+        self.assertNotIn("BreakoutAgent", by)
+        self.assertAlmostEqual(by["NewsAgent"].pnl_20d, 50.0)
+        self.assertIn("phantom", report.scoring_note)
+        rows = compare_ledger([phantom], [trip])
+        self.assertFalse(rows[0].score)
+        self.assertEqual(rows[0].slices, [])
+        self.assertIn("PHANTOM", rows[0].note)
+        self.assertIn("88374c40e400", scoring_skip_reason(phantom, [phantom]) or "")
+
+    def test_durable_rule_skips_a_matching_open_lot_and_not_a_different_one(self):
+        closed = _trade(
+            "BreakoutAgent", 100.0, days_ago=1, symbol="SPY", shares=11, entry=729.79,
+        )
+        closed.trade_id = "deadbeefdead"
+        twin = _trade(
+            "NewsAgent", 0.0, days_ago=0, symbol="SPY", shares=11, entry=729.79, open_=True,
+        )
+        twin.trade_id = "openlotopen1"
+        other = _trade("NewsAgent", 40.0, days_ago=2, symbol="QQQ", shares=5, entry=400)
+        report = self._eval([closed, twin, other], round_trips=[])
+        by = {a.name: a for a in report.agents}
+        self.assertNotIn("BreakoutAgent", by)
+        self.assertAlmostEqual(by["NewsAgent"].pnl_20d, 40.0)
+        flags = split_lot_flags([closed, twin])
+        self.assertEqual(len(flags), 1)
+        self.assertTrue(flags[0]["message"].startswith("CRITICAL:"))
+        self.assertIn("deadbeefdead", flags[0]["message"])
+        self.assertIn("100.00", flags[0]["message"])
+
+        different = _trade(
+            "BreakoutAgent", 80.0, days_ago=1, symbol="SPY", shares=11, entry=700.0,
+        )
+        different.trade_id = "otherentry01"
+        report = self._eval([different, twin], round_trips=[])
+        by = {a.name: a for a in report.agents}
+        self.assertAlmostEqual(by["BreakoutAgent"].pnl_20d, 80.0)
+        self.assertEqual(split_lot_flags([different, twin]), [])
+
+    def test_broker_lot_match_flags_without_deleting_history(self):
+        closed = _trade(
+            "BreakoutAgent", 258.57, days_ago=1, symbol="SPY", shares=11, entry=729.79,
+        )
+        closed.trade_id = "brokeronly01"
+        closed.status = "target"
+        held = {"symbol": "SPY", "qty": "11", "avg_entry_price": "729.79"}
+        self.assertIsNotNone(scoring_skip_reason(closed, [closed], [held]))
+        flags = split_lot_flags([closed], [held])
+        self.assertEqual([f["trade_id"] for f in flags], ["brokeronly01"])
+        # The closed object is unchanged — history is not rewritten.
+        self.assertEqual(closed.status, "target")
+        self.assertAlmostEqual(closed.realized_pnl, 258.57)
+        # A different size is a different lot.
+        other_size = {"symbol": "SPY", "qty": 20, "avg_entry_price": 729.79}
+        self.assertIsNone(scoring_skip_reason(closed, [closed], [other_size]))
+        self.assertEqual(split_lot_flags([closed], [other_size]), [])
+        # The known id stays out of scoring after the live lot is gone.
+        phantom = self._phantom()
+        self.assertIsNotNone(scoring_skip_reason(phantom, [phantom], []))
+        self.assertEqual(split_lot_flags([phantom], []), [])
 
 
 class GatesUntouched(unittest.TestCase):
