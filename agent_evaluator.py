@@ -4,6 +4,12 @@ agent_evaluator.py — v2.2 (L-2026-10-01b)
 Ranks leaf agents by P&L after paper friction. MetaAgent(...) wrappers
 are unwrapped before anything is judged.
 
+CHANGE LOG (L-2026-10-05):
+  • A closed ledger row that still matches an open lot (symbol, side,
+    qty, and entry when both are known) does not score. Trade
+    88374c40e400 (SPY, false +$258.57) is excluded by id as well.
+    The row stays in the ledger.
+
 CHANGE LOG (L-2026-10-01b):
   • Scoring dollars are broker-fill realized P&L per closed round trip,
     after the one paper-friction cost, split 1/N across leaf agents on
@@ -83,7 +89,12 @@ from pathlib import Path
 from typing import Optional
 
 import trade_ledger as _ledger
-from broker_fills import ScoreSlice, prepare_scoring_book, slices_for_trade
+from broker_fills import (
+    ScoreSlice,
+    prepare_scoring_book,
+    scoring_skip_reason,
+    slices_for_trade,
+)
 
 log = logging.getLogger("AgentEvaluator")
 
@@ -356,7 +367,7 @@ def _accumulate_slice(agg: dict, sl: ScoreSlice, opened, cutoff_5d, cutoff_20d) 
 class AgentEvaluator:
     """Reads the ledger and produces a ranked EvalReport."""
 
-    def evaluate(self, round_trips=None) -> EvalReport:
+    def evaluate(self, round_trips=None, *, broker_positions=None) -> EvalReport:
         # Epoch-filtered: pre-2026-07-02 trades were distorted by the
         # duplicate-entry bug, so they'd have agents benched for the bug's
         # sins rather than their own. Full history remains in the ledger
@@ -364,10 +375,31 @@ class AgentEvaluator:
         all_trades = _ledger.epoch_trades()
         active_state = _agent_active_state()
         book, broker_available = prepare_scoring_book(round_trips)
+        if broker_positions is None and round_trips is None and broker_available:
+            try:
+                from broker_fills import fetch_open_positions
+                broker_positions = fetch_open_positions()
+            except Exception as e:
+                log.info("open positions unavailable for phantom-lot check (%s)", e)
+                broker_positions = None
+        # Closed rows that still describe a live lot (or the flagged SPY
+        # id 88374c40e400) do not vote. Drop them before fill assignment
+        # so a phantom cannot consume a real round trip.
+        scoreable = []
+        skipped_phantoms = 0
+        for t in all_trades:
+            if getattr(t, "is_open", False):
+                continue
+            reason = scoring_skip_reason(t, all_trades, broker_positions)
+            if reason:
+                skipped_phantoms += 1
+                log.warning("scoring excluded phantom closed lot: %s", reason)
+                continue
+            scoreable.append(t)
         assignment: dict[str, list] = {}
         if broker_available:
             from broker_fills import assign_round_trips
-            assignment = assign_round_trips(all_trades, book)
+            assignment = assign_round_trips(scoreable, book)
             scoring_note = (
                 "Scoring: broker-fill realized P&L after costs, co-signed 1/N. "
                 "Unmatched closed trades use ledger realized and are logged."
@@ -378,6 +410,10 @@ class AgentEvaluator:
                 "(broker fills not loaded)."
             )
             log.info("broker fills unavailable — evaluator scoring from ledger realized")
+        if skipped_phantoms:
+            scoring_note += (
+                f" Excluded {skipped_phantoms} phantom closed lot(s)."
+            )
 
         # ── Window cutoffs (calendar days, ET) ────────────────────────────
         today_midnight = _today_et_date()
@@ -389,14 +425,13 @@ class AgentEvaluator:
         # copy on every co-signer (that double-counted a shared loss).
         agg: dict[str, dict] = {}
 
-        for t in all_trades:
+        for t in scoreable:
             # Closed trades only. Marking open winners into the 5d/20d
             # windows is how a losing agent kept a full weight while its
             # closed record bled (meta_agent already dropped unrealized
             # for that reason; PR #14). Rotation, FLAG, and size-tilt read
-            # this report, so an open mark must not vote.
-            if getattr(t, "is_open", False):
-                continue
+            # this report, so an open mark must not vote. Phantom closed
+            # lots were removed from scoreable above.
             opened = _trade_opened_dt(t)
             if broker_available:
                 slices = slices_for_trade(

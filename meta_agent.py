@@ -460,6 +460,7 @@ class MetaAgent:
             # frequently appears as a co-signer still earns weight from
             # those trades' outcomes.
             agent_pnl: dict[str, float] = {name: 0.0 for name in DEFAULT_WEIGHTS}
+            from broker_fills import scoring_skip_reason
             for t in all_trades:
                 if t.opened_at_et < cutoff_iso:
                     continue
@@ -467,6 +468,11 @@ class MetaAgent:
                 # hold open winners to keep weight 1.0 while its closed
                 # trades lost $6.7k (post-mortem 2026-07-31).
                 if t.is_open:
+                    continue
+                # Same phantom rule as the evaluator. A closed row that
+                # still matches an open lot (or SPY 88374c40e400) must
+                # not move weights. The ledger row is left in place.
+                if scoring_skip_reason(t, all_trades):
                     continue
                 pnl = t.realized_pnl or 0.0
                 cost = _ledger.round_trip_cost(t)
@@ -519,6 +525,8 @@ class MetaAgent:
             for name in DEFAULT_WEIGHTS:
                 streak = 0
                 for t in closed:
+                    if scoring_skip_reason(t, all_trades):
+                        continue
                     leaves = getattr(t, "leaf_agents", None) or _ledger.leaf_agent_names(
                         getattr(t, "primary_agent", ""),
                         getattr(t, "contributors", ""),

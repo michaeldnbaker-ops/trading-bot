@@ -88,16 +88,23 @@ def format_report(rows: list[bf.CompareRow], *, day: str | None = None,
 def run(client=None, trades=None, day: str | None = None) -> str:
     """Build the report. Pass client/trades in tests. Default path is the VM."""
     fill_source = ""
-    open_symbols: set[str] = set()
     if client is None:
         client = bf.make_paper_client()
     if trades is None:
         import trade_ledger as tl
-        trades = [t for t in tl.all_trades() if not t.is_open]
+        # Open rows stay in the book so a closed twin can be recognized.
+        trades = list(tl.all_trades())
     fills, fill_source = bf.fetch_fills(client)
-    open_symbols = bf.fetch_open_symbols(client)
+    positions = bf.fetch_open_positions(client)
+    open_symbols = {
+        str(bf._get(p, "symbol", default=""))
+        for p in positions
+        if bf._get(p, "symbol")
+    }
     trips = bf.build_round_trips(fills)
-    rows = bf.compare_ledger(trades, trips, broker_open=open_symbols)
+    rows = bf.compare_ledger(
+        trades, trips, broker_open=open_symbols, broker_positions=positions,
+    )
     ledger_today = None
     if day:
         ledger_today = round(sum(
@@ -105,6 +112,7 @@ def run(client=None, trades=None, day: str | None = None) -> str:
             for t in trades
             if not getattr(t, "is_open", False)
             and str(getattr(t, "exit_at_et", "") or "")[:10] == day
+            and not bf.scoring_skip_reason(t, trades, positions)
         ), 2)
     return format_report(
         rows, day=day, trips=trips, fill_source=fill_source,

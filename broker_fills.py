@@ -61,6 +61,176 @@ class ScoreSlice:
     source: str               # "broker" | "ledger"
 
 
+# Learning Loop 2026-10-05. SPY 11 shares, trade 88374c40e400, was marked
+# closed/target at $753.30 while the broker still held that lot. The
+# ledger booked a false +$258.57 ((753.30 - ~729.79) * 11). The row stays
+# in the ledger. Scoring ignores this id even after the live lot is gone,
+# and ignores any later closed row whose symbol, side, and qty (and entry,
+# when both sides have one) still match an open ledger lot or an open
+# broker position. Reconcile flags the live disagreement; it does not
+# delete history.
+PHANTOM_EXCLUDED_TRADE_IDS = frozenset({"88374c40e400"})
+PHANTOM_QTY_REL = 0.02
+PHANTOM_ENTRY_REL = 0.002
+PHANTOM_ENTRY_ABS = 0.05
+
+
+def _num(value) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _qty_close(a, b) -> bool:
+    left, right = abs(float(a or 0)), abs(float(b or 0))
+    if left <= 0 or right <= 0:
+        return False
+    return abs(left - right) <= max(0.01, PHANTOM_QTY_REL * max(left, right))
+
+
+def _entry_close(a: Optional[float], b: Optional[float]) -> bool:
+    """True when entries agree, or when either side has no entry to compare."""
+    if a is None or b is None or a <= 0 or b <= 0:
+        return True
+    return abs(a - b) <= max(PHANTOM_ENTRY_ABS, PHANTOM_ENTRY_REL * max(abs(a), abs(b)))
+
+
+def _broker_lot(position) -> Optional[tuple]:
+    if isinstance(position, dict):
+        sym = position.get("symbol")
+        qty = position.get("qty")
+        entry = position.get("avg_entry_price", position.get("entry"))
+    else:
+        sym = getattr(position, "symbol", None)
+        qty = getattr(position, "qty", None)
+        entry = getattr(position, "avg_entry_price", None)
+    size = _num(qty)
+    if not sym or size is None or size == 0:
+        return None
+    side = "LONG" if size > 0 else "SHORT"
+    ent = _num(entry)
+    if ent is not None and ent <= 0:
+        ent = None
+    return str(sym), side, abs(size), ent
+
+
+def same_open_lot(trade, symbol, side, qty, entry) -> bool:
+    """Closed row vs one live lot: symbol, side, qty, and entry when known."""
+    if norm_symbol(getattr(trade, "symbol", "")) != norm_symbol(symbol):
+        return False
+    if position_side(getattr(trade, "side", "")) != position_side(side):
+        return False
+    if not _qty_close(getattr(trade, "shares", 0), qty):
+        return False
+    return _entry_close(_num(getattr(trade, "entry_price", None)), _num(entry))
+
+
+def _live_lot_matches(trade, trades, broker_positions=None) -> list[str]:
+    kinds: list[str] = []
+    for other in trades or []:
+        if other is trade or not getattr(other, "is_open", False):
+            continue
+        if same_open_lot(
+            trade,
+            getattr(other, "symbol", ""),
+            getattr(other, "side", ""),
+            getattr(other, "shares", 0),
+            getattr(other, "entry_price", None),
+        ):
+            kinds.append("open ledger lot")
+            break
+    for position in broker_positions or []:
+        lot = _broker_lot(position)
+        if lot is None:
+            continue
+        sym, side, qty, entry = lot
+        if same_open_lot(trade, sym, side, qty, entry):
+            kinds.append("open broker position")
+            break
+    return kinds
+
+
+def closed_lot_still_open_reason(trade, trades, broker_positions=None) -> Optional[str]:
+    """Durable rule: this closed row still describes a lot that is open.
+
+    None when the row is open, or when no live lot matches. Used by
+    reconcile to FLAG the disagreement. Does not by itself name the
+    2026-10-05 id — that id is a scoring exclusion even after the lot
+    is actually closed.
+    """
+    if getattr(trade, "is_open", False):
+        return None
+    kinds = _live_lot_matches(trade, trades, broker_positions)
+    if not kinds:
+        return None
+    tid = str(getattr(trade, "trade_id", "") or "")
+    where = " and ".join(kinds)
+    return (
+        f"phantom closed lot {tid} {getattr(trade, 'symbol', '')} "
+        f"x{getattr(trade, 'shares', 0)}: closed row still matches {where}"
+    )
+
+
+def scoring_skip_reason(trade, trades, broker_positions=None) -> Optional[str]:
+    """Why rotation/scorecard must ignore this closed row's realized P&L.
+
+    The ledger row is not deleted. ``PHANTOM_EXCLUDED_TRADE_IDS`` covers
+    the known false SPY close. The durable rule covers the same shape
+    on any later row while the live lot is still open.
+    """
+    if getattr(trade, "is_open", False):
+        return None
+    tid = str(getattr(trade, "trade_id", "") or "")
+    if tid in PHANTOM_EXCLUDED_TRADE_IDS:
+        return (
+            f"excluded phantom closed lot {tid} "
+            "(Learning Loop 2026-10-05; row kept in the ledger)"
+        )
+    return closed_lot_still_open_reason(trade, trades, broker_positions)
+
+
+def split_lot_flags(trades, broker_positions=None) -> list[dict]:
+    """One CRITICAL flag per closed row that still matches a live lot.
+
+    ``message`` is the reconcile/alert line. ``detail`` is the invariant
+    text (severity is added by the caller). History is not modified.
+    """
+    flags = []
+    seen: set[str] = set()
+    for trade in trades or []:
+        reason = closed_lot_still_open_reason(trade, trades, broker_positions)
+        if not reason:
+            continue
+        tid = str(getattr(trade, "trade_id", "") or "")
+        if tid in seen:
+            continue
+        seen.add(tid)
+        kinds = _live_lot_matches(trade, trades, broker_positions)
+        where = " and ".join(kinds) if kinds else "a live lot"
+        try:
+            qty = float(getattr(trade, "shares", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        pnl = round(float(getattr(trade, "realized_pnl", 0) or 0), 2)
+        symbol = str(getattr(trade, "symbol", "") or "")
+        detail = (
+            f"{symbol} {tid} x{qty:g} booked ${pnl:+.2f} while the same lot "
+            f"is still open ({where})"
+        )
+        flags.append({
+            "trade_id": tid,
+            "symbol": symbol,
+            "qty": qty,
+            "realized_pnl": pnl,
+            "detail": detail,
+            "message": f"CRITICAL: {detail}",
+        })
+    return flags
+
+
 @dataclass
 class CompareRow:
     trade_id: str
@@ -79,6 +249,7 @@ class CompareRow:
     note: str
     source: str
     slices: list[ScoreSlice] = field(default_factory=list)
+    score: bool = True
 
 
 def network_scoring_enabled() -> bool:
@@ -412,12 +583,14 @@ def prepare_scoring_book(round_trips: Optional[list[RoundTrip]]):
         return [], False
 
 
-def compare_ledger(trades: Iterable, trips: list[RoundTrip], *, broker_open: Optional[set[str]] = None) -> list[CompareRow]:
+def compare_ledger(trades: Iterable, trips: list[RoundTrip], *, broker_open: Optional[set[str]] = None,
+                   broker_positions=None) -> list[CompareRow]:
     """Per closed ledger row: broker round-trip P&L vs ledger realized."""
-    assignment = assign_round_trips(trades, trips)
+    trade_list = list(trades)
+    assignment = assign_round_trips(trade_list, trips)
     held = {norm_symbol(s) for s in (broker_open or set())}
     rows: list[CompareRow] = []
-    for trade in trades:
+    for trade in trade_list:
         if getattr(trade, "is_open", False):
             continue
         matched = assignment.get(str(getattr(trade, "trade_id", "")), [])
@@ -436,9 +609,16 @@ def compare_ledger(trades: Iterable, trips: list[RoundTrip], *, broker_open: Opt
             note = "NO BROKER FILL — ledger fallback"
             if norm_symbol(getattr(trade, "symbol", "")) in held:
                 note = "LEDGER EXITED EARLY — broker still holds; " + note
-        slices = slices_for_trade(
-            trade, matched, warn_unmatched=False,
-        )
+        skip = scoring_skip_reason(trade, trade_list, broker_positions)
+        score = True
+        if skip:
+            note = "PHANTOM CLOSED LOT — excluded from scoring; " + note
+            score = False
+            slices: list[ScoreSlice] = []
+        else:
+            slices = slices_for_trade(
+                trade, matched, warn_unmatched=False,
+            )
         rows.append(CompareRow(
             trade_id=str(getattr(trade, "trade_id", "")),
             symbol=str(getattr(trade, "symbol", "")),
@@ -459,6 +639,7 @@ def compare_ledger(trades: Iterable, trips: list[RoundTrip], *, broker_open: Opt
             note=note,
             source=source,
             slices=slices,
+            score=score,
         ))
     return rows
 
@@ -504,7 +685,7 @@ def agent_pnl_deltas(rows: list[CompareRow]) -> dict[str, float]:
     """
     totals: dict[str, float] = {}
     for row in rows:
-        if row.broker_pnl is None or not row.agents:
+        if not getattr(row, "score", True) or row.broker_pnl is None or not row.agents:
             continue
         ledger_parts = split_amount(row.ledger_pnl, len(row.agents))
         broker_parts = split_amount(row.broker_pnl, len(row.agents))
@@ -625,6 +806,21 @@ def fetch_fills(client) -> tuple[list[dict], str]:
     fills = _fills_from_closed_orders(client)
     fills.sort(key=lambda f: parse_time(f["time"]) or datetime.min.replace(tzinfo=timezone.utc))
     return fills, "closed_orders"
+
+
+def fetch_open_positions(client=None) -> list:
+    """Live paper positions. Read-only. Empty when the broker cannot be read."""
+    if client is None:
+        client = make_paper_client()
+    assert_paper_client(client)
+    getter = getattr(client, "get_all_positions", None)
+    if getter is None:
+        return []
+    try:
+        return list(getter() or [])
+    except Exception as e:
+        log.warning("position read failed (%s)", e)
+        return []
 
 
 def fetch_open_symbols(client) -> set[str]:

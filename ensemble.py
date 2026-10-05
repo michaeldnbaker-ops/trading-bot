@@ -143,8 +143,9 @@ except Exception as _e:
 def _halt_cuts_symbol(sym: str, unrealized_pl: float) -> bool:
     """Daily-loss de-risk flattens losing equities only.
 
-    Options close on +100% / -50% / CLOSE_DTE or the broker protective
-    stop, not because the book hit a daily loss. Crypto has its own
+    Options market-close on -50% / CLOSE_DTE or the broker protective
+    stop. +100% / +150% only ratchet that stop. A daily loss does not
+    flatten them. Crypto has its own
     scheduler. Winners stay on their trails. L-2026-10-01b.
     """
     if unrealized_pl >= 0:

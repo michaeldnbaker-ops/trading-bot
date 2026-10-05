@@ -27,14 +27,20 @@ Risk model:
     else still trades shares. Options are the conviction expression, not
     the default.
 
+CHANGE LOG (L-2026-10-05, option profit ratchet):
+  A long option is market-flattened only on -50% of premium, CLOSE_DTE,
+  or a filled broker stop. +100% and +150% move that stop; they do not
+  market-sell. At mark or last >= 2× entry the sell stop goes to entry
+  (break-even). At >= 2.5× entry it goes to 1.5× entry (lock +50%).
+  The stop is only ever raised, and the old order is cancelled first
+  so a lower stop is not left resting under the new one.
+
 CHANGE LOG (L-2026-10-01b):
-  A long option closes only on +100% of premium, -50% of premium,
-  CLOSE_DTE, or the broker protective stop filling. Equity trailing
-  stops, ATR stops, and hold-time expiry do not apply. The exit mark
-  is the quote mid, else the mark implied by dollar P&L — not a last
-  print sitting on the bid. The protective stop is cancelled only when
-  one of those rules is actually closing the contract, so Alpaca does
-  not reject the close as uncovered.
+  Equity trailing stops, ATR stops, and hold-time expiry do not apply.
+  The exit mark is the quote mid, else the mark implied by dollar P&L
+  — not a last print sitting on the bid. The protective stop is
+  cancelled only when a premium rule is actually closing the contract,
+  so Alpaca does not reject the close as uncovered.
 """
 
 from __future__ import annotations
@@ -55,8 +61,14 @@ OPTIONS_RISK_PCT       = float(os.getenv("OPTIONS_RISK_PCT", "1.0"))   # % of eq
 MIN_DTE, MAX_DTE       = 25, 50      # entry window: enough time for the thesis
 CLOSE_DTE              = 10          # exit before theta accelerates
 MAX_SPREAD_PCT         = 15.0        # skip illiquid contracts
-PROFIT_TAKE_MULT       = 2.0         # close at +100% premium
-STOP_LOSS_MULT         = 0.50        # close at -50% premium
+STOP_LOSS_MULT         = 0.50        # protective stop, and the market flatten, at -50%
+# Profit ratchet on the resting sell stop. These are not market flattens:
+# a market sell at the same mark would cancel the stop this ratchet just set.
+RATCHET_BREAKEVEN_MARK = 2.0         # +100%: mark or last >= 2× entry
+RATCHET_BREAKEVEN_STOP = 1.0         # stop at entry (break-even)
+RATCHET_LOCK_MARK      = 2.5         # +150%: mark or last >= 2.5× entry
+RATCHET_LOCK_STOP      = 1.5         # stop at 1.5× entry (lock +50%)
+PROFIT_TAKE_MULT       = RATCHET_BREAKEVEN_MARK  # name kept; now a stop step
 _OCC_EXPIRY            = re.compile(r"(\d{6})[CP]")
 
 
@@ -119,12 +131,13 @@ def premium_mark(position, quote_mid: float | None = None) -> float | None:
 
 def option_exit_reason(symbol: str, entry_premium: float, mark: float | None,
                        today: date | None = None) -> str | None:
-    """Why this long option must be closed, or None to keep holding it.
+    """Why this long option must be market-flattened, or None to keep it.
 
-    Software closes are only +100% of premium, -50% of premium, and
-    CLOSE_DTE. Equity trailing stops, ATR stops, and MAX_HOLD_DAYS are
-    not reasons. A filled broker protective stop is already flat at the
-    broker; this function does not invent that fill.
+    Software flattens are only -50% of premium and CLOSE_DTE. +100% and
+    +150% ratchet the protective stop (see long_option_stop_target);
+    they are not market sells. Equity trailing stops, ATR stops, and
+    MAX_HOLD_DAYS are not reasons. A filled broker stop is already flat
+    at the broker; this function does not invent that fill.
     """
     try:
         entry = float(entry_premium)
@@ -138,14 +151,141 @@ def option_exit_reason(symbol: str, entry_premium: float, mark: float | None,
             px = 0.0
         if px > 0:
             ratio = px / entry
-    if ratio is not None and ratio >= PROFIT_TAKE_MULT:
-        return f"profit target +{(ratio - 1) * 100:.0f}%"
     if ratio is not None and ratio <= STOP_LOSS_MULT:
         return f"stop -{(1 - ratio) * 100:.0f}%"
     dte = occ_dte(symbol, today)
     if dte is not None and dte <= CLOSE_DTE:
         return f"{dte}d to expiry — theta guard"
     return None
+
+
+def ratchet_observation(position, quote_mid: float | None = None) -> float | None:
+    """Premium used for the profit ratchet: the higher of mark and last.
+
+    Either print at a threshold moves the stop. The -50% flatten still
+    uses premium_mark alone, so a bid last cannot fake a stop-out.
+    """
+    mark = premium_mark(position, quote_mid=quote_mid)
+    try:
+        last = float(getattr(position, "current_price", 0) or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    vals = []
+    if mark is not None and mark > 0:
+        vals.append(float(mark))
+    if last > 0:
+        vals.append(last)
+    return max(vals) if vals else None
+
+
+def long_option_stop_target(entry: float, mark: float | None) -> float:
+    """Sell-stop for a long option.
+
+    Below +100% the stop stays at -50% of premium. At +100% it moves to
+    entry. At +150% it moves to 1.5× entry. This never returns a stop
+    below the -50% floor.
+    """
+    try:
+        basis = abs(float(entry))
+    except (TypeError, ValueError):
+        basis = 0.0
+    floor = round(max(basis * STOP_LOSS_MULT, 0.01), 2) if basis > 0 else 0.01
+    if basis <= 0 or mark is None:
+        return floor
+    try:
+        ratio = float(mark) / basis
+    except (TypeError, ValueError):
+        return floor
+    if ratio >= RATCHET_LOCK_MARK:
+        return round(max(basis * RATCHET_LOCK_STOP, floor), 2)
+    if ratio >= RATCHET_BREAKEVEN_MARK:
+        return round(max(basis * RATCHET_BREAKEVEN_STOP, floor), 2)
+    return floor
+
+
+def ratchet_floor(existing: float | None, target: float, *, long: bool = True) -> float:
+    """Never loosen a protective stop.
+
+    Long premium: a higher price locks more. A later mark that only
+    qualifies for break-even must not walk a +50% lock back down.
+    """
+    try:
+        tgt = float(target)
+    except (TypeError, ValueError):
+        return 0.01
+    if existing is None:
+        return round(tgt, 2)
+    try:
+        cur = float(existing)
+    except (TypeError, ValueError):
+        return round(tgt, 2)
+    if cur <= 0:
+        return round(tgt, 2)
+    if long:
+        return round(max(cur, tgt), 2)
+    return round(min(cur, tgt), 2)
+
+
+def stop_replace_decision(existing: float | None, has_order: bool, target: float,
+                          *, long: bool = True) -> str:
+    """``place``, ``raise``, or ``keep``.
+
+    A resting order whose price we cannot read is kept. Replacing it
+    could stack a second stop or walk protection the wrong way. A cent
+    of rounding is the same stop and is not cancelled.
+    """
+    if not has_order:
+        return "place"
+    if existing is None:
+        return "keep"
+    tightened = ratchet_floor(existing, target, long=long)
+    if long:
+        return "raise" if tightened > float(existing) + 0.009 else "keep"
+    return "raise" if tightened < float(existing) - 0.009 else "keep"
+
+
+def _order_field(order, name, default=None):
+    if isinstance(order, dict):
+        return order.get(name, default)
+    return getattr(order, name, default)
+
+
+def _order_side_name(order) -> str:
+    return str(_order_field(order, "side", "") or "").lower().split(".")[-1]
+
+
+def _order_stop_price(order) -> float | None:
+    raw = _order_field(order, "stop_price", None)
+    if raw is None:
+        raw = _order_field(order, "stop", None)
+    try:
+        if raw is None or raw == "":
+            return None
+        px = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return px if px > 0 else None
+
+
+def closing_option_orders(orders, signed: float, symbol: str) -> list:
+    out = []
+    for order in orders or []:
+        sym = str(_order_field(order, "symbol", "") or "")
+        if sym and sym != symbol:
+            continue
+        side = _order_side_name(order)
+        if signed > 0 and side == "sell":
+            out.append(order)
+        elif signed < 0 and side == "buy":
+            out.append(order)
+    return out
+
+
+def tightest_stop_price(orders, *, long: bool) -> float | None:
+    prices = [px for px in (_order_stop_price(o) for o in orders) if px is not None]
+    if not prices:
+        return None
+    return max(prices) if long else min(prices)
 
 
 def _clients():
@@ -307,8 +447,13 @@ def execute_options_trade(signal: dict) -> dict | None:
         return None
 
 
-def submit_option_protective_stop(client, position) -> dict:
-    """Place a stop that caps a long option near STOP_LOSS_MULT of premium.
+def submit_option_protective_stop(client, position, stop_price=None, mark=None) -> dict:
+    """Place a stop that caps a long option.
+
+    With no ``stop_price``, a long uses the profit ratchet (break-even at
+    +100%, lock +50% at +150%) or the -50% floor when the mark is below
+    that. Pass ``stop_price`` to replace a lower stop with a known target
+    or to restore the previous stop after a rejected raise.
 
     Alpaca rejects trailing stops on option contracts. A plain stop is the
     protective exit the broker can actually hold. GTC is tried first, then
@@ -327,10 +472,18 @@ def submit_option_protective_stop(client, position) -> dict:
     if qty < 1 or basis <= 0:
         return {"placed": False, "error": "qty or premium is zero",
                 "stop_price": None, "qty": qty}
-    # Long premium: sell stop below the debit. Short premium is not how
-    # this book enters, but a buy stop above the credit is the mirror.
-    if signed > 0:
-        stop_px = round(max(basis * STOP_LOSS_MULT, 0.01), 2)
+    # Long premium: sell stop. Short premium is not how this book enters,
+    # but a buy stop above the credit is the mirror. The ratchet is long-only.
+    if stop_price is not None:
+        try:
+            stop_px = round(max(float(stop_price), 0.01), 2)
+        except (TypeError, ValueError):
+            stop_px = round(max(basis * STOP_LOSS_MULT, 0.01), 2)
+        side_name = "sell" if signed > 0 else "buy"
+    elif signed > 0:
+        if mark is None:
+            mark = ratchet_observation(position)
+        stop_px = long_option_stop_target(basis, mark)
         side_name = "sell"
     else:
         stop_px = round(basis / STOP_LOSS_MULT, 2)
@@ -365,6 +518,88 @@ def submit_option_protective_stop(client, position) -> dict:
         "qty": qty,
         "error": "; ".join(errors) or "broker rejected options stop",
     }
+
+
+def _load_symbol_orders(client, symbol: str) -> list:
+    try:
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+        return list(client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, symbols=[symbol], limit=50)))
+    except Exception:
+        try:
+            return [
+                o for o in client.get_orders()
+                if str(_order_field(o, "symbol", "") or "") in ("", symbol)
+            ]
+        except Exception as e:
+            log.warning(f"options: could not list orders for {symbol}: {e}")
+            return []
+
+
+def sync_option_protective_stop(client, position, orders=None, mark=None) -> dict:
+    """Place or raise the long-option sell stop. Never stack, never lower.
+
+    Default stop is -50% of premium. At +100% (mark or last >= 2× entry)
+    the stop moves to entry. At +150% (>= 2.5×) it moves to 1.5× entry.
+    An existing lower stop is cancelled and replaced by one order. An
+    equal or tighter stop is left alone. If the raise is rejected, the
+    previous stop is put back so the contract is not left naked.
+    """
+    sym = str(getattr(position, "symbol", "") or "")
+    try:
+        signed = float(position.qty)
+        basis = abs(float(position.avg_entry_price))
+    except (TypeError, ValueError, AttributeError) as e:
+        return {"action": "refused", "placed": False, "error": str(e),
+                "stop_price": None, "qty": 0, "previous": None}
+    if orders is None:
+        orders = _load_symbol_orders(client, sym)
+    closing = closing_option_orders(orders, signed, sym)
+    long = signed > 0
+    if mark is None and long:
+        mark = ratchet_observation(position)
+    if long:
+        target = long_option_stop_target(basis, mark)
+    else:
+        target = round(basis / STOP_LOSS_MULT, 2) if basis > 0 else None
+    existing = tightest_stop_price(closing, long=long)
+    decision = stop_replace_decision(
+        existing, bool(closing), target or 0.0, long=long,
+    )
+    qty = abs(int(signed)) if signed else 0
+    if decision == "keep" or target is None:
+        return {
+            "action": "keep", "placed": False, "stop_price": existing,
+            "qty": qty, "error": "", "previous": existing,
+        }
+    if decision == "raise":
+        for order in closing:
+            oid = str(_order_field(order, "id", "") or "")
+            if not oid:
+                continue
+            try:
+                client.cancel_order_by_id(oid)
+            except Exception as e:
+                log.warning(f"options: cancel {sym} before ratchet failed: {e}")
+    result = submit_option_protective_stop(
+        client, position, stop_price=target, mark=mark,
+    )
+    if not result.get("placed") and decision == "raise" and existing:
+        restored = submit_option_protective_stop(
+            client, position, stop_price=existing, mark=mark,
+        )
+        return {
+            **result,
+            "action": "refused",
+            "restored": bool(restored.get("placed")),
+            "previous": existing,
+        }
+    result["action"] = "raised" if decision == "raise" and result.get("placed") else (
+        "placed" if result.get("placed") else "refused"
+    )
+    result["previous"] = existing
+    return result
 
 
 def _cancel_symbol_orders(client, sym: str) -> None:
@@ -404,10 +639,10 @@ def _flatten_option(client, sym: str) -> None:
 def manage_options_exits(today: date | None = None) -> None:
     """Exit rules for open option positions.
 
-    Options can't use Alpaca trailing stops, so exits are managed here:
-    take profit at +100%, cut at -50%, and always close before theta
-    accelerates in the final days. Nothing else — not the underlying's
-    stop, not a time stop, not a small mark-to-market loss.
+    Options can't use Alpaca trailing stops. Market-flatten at -50% and
+    at CLOSE_DTE. At +100% / +150% raise the resting sell stop (break-even,
+    then lock +50%) instead of selling the bid. Nothing else — not the
+    underlying's stop, not a time stop, not a small mark-to-market loss.
     """
     if not OPTIONS_ENABLED:
         return
@@ -440,6 +675,18 @@ def manage_options_exits(today: date | None = None) -> None:
             mark = premium_mark(p, quote_mid=quote_mid)
             reason = option_exit_reason(sym, cost_basis, mark, today=today)
             if not reason:
+                observed = ratchet_observation(p, quote_mid=quote_mid)
+                result = sync_option_protective_stop(client, p, mark=observed)
+                if result.get("action") in {"raised", "placed"} and result.get("placed"):
+                    log.info(
+                        f"🎯 OPTIONS RATCHET {sym}: stop ${result.get('stop_price')} "
+                        f"(entry ${cost_basis:.2f} mark ${observed or 0:.2f})"
+                    )
+                elif result.get("action") == "refused":
+                    log.warning(
+                        f"options: {sym} protective stop not updated "
+                        f"({result.get('error')})"
+                    )
                 continue
 
             flattened = True
