@@ -30,6 +30,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from dotenv import load_dotenv
 
@@ -156,6 +157,84 @@ def _halt_cuts_symbol(sym: str, unrealized_pl: float) -> bool:
     if is_option_symbol(sym):
         return False
     return True
+
+
+class EquityEntryBudget(NamedTuple):
+    """New non-crypto entry slots for this tick.
+
+    ``entries_remaining`` is the only count the early cap return and the
+    per-tick budget break may use. ``after_10_limit`` is None before 10:00 ET.
+    """
+
+    entries_remaining: int
+    after_10_limit: int | None
+    opened_today: int
+    opened_after_10: int
+
+
+def _is_non_crypto_symbol(symbol: str | None) -> bool:
+    """Slash symbols are crypto. Same population as the daily equity cap."""
+    return "/" not in (symbol or "")
+
+
+def _opened_at_or_after_10_et(opened_at_et: str | None) -> bool:
+    """True when a ledger open stamp is 10:00:00 ET or later.
+
+    Stamps are naive ET ``YYYY-MM-DD HH:MM:SS`` (a ``T`` separator is accepted).
+    """
+    raw = (opened_at_et or "").strip().replace("T", " ")
+    if len(raw) < 16:
+        return False
+    for length, fmt in ((19, "%Y-%m-%d %H:%M:%S"), (16, "%Y-%m-%d %H:%M")):
+        try:
+            stamp = datetime.strptime(raw[:length], fmt)
+        except ValueError:
+            continue
+        return stamp.hour >= 10
+    return False
+
+
+def equity_entry_budget(trades, cap: int, now_et: datetime) -> EquityEntryBudget:
+    """Daily cap, plus a separate after-10:00 ET budget.
+
+    Before 10:00 ET only the daily cap applies. At or after 10:00 ET, new
+    non-crypto entries for the rest of the day are limited to
+    ``max(1, cap // 2)`` minus entries already opened at or after 10:00 ET,
+    and still cannot exceed ``cap - opened_today``.
+    """
+    from session_gates import now_et as _as_et
+
+    now_et = _as_et(now_et)
+    cap = int(cap)
+    opened_today = 0
+    opened_after_10 = 0
+    for trade in trades:
+        if not _is_non_crypto_symbol(getattr(trade, "symbol", "")):
+            continue
+        opened_today += 1
+        if _opened_at_or_after_10_et(getattr(trade, "opened_at_et", "")):
+            opened_after_10 += 1
+    daily_left = cap - opened_today
+    if now_et.hour < 10:
+        return EquityEntryBudget(daily_left, None, opened_today, opened_after_10)
+    after_limit = max(1, cap // 2)
+    after_left = after_limit - opened_after_10
+    return EquityEntryBudget(
+        min(daily_left, after_left),
+        after_limit,
+        opened_today,
+        opened_after_10,
+    )
+
+
+def entry_slot_open(entries_remaining: int, approved_this_tick: int = 0) -> bool:
+    """True when another new entry still fits in ``entries_remaining``.
+
+    The early cap return calls this with no approvals. The per-tick break
+    calls it with ``len(approved)``. Both must pass the same remaining count
+    from ``equity_entry_budget`` — do not reapply ``max(1, cap // 2)`` here.
+    """
+    return (entries_remaining - approved_this_tick) > 0
 
 
 def _load_benched_agent_names() -> set[str]:
@@ -297,36 +376,52 @@ class Ensemble:
 
         # Step 2a: daily entry budget — once DAILY_TRADE_CAP equity positions
         # have opened today, we're done adding risk until tomorrow.
+        # Concentrate entries in the first hour. Evidence 2026-07-31:
+        # 9-10am ran +$102/trade against the rest of the session on 38
+        # vs 95 trades. After 10:00 ET, new equity entries for the rest of
+        # the day are limited to max(1, cap // 2) minus non-crypto entries
+        # already opened at or after 10:00. Reapplying that ceiling every
+        # tick (2026-10-05: RXO 09:53, then PCVX and XP both after 11:00
+        # against a limit of 1) is not the budget. The daily cap still binds.
+        # entries_remaining from this one call feeds both gates below.
+        _tl = None
+        _now_et = None
+        _today_rows: list = []
         try:
             import trade_ledger as _tl
             from datetime import datetime as _dt
-            _today = _dt.now(_tl.ET).strftime("%Y-%m-%d")
-            opened_today = len([t for t in _tl.trades_on_date(_today)
-                                if "/" not in t.symbol])
+            _now_et = _dt.now(_tl.ET)
         except Exception:
-            opened_today = 0
+            _now_et = None
+        try:
+            if _tl is not None and _now_et is not None:
+                _today_rows = list(_tl.trades_on_date(_now_et.strftime("%Y-%m-%d")))
+        except Exception:
+            _today_rows = []
+        if _now_et is None:
+            try:
+                from datetime import datetime as _dt
+                from zoneinfo import ZoneInfo
+                _now_et = _dt.now(ZoneInfo("America/New_York"))
+            except Exception:
+                _now_et = None
         try:
             from auto_tune import load as _at_cfg
             _cap = int(_at_cfg().get("daily_trade_cap", DAILY_TRADE_CAP))
         except Exception:
             _cap = DAILY_TRADE_CAP
-        entries_remaining = _cap - opened_today
-        # Concentrate entries in the first hour. Evidence 2026-07-31:
-        # 9-10am ran +$102/trade against the rest of the session on 38
-        # vs 95 trades. After 10am, hold back half the daily budget so
-        # the good window is never starved by mediocre later setups.
-        # Logged below. None before 10:00 ET; the same max(1, cap // 2)
-        # value the budget uses once that limit applies. Cap math is unchanged.
-        _after_10_limit = None
-        try:
-            from datetime import datetime as _d2
-            import trade_ledger as _tl2
-            if _d2.now(_tl2.ET).hour >= 10:
-                _after_10_limit = max(1, _cap // 2)
-                entries_remaining = min(entries_remaining, _after_10_limit)
-        except Exception:
-            pass
-        if entries_remaining <= 0:
+        if _now_et is None:
+            opened_today = len([
+                t for t in _today_rows if _is_non_crypto_symbol(getattr(t, "symbol", ""))
+            ])
+            entries_remaining = _cap - opened_today
+            _after_10_limit = None
+        else:
+            _eb = equity_entry_budget(_today_rows, _cap, _now_et)
+            entries_remaining = _eb.entries_remaining
+            _after_10_limit = _eb.after_10_limit
+            opened_today = _eb.opened_today
+        if not entry_slot_open(entries_remaining):
             _cap_shown = f"{opened_today}/{_cap}"
             if _after_10_limit is not None:
                 _cap_shown += f", after-10:00-ET limit {_after_10_limit}"
@@ -566,7 +661,10 @@ class Ensemble:
                     )
                     continue
 
-                if len(approved) >= entries_remaining:
+                # Same entries_remaining as the early cap return. Do not
+                # recompute max(1, cap // 2) — that ceiling is already
+                # reduced by entries opened at or after 10:00 ET.
+                if not entry_slot_open(entries_remaining, len(approved)):
                     _budget = f"{_cap}/day"
                     if _after_10_limit is not None:
                         _budget += f", after-10:00-ET limit {_after_10_limit}"
