@@ -30,6 +30,9 @@ Cron entry (no change required):
 The cron email is the plain-English note in plain_report.py (one a day:
 daily, weekly on the last session of the week, monthly on the last
 session of the month). --preview YYYY-MM-DD prints it and does not send.
+Day P&L and equity use Alpaca's settled portfolio-history closes. When
+today's daily bar is not posted yet, the note uses live equity minus the
+prior history close and labels that figure preliminary.
 """
 
 from __future__ import annotations
