@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +32,9 @@ from plain_report import (
     direction_pts,
     _load_history,
     equity_from_history_payload,
+    is_day_preliminary,
+    load_view,
+    settled_close_for_day,
     go_no_go_status,
     is_alert_text,
     legacy_realized,
@@ -165,6 +168,9 @@ class SubjectWording(unittest.TestCase):
         )
 
     def test_late_official_bar_uses_account_and_last_equity(self):
+        # Today's bar is missing, so the live equity is labeled preliminary.
+        # The prior history close matches last_equity in this fixture, so
+        # the dollars still match the settled note.
         official = fixture_view()
         late = fixture_view(
             equity_by_day={THU: 78131.09, PRIOR_FRI: 78967.12},
@@ -172,15 +178,23 @@ class SubjectWording(unittest.TestCase):
             last_equity=78131.09,
             live_equity=True,
         )
+        self.assertFalse(is_day_preliminary(FRI, official))
+        self.assertTrue(is_day_preliminary(FRI, late))
         for cadence in ("daily", "weekly"):
             a = build_email(FRI, cadence, official)
             b = build_email(FRI, cadence, late)
-            self.assertEqual(a.subject, b.subject)
+            self.assertNotIn("preliminary", a.subject)
+            self.assertNotIn("preliminary", a.body.lower())
+            self.assertIn("(preliminary)", b.subject)
+            self.assertIn("preliminary", b.body.lower())
             for word in ("provisional", "estimate", "unofficial", "intraday", "last_equity"):
                 self.assertNotIn(word, b.body.lower())
-            self.assertIn("equity $78,671.07", b.body)
+            self.assertIn("equity $78,671.07 (preliminary)", b.body)
             self.assertIn("$3,671.07 above the $75,000 line", b.body)
             self.assertIn("All-time drawdown from the $100,000 start: $21,328.93.", b.body)
+        self.assertIn("UP $540 (preliminary)", build_email(FRI, "daily", late).subject)
+        self.assertIn("DOWN $296 (preliminary)", build_email(FRI, "weekly", late).subject)
+        self.assertIn("(up $540, preliminary)", build_email(FRI, "daily", late).body)
 
     def test_missing_broker_does_not_invent_numbers(self):
         email = build_email(date(2026, 10, 1), "daily", MarketView())
@@ -625,6 +639,198 @@ class Cli(unittest.TestCase):
         self.assertNotIn("Traceback", proc.stderr)
         self.assertIn("unavailable", proc.stdout)
         self.assertNotIn("UP $", proc.stdout.split("Subject:", 1)[-1].splitlines()[0])
+
+
+MON = date(2026, 10, 5)
+# 10/5 settled close from portfolio history. Prior close is the number
+# that makes that day -$391.
+SETTLED_CLOSE = 78280.10
+PRIOR_CLOSE = SETTLED_CLOSE + 391  # 78671.10
+
+
+def _next_utc_midnight(session: date) -> str:
+    """Portfolio-history 1D bars are stamped the next UTC midnight."""
+    nxt = session + timedelta(days=1)
+    return f"{nxt.isoformat()}T00:00:00Z"
+
+
+class SettledDayPnL(unittest.TestCase):
+    """Day P&L comes from portfolio-history closes, not the live account."""
+
+    def _load(self, history, account, *, history_error=False):
+        periods = []
+
+        def fake_get(url, headers, params=None):
+            if "portfolio/history" in url:
+                period = (params or {}).get("period")
+                periods.append(period)
+                self.assertEqual((params or {}).get("timeframe"), "1D")
+                if history_error:
+                    raise RuntimeError("portfolio history unavailable")
+                if callable(history):
+                    return history(period)
+                return history
+            if url.endswith("/v2/account"):
+                return account
+            if url.endswith("/v2/positions"):
+                return []
+            raise RuntimeError("unexpected url")
+
+        spy = {date(2026, 10, 2): 100.0, MON: 100.0}
+        with patch.dict(os.environ, {
+            "ALPACA_API_KEY": "test-key",
+            "ALPACA_API_SECRET": "test-secret",
+        }), patch("plain_report._get_json", side_effect=fake_get), \
+             patch("plain_report._load_spy", return_value=spy), \
+             patch("plain_report._load_trades", return_value=[]), \
+             patch("plain_report.collect_alerts", return_value=[]):
+            view = load_view(MON, live=True)
+        return view, periods
+
+    def test_settled_close_day_pnl_uses_prior_history_close(self):
+        # Live equity would have printed DOWN $531. The settled day is -$391.
+        history = {
+            "timestamp": [_next_utc_midnight(date(2026, 10, 2)), _next_utc_midnight(MON)],
+            "equity": [PRIOR_CLOSE, SETTLED_CLOSE],
+            "timeframe": "1D",
+        }
+        self.assertEqual(settled_close_for_day(history, MON), SETTLED_CLOSE)
+        view, periods = self._load(
+            history,
+            {"equity": PRIOR_CLOSE - 531, "last_equity": 77000.0},
+        )
+        self.assertEqual(periods, ["1A", "3M", "1M", "1W"])
+        self.assertEqual(view.equity_by_day[MON], SETTLED_CLOSE)
+        self.assertEqual(view.equity_by_day[date(2026, 10, 2)], PRIOR_CLOSE)
+        self.assertFalse(is_day_preliminary(MON, view))
+        email = build_email(MON, "daily", view)
+        self.assertEqual(
+            email.subject,
+            "Trading [PAPER] Daily 10/5/2026: DOWN $391, BEHIND S&P by 0.50 pts",
+        )
+        self.assertNotIn("preliminary", email.subject.lower())
+        self.assertNotIn("preliminary", email.body.lower())
+        self.assertIn("down 0.50%", email.body)
+        self.assertIn("(down $391).", email.body)
+        self.assertIn("equity $78,280.10,", email.body)
+        self.assertIn(
+            "Since the new plan (Mon 10/5): the bot was down 0.50%",
+            email.body,
+        )
+        self.assertNotIn("531", email.subject)
+        self.assertNotIn("78,140", email.body)
+
+    def test_session_et_stamp_is_also_a_settled_close(self):
+        # A bar timestamped on the session's own ET date (4:00 PM ET) is
+        # today's close even though the UTC-minus-one map lands on Sunday.
+        history = {
+            "timestamp": ["2026-10-03T00:00:00Z", "2026-10-05T20:00:00Z"],
+            "equity": [PRIOR_CLOSE, SETTLED_CLOSE],
+        }
+        self.assertEqual(settled_close_for_day(history, MON), SETTLED_CLOSE)
+        view, _periods = self._load(history, {"equity": 1.0, "last_equity": 1.0})
+        email = build_email(MON, "daily", view)
+        self.assertIn("DOWN $391", email.subject)
+        self.assertNotIn("preliminary", email.subject.lower())
+
+    def test_missing_today_bar_is_preliminary(self):
+        # Latest stamp is Friday's close (Saturday 00:00 UTC), before Monday.
+        history = {
+            "timestamp": [_next_utc_midnight(date(2026, 10, 2))],
+            "equity": [PRIOR_CLOSE],
+            "timeframe": "1D",
+        }
+        self.assertIsNone(settled_close_for_day(history, MON))
+        live = PRIOR_CLOSE - 142
+        view, _periods = self._load(
+            history,
+            {"equity": live, "last_equity": 77000.0},
+        )
+        self.assertNotIn(MON, view.equity_by_day)
+        self.assertTrue(is_day_preliminary(MON, view))
+        email = build_email(MON, "daily", view)
+        self.assertIn(
+            "Trading [PAPER] Daily 10/5/2026: DOWN $142 (preliminary)",
+            email.subject,
+        )
+        self.assertIn("down $142 (preliminary) today", email.body)
+        self.assertIn("(down $142, preliminary)", email.body)
+        self.assertIn("equity $78,529.10 (preliminary)", email.body)
+        # last_equity would have been live 78529.10 minus 77000 = UP $1,529.
+        self.assertNotIn("UP $1,529", email.subject)
+        self.assertNotIn("UP $1,529", email.body)
+        for section in ("Today:", "Since the new plan", "Today's standing:", "OLD LOSSES", FOOTER):
+            self.assertIn(section, email.body)
+
+    def test_null_or_zero_today_bar_is_preliminary(self):
+        live = PRIOR_CLOSE - 142
+        account = {"equity": live, "last_equity": 77000.0}
+        for bad in (None, 0, 0.0):
+            history = {
+                "timestamp": [
+                    _next_utc_midnight(date(2026, 10, 2)),
+                    _next_utc_midnight(MON),
+                ],
+                "equity": [PRIOR_CLOSE, bad],
+            }
+            self.assertIsNone(settled_close_for_day(history, MON))
+            view, _periods = self._load(history, account)
+            email = build_email(MON, "daily", view)
+            self.assertIn("DOWN $142 (preliminary)", email.subject)
+            self.assertNotIn("DOWN $391", email.subject)
+
+    def test_one_week_missing_today_overrides_a_longer_window(self):
+        long = {
+            "timestamp": [_next_utc_midnight(date(2026, 10, 2)), _next_utc_midnight(MON)],
+            "equity": [PRIOR_CLOSE, SETTLED_CLOSE],
+        }
+        short = {
+            "timestamp": [_next_utc_midnight(date(2026, 10, 2))],
+            "equity": [PRIOR_CLOSE],
+        }
+        view, _periods = self._load(
+            lambda period: short if period in ("1W", "1M") else long,
+            {"equity": PRIOR_CLOSE - 142, "last_equity": 77000.0},
+        )
+        email = build_email(MON, "daily", view)
+        self.assertIn("DOWN $142 (preliminary)", email.subject)
+        self.assertNotIn(MON, view.equity_by_day)
+
+    def test_all_zero_week_keeps_the_settled_longer_window(self):
+        long = {
+            "timestamp": [_next_utc_midnight(date(2026, 10, 2)), _next_utc_midnight(MON)],
+            "equity": [PRIOR_CLOSE, SETTLED_CLOSE],
+        }
+        zeros = {
+            "timestamp": [_next_utc_midnight(date(2026, 10, 2))] * 3,
+            "equity": [0.0, 0.0, 0.0],
+        }
+        view, _periods = self._load(
+            lambda period: zeros if period in ("1W", "1M") else long,
+            {"equity": 1.0, "last_equity": 1.0},
+        )
+        email = build_email(MON, "daily", view)
+        self.assertIn("DOWN $391", email.subject)
+        self.assertNotIn("preliminary", email.subject.lower())
+        self.assertEqual(view.equity_by_day[MON], SETTLED_CLOSE)
+
+    def test_history_api_error_falls_back_without_crashing(self):
+        view, periods = self._load(
+            {},
+            {"equity": 78000.0, "last_equity": PRIOR_CLOSE},
+            history_error=True,
+        )
+        self.assertEqual(periods, ["1A", "3M", "1M", "1W"])
+        self.assertEqual(view.equity_by_day, {})
+        self.assertTrue(is_day_preliminary(MON, view))
+        email = build_email(MON, "daily", view)
+        # Old behavior: live equity minus last_equity, now labeled preliminary.
+        self.assertIn("DOWN $671 (preliminary)", email.subject)
+        self.assertIn("preliminary", email.body)
+        self.assertIn("[PAPER]", email.subject)
+        self.assertNotIn("DOWN $391", email.subject)
+        for section in ("Today:", "Since the new plan", "Today's standing:", "OLD LOSSES", FOOTER):
+            self.assertIn(section, email.body)
 
 
 if __name__ == "__main__":

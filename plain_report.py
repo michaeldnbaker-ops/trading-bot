@@ -11,14 +11,18 @@ One plain-English note per trading day, in three cadences:
   monthly  the last trading day of the month. Replaces daily and weekly.
 
 Money is the broker only: Alpaca portfolio history for official daily
-closes, account equity / last_equity when today's 1D bar is not posted
-yet, Alpaca positions for the open book, broker-fill round trips for
-trade stats, and SPY close-to-close for the same dates. The ledger is
-used only to name a round trip News or Breakout. It is never a dollar.
+closes (period 1W or 1M, timeframe 1D, with 1A/3M filling older days),
+account equity minus the prior history close when today's 1D bar is not
+posted yet, and account equity minus last_equity only when portfolio
+history itself cannot be read. A figure that is not the settled close
+is labeled preliminary. Alpaca positions are the open book, broker-fill
+round trips are the trade stats, and SPY close-to-close uses the same
+dates. The ledger is used only to name a round trip News or Breakout.
+It is never a dollar.
 
 Alpaca's 1D portfolio bars are stamped the next UTC day. A Friday close
 arrives with a Saturday UTC timestamp; the session date is that UTC
-date minus one day.
+date minus one day. That stamp's ET date is the session date.
 
 This module only reads. It does not submit, cancel, or close orders.
 With no .env and no network every figure is "unavailable" or
@@ -259,14 +263,31 @@ def period_stats(end_eq, start_eq, end_spy, start_spy) -> PeriodStats | None:
     return PeriodStats(dollars=end_eq - start_eq, bot_pct=bot, spy_pct=spy, pts=bot - spy)
 
 
-def equity_on(day: date | None, as_of: date, view: MarketView) -> Decimal | None:
-    if day is None:
+def history_close(day: date | None, view: MarketView) -> Decimal | None:
+    """A settled portfolio-history close. Live account equity is not used."""
+    if day is None or day not in view.equity_by_day:
         return None
-    if day in view.equity_by_day:
-        value = view.equity_by_day[day]
-        if value is None or D(value) <= 0:
-            return None
-        return D(value)
+    value = view.equity_by_day[day]
+    if value is None or D(value) <= 0:
+        return None
+    return D(value)
+
+
+def is_day_preliminary(as_of: date, view: MarketView) -> bool:
+    """True when today's equity is the live account, not a settled 1D close."""
+    if not view.live_equity:
+        return False
+    if history_close(as_of, view) is not None:
+        return False
+    if view.account_equity is None or D(view.account_equity) <= 0:
+        return False
+    return True
+
+
+def equity_on(day: date | None, as_of: date, view: MarketView) -> Decimal | None:
+    found = history_close(day, view)
+    if found is not None:
+        return found
     if view.live_equity and day == as_of and view.account_equity is not None:
         if D(view.account_equity) <= 0:
             return None
@@ -275,12 +296,20 @@ def equity_on(day: date | None, as_of: date, view: MarketView) -> Decimal | None
 
 
 def daily_start_equity(as_of: date, view: MarketView) -> Decimal | None:
-    """Yesterday's close. Official bar, or last_equity when today's bar is late."""
-    if as_of not in view.equity_by_day and view.live_equity and view.last_equity is not None:
-        if D(view.last_equity) <= 0:
-            return None
+    """Prior session's close.
+
+    The portfolio-history close is used whenever that bar exists, including
+    when today's bar is still missing. last_equity is only the fallback
+    when history has no prior close (the history call failed).
+    """
+    prior = history_close(previous_trading_day(as_of), view)
+    if prior is not None:
+        return prior
+    if history_close(as_of, view) is not None:
+        return None
+    if view.live_equity and view.last_equity is not None and D(view.last_equity) > 0:
         return D(view.last_equity)
-    return equity_on(previous_trading_day(as_of), as_of, view)
+    return None
 
 
 def spy_on(day: date | None, view: MarketView) -> Decimal | None:
@@ -326,16 +355,26 @@ def since_plan_stats(as_of: date, view: MarketView) -> PeriodStats | None:
 
 # ── Subject and sentences ────────────────────────────────────────────────────
 
+def _day_mark(as_of: date, view: MarketView) -> str:
+    """Suffix for a dollar figure that uses unsettled live equity."""
+    return " (preliminary)" if is_day_preliminary(as_of, view) else ""
+
+
 def subject_line(cadence: str, as_of: date, view: MarketView) -> str:
     title = {"daily": "Daily", "weekly": "Weekly", "monthly": "Monthly"}[cadence]
     head = f"Trading [PAPER] {title} {_mdy(as_of)}: "
     stats = stats_for(cadence, as_of, view)
     if stats is None:
         return head + "unavailable"
-    return head + f"{direction_dollars(stats.dollars)}, {direction_pts(stats.pts)}"
+    # Every cadence's headline ends on today's equity. Label it when that
+    # equity is the live account rather than the settled daily close.
+    return head + (
+        f"{direction_dollars(stats.dollars)}{_day_mark(as_of, view)}, "
+        f"{direction_pts(stats.pts)}"
+    )
 
 
-def opening_sentence(cadence: str, stats: PeriodStats | None) -> str:
+def opening_sentence(cadence: str, stats: PeriodStats | None, *, preliminary: bool = False) -> str:
     period = {"daily": "today", "weekly": "this week", "monthly": "this month"}[cadence]
     if stats is None:
         return f"The paper account's result for {period} is unavailable."
@@ -346,30 +385,39 @@ def opening_sentence(cadence: str, stats: PeriodStats | None) -> str:
         rel = f"ahead of the S&P by {abs(pts_rounded):.2f} points"
     else:
         rel = f"behind the S&P by {abs(pts_rounded):.2f} points"
+    mark = " (preliminary)" if preliminary else ""
     return (
-        f"The paper account was {moved} ${abs(rounded):,.0f} {period}, {rel}."
+        f"The paper account was {moved} ${abs(rounded):,.0f}{mark} {period}, {rel}."
     )
 
 
-def format_period_line(label: str, stats: PeriodStats | None) -> str:
+def format_period_line(label: str, stats: PeriodStats | None, *, preliminary: bool = False) -> str:
     if stats is None:
         return f"{label}: unavailable."
+    dollars = dollar_phrase(stats.dollars)
+    if preliminary:
+        dollars = f"{dollars}, preliminary"
     return (
         f"{label}: the bot was {pct_phrase(stats.bot_pct)} and the S&P was "
         f"{pct_phrase(stats.spy_pct)}, {pts_phrase(stats.pts)} "
-        f"({dollar_phrase(stats.dollars)})."
+        f"({dollars})."
     )
 
 
 def period_block(cadence: str, as_of: date, view: MarketView) -> str:
+    preliminary = is_day_preliminary(as_of, view)
     today = _pair(as_of, None, view, daily=True)
-    lines = [format_period_line("Today", today)]
+    lines = [format_period_line("Today", today, preliminary=preliminary)]
     if cadence == "weekly" or (cadence == "monthly" and shows_week_line(as_of)):
         anchor = previous_trading_day(_week_monday(as_of))
-        lines.append(format_period_line("This week", _pair(as_of, anchor, view, daily=False)))
+        lines.append(format_period_line(
+            "This week", _pair(as_of, anchor, view, daily=False), preliminary=preliminary,
+        ))
     if cadence == "monthly":
         anchor = previous_trading_day(date(as_of.year, as_of.month, 1))
-        lines.append(format_period_line("This month", _pair(as_of, anchor, view, daily=False)))
+        lines.append(format_period_line(
+            "This month", _pair(as_of, anchor, view, daily=False), preliminary=preliminary,
+        ))
     return "\n".join(lines)
 
 
@@ -440,10 +488,13 @@ def section_three(as_of: date, view: MarketView) -> str:
     if stats is None:
         line = f"Since the new plan (Mon 10/5): unavailable. {status}"
     else:
+        dollars = dollar_phrase(stats.dollars)
+        if is_day_preliminary(as_of, view):
+            dollars = f"{dollars}, preliminary"
         line = (
             f"Since the new plan (Mon 10/5): the bot was {pct_phrase(stats.bot_pct)} "
             f"and the S&P was {pct_phrase(stats.spy_pct)}, {pts_phrase(stats.pts)} "
-            f"({dollar_phrase(stats.dollars)}). {status}"
+            f"({dollars}). {status}"
         )
     return line + "\n" + "\n".join(trade_lines(view.trades))
 
@@ -456,8 +507,8 @@ def standing_line(as_of: date, view: MarketView) -> str:
         gap = equity - D(TRIPWIRE)
         side = "above" if gap >= 0 else "below"
         book = (
-            f"equity {level_dollars(equity)}, {level_dollars(abs(gap))} {side} "
-            f"the $75,000 line"
+            f"equity {level_dollars(equity)}{_day_mark(as_of, view)}, "
+            f"{level_dollars(abs(gap))} {side} the $75,000 line"
         )
     if view.positions is None:
         # A past-date preview does not load the live book. A live fetch that
@@ -566,7 +617,7 @@ def next_changes_block(cadence: str, as_of: date, path: Path) -> str:
 def render_body(cadence: str, as_of: date, view: MarketView, path: Path) -> str:
     stats = stats_for(cadence, as_of, view)
     blocks = [
-        opening_sentence(cadence, stats),
+        opening_sentence(cadence, stats, preliminary=is_day_preliminary(as_of, view)),
         period_block(cadence, as_of, view),
         section_three(as_of, view),
     ]
@@ -666,6 +717,114 @@ def equity_from_history_payload(payload: dict) -> dict[date, float]:
             continue
         out[session_date_for_portfolio_bar(ts)] = value
     return out
+
+
+def _history_bars(payload: dict) -> list[tuple[datetime, float | None]]:
+    """Every bar, including null and zero equity. Those mean 'not settled'."""
+    if not isinstance(payload, dict):
+        return []
+    stamps = payload.get("timestamp") or []
+    equities = payload.get("equity") or []
+    bars: list[tuple[datetime, float | None]] = []
+    for raw_ts, raw_eq in zip(stamps, equities):
+        ts = _parse_stamp(raw_ts)
+        if ts is None:
+            continue
+        if raw_eq in (None, ""):
+            bars.append((ts, None))
+            continue
+        try:
+            value = float(raw_eq)
+        except (TypeError, ValueError):
+            bars.append((ts, None))
+            continue
+        bars.append((ts, value))
+    return bars
+
+
+def settled_close_for_day(payload: dict, as_of: date) -> float | None:
+    """Today's portfolio-history close, or None when that daily bar is absent.
+
+    Absent when there is no bar, the latest bar's ET date is before
+    `as_of`, or that bar's equity is null or 0. A next-UTC-midnight stamp
+    (Tuesday 00:00 UTC) falls on Monday evening ET, so its ET date is the
+    session. A bar timestamped on the session's own ET date counts too.
+    """
+    bars = _history_bars(payload)
+    if not bars:
+        return None
+    ts, eq = max(bars, key=lambda item: item[0])
+    et_day = ts.astimezone(ET).date()
+    if et_day < as_of:
+        return None
+    if eq is None or eq <= 0:
+        return None
+    session = session_date_for_portfolio_bar(ts)
+    if session != as_of and et_day != as_of:
+        return None
+    return eq
+
+
+def _fetch_portfolio_history(headers: dict, period: str) -> dict | None:
+    """GET paper portfolio history. None on any failure. Never logs secrets."""
+    try:
+        payload = _get_json(
+            f"{PAPER_API}/v2/account/portfolio/history",
+            headers,
+            {"period": period, "timeframe": "1D"},
+        )
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _fill_equity_from_history(view: MarketView, headers: dict, as_of: date) -> None:
+    """Settled daily closes from portfolio history. Never raises.
+
+    1W and 1M are the source for today's close. 1A and 3M fill older
+    sessions (the week, the month, and the close before the plan). When
+    the short window answers and today's bar is missing, a today point
+    from the long window is dropped so the email uses live equity and
+    says preliminary. When every history call fails, equity_by_day stays
+    empty and the day falls back to account equity minus last_equity.
+    """
+    merged: dict[date, float] = {}
+    long_settled: float | None = None
+    short_settled: float | None = None
+    saw_short = False
+    for period in ("1A", "3M"):
+        payload = _fetch_portfolio_history(headers, period)
+        if payload is None:
+            continue
+        for day, value in equity_from_history_payload(payload).items():
+            merged[day] = value
+        close = settled_close_for_day(payload, as_of)
+        if close is not None:
+            long_settled = close
+    for period in ("1M", "1W"):
+        payload = _fetch_portfolio_history(headers, period)
+        if payload is None:
+            continue
+        parsed = equity_from_history_payload(payload)
+        close = settled_close_for_day(payload, as_of)
+        # An empty or all-zero window is the old Alpaca "no history" shape.
+        # It is not a verdict that today's bar is missing.
+        if not parsed and close is None:
+            continue
+        saw_short = True
+        for day, value in parsed.items():
+            merged[day] = value
+        # 1W replaces 1M. A short window that lacks today's bar clears it.
+        short_settled = close
+    if short_settled is not None:
+        merged[as_of] = short_settled
+    elif saw_short:
+        merged.pop(as_of, None)
+    elif long_settled is not None:
+        merged[as_of] = long_settled
+    else:
+        merged.pop(as_of, None)
+    view.equity_by_day = merged
 
 
 def spy_from_bars(bars: list) -> dict[date, float]:
@@ -948,7 +1107,7 @@ def load_view(as_of: date, *, live: bool) -> MarketView:
         view.account_equity, view.last_equity = _load_account(headers)
         view.positions = _load_positions(headers)
     if headers:
-        view.equity_by_day = _load_history(headers)
+        _fill_equity_from_history(view, headers, as_of)
     view.spy_by_day = _load_spy(headers, as_of)
     try:
         view.trades = _load_trades()
