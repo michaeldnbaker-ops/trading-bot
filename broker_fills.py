@@ -19,6 +19,13 @@ leaf participated in the round trip.
 When no closed fill matches a ledger row, scoring uses ledger
 realized_pnl and logs the trade id. That is the only fallback.
 
+A ledger row that carries entry_order_id and exit_order_id is priced
+from those two orders' average fills. FIFO is only the fallback for
+rows that do not have both ids, and it does not reuse fills already
+claimed by an order-id match. Full history is required: a short window
+drops July fills, and FIFO on that history pairs a later sell with an
+older lot the broker still holds.
+
 This module does not submit orders and does not write the ledger.
 `fetch_round_trips` is read-only (activities, closed orders, positions).
 """
@@ -403,11 +410,7 @@ def normalize_fill(raw) -> Optional[dict]:
     }
 
 
-def build_round_trips(fills: Iterable) -> list[RoundTrip]:
-    """FIFO round trips. Partial fills on one entry become separate slices.
-
-    An opening lot that never closes is not a trip (still open at the broker).
-    """
+def _normalized_fills(fills: Iterable) -> list[dict]:
     rows = []
     for raw in fills:
         if isinstance(raw, dict) and raw.get("time") and raw.get("side") in {"buy", "sell"}:
@@ -417,12 +420,91 @@ def build_round_trips(fills: Iterable) -> list[RoundTrip]:
         if norm:
             rows.append(norm)
     rows.sort(key=lambda f: parse_time(f["time"]) or datetime.min.replace(tzinfo=timezone.utc))
+    return rows
+
+
+def _order_vwap(parts: list[dict]) -> tuple[float, float, str, str]:
+    """qty, average price, earliest time, latest time."""
+    qty = sum(float(p["qty"]) for p in parts)
+    avg = sum(float(p["price"]) * float(p["qty"]) for p in parts) / qty
+    earliest = min(parts, key=lambda p: parse_time(p["time"]) or datetime.max.replace(tzinfo=timezone.utc))
+    latest = max(parts, key=lambda p: parse_time(p["time"]) or datetime.min.replace(tzinfo=timezone.utc))
+    return qty, avg, str(earliest["time"]), str(latest["time"])
+
+
+def _trips_from_order_ids(rows: list[dict], trades: Iterable) -> tuple[list[RoundTrip], set[int]]:
+    """Round trips whose entry and exit orders are on the ledger row.
+
+    P&L is (exit average − entry average) × filled qty, short sign and
+    the option multiplier included. Fills used here are not offered to FIFO,
+    so a later sell is not paired with an older lot the broker still holds.
+    """
+    by_order: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        oid = str(row.get("order_id") or "")
+        if oid:
+            by_order.setdefault(oid, []).append(i)
+    consumed: set[int] = set()
+    trips: list[RoundTrip] = []
+    used_pairs: set[tuple[str, str]] = set()
+    closed = [t for t in trades or [] if not getattr(t, "is_open", False)]
+    closed.sort(key=lambda t: getattr(t, "opened_at_et", "") or "")
+    for trade in closed:
+        eid = str(getattr(trade, "entry_order_id", "") or "")
+        xid = str(getattr(trade, "exit_order_id", "") or "")
+        if not eid or not xid or eid == xid or (eid, xid) in used_pairs:
+            continue
+        e_idx = [i for i in by_order.get(eid, []) if i not in consumed]
+        x_idx = [i for i in by_order.get(xid, []) if i not in consumed]
+        if not e_idx or not x_idx:
+            continue
+        e_fills = [rows[i] for i in e_idx]
+        x_fills = [rows[i] for i in x_idx]
+        if norm_symbol(e_fills[0]["symbol"]) != norm_symbol(x_fills[0]["symbol"]):
+            continue
+        e_qty, e_avg, e_time, _e_last = _order_vwap(e_fills)
+        x_qty, x_avg, _x_first, x_time = _order_vwap(x_fills)
+        qty = min(e_qty, x_qty)
+        if qty <= 0:
+            continue
+        symbol = str(e_fills[0]["symbol"])
+        side = position_side(getattr(trade, "side", ""))
+        trips.append(RoundTrip(
+            symbol=symbol,
+            side=side,
+            qty=round(qty, 8),
+            entry_price=round(e_avg, 4),
+            exit_price=round(x_avg, 4),
+            entry_time=e_time,
+            exit_time=x_time,
+            realized_pnl=realized_pnl(side, e_avg, x_avg, qty, symbol),
+            order_ids=(eid, xid),
+        ))
+        consumed.update(e_idx)
+        consumed.update(x_idx)
+        used_pairs.add((eid, xid))
+    return trips, consumed
+
+
+def build_round_trips(fills: Iterable, trades: Iterable | None = None) -> list[RoundTrip]:
+    """Round trips. Order ids first when `trades` carries them; FIFO after.
+
+    Partial fills on one FIFO entry become separate slices. An order-id
+    match is one trip at the two orders' average fills. An opening lot
+    that never closes is not a trip (still open at the broker).
+    """
+    rows = _normalized_fills(fills)
+    consumed: set[int] = set()
+    oid_trips: list[RoundTrip] = []
+    if trades:
+        oid_trips, consumed = _trips_from_order_ids(rows, trades)
+    remaining = [row for i, row in enumerate(rows) if i not in consumed]
 
     by_symbol: dict[str, list[dict]] = {}
-    for row in rows:
+    for row in remaining:
         by_symbol.setdefault(row["symbol"], []).append(row)
 
-    trips: list[RoundTrip] = []
+    trips: list[RoundTrip] = list(oid_trips)
     for symbol, prints in by_symbol.items():
         trips.extend(_fifo_symbol(symbol, prints))
     return trips
@@ -521,23 +603,55 @@ def slices_for_trade(trade, trips: Optional[list[RoundTrip]], *, warn_unmatched:
     ]
 
 
-def assign_round_trips(trades: Iterable, trips: list[RoundTrip]) -> dict[str, list[RoundTrip]]:
-    """Greedy closest-open-time match. Each trip is used at most once.
+_MATCH_COUNTS = {"order_id": 0, "fifo": 0, "unmatched": 0}
 
-    Qty stops the match once the ledger size is covered, so a later round
-    trip on the same symbol stays available for the next row. Price is not
-    a reject: signal price vs fill average is one of the gaps we measure.
+
+def match_method_counts() -> dict[str, int]:
+    """How the last assign_round_trips call priced closed rows."""
+    return dict(_MATCH_COUNTS)
+
+
+def assign_round_trips(trades: Iterable, trips: list[RoundTrip]) -> dict[str, list[RoundTrip]]:
+    """Order-id match first, then greedy closest-open-time FIFO.
+
+    Each trip is used at most once. Qty stops the FIFO match once the
+    ledger size is covered, so a later round trip on the same symbol
+    stays available for the next row. Price is not a reject: signal
+    price vs fill average is one of the gaps we measure.
+
+    A row with both order ids claims the trip built from those orders
+    even when FIFO would have paired the sell with an older open lot.
     """
+    global _MATCH_COUNTS
     pools: dict[tuple[str, str], list[int]] = {}
+    by_pair: dict[tuple[str, str], list[int]] = {}
     for i, trip in enumerate(trips):
         pools.setdefault((norm_symbol(trip.symbol), trip.side), []).append(i)
+        ids = tuple(trip.order_ids)
+        if len(ids) >= 2 and ids[0] and ids[1]:
+            by_pair.setdefault((str(ids[0]), str(ids[1])), []).append(i)
 
     used: set[int] = set()
     out: dict[str, list[RoundTrip]] = {}
     closed = [t for t in trades if not getattr(t, "is_open", False)]
     closed.sort(key=lambda t: getattr(t, "opened_at_et", "") or "")
     window = MATCH_WINDOW.total_seconds()
+    order_id_n = 0
+    fifo_n = 0
+    pending = []
     for trade in closed:
+        eid = str(getattr(trade, "entry_order_id", "") or "")
+        xid = str(getattr(trade, "exit_order_id", "") or "")
+        tid = str(getattr(trade, "trade_id", ""))
+        if eid and xid:
+            hits = [i for i in by_pair.get((eid, xid), []) if i not in used]
+            if hits:
+                out[tid] = [trips[i] for i in hits]
+                used.update(hits)
+                order_id_n += 1
+                continue
+        pending.append(trade)
+    for trade in pending:
         key = (norm_symbol(getattr(trade, "symbol", "")), position_side(getattr(trade, "side", "")))
         opened = parse_time(getattr(trade, "opened_at_et", ""))
         candidates = [i for i in pools.get(key, []) if i not in used]
@@ -563,6 +677,10 @@ def assign_round_trips(trades: Iterable, trips: list[RoundTrip]) -> dict[str, li
             if need <= 0:
                 break
         out[str(getattr(trade, "trade_id", ""))] = chosen
+        if chosen:
+            fifo_n += 1
+    unmatched = len(closed) - order_id_n - fifo_n
+    _MATCH_COUNTS = {"order_id": order_id_n, "fifo": fifo_n, "unmatched": unmatched}
     return out
 
 
@@ -733,42 +851,63 @@ class _ReadOnly:
         return getattr(self._client, name)
 
 
-def _activity_pages(client):
-    """Yield FILL activities. Stops after 50 pages."""
-    try:
-        from alpaca.trading.enums import ActivityType
-        from alpaca.trading.requests import GetAccountActivitiesRequest
-    except Exception:
-        ActivityType = None
-        GetAccountActivitiesRequest = None
+def activity_after_date(trades: Iterable | None = None) -> Optional[str]:
+    """YYYY-MM-DD, 30 days before the ledger's earliest opened_at.
 
+    That is the first date a row was opened, not merely the oldest position
+    still open. A window that starts at the oldest live lot drops the July
+    closes the scorer still has to price. The 30 days cover an entry fill
+    that printed before the log line.
+    """
+    if trades is None:
+        try:
+            import trade_ledger as tl
+            trades = tl.all_trades()
+        except Exception:
+            return None
+    opened: list[str] = []
+    for trade in trades or []:
+        raw = str(getattr(trade, "opened_at_et", "") or "")[:10]
+        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+            opened.append(raw)
+    if not opened:
+        return None
+    earliest = datetime.strptime(min(opened), "%Y-%m-%d").date() - timedelta(days=30)
+    return earliest.isoformat()
+
+
+def _activity_pages(client, after: Optional[str] = None):
+    """Yield FILL activities, oldest first, until a short page.
+
+    alpaca-py 0.43.4 TradingClient has no get_account_activities. The
+    REST helper is client.get('/account/activities/FILL', params).
+    """
+    getter = getattr(client, "get", None)
+    if not callable(getter):
+        raise RuntimeError("TradingClient has no REST get()")
     token = None
-    for page in range(50):
-        if GetAccountActivitiesRequest is not None and ActivityType is not None:
-            kwargs = {"activity_types": [ActivityType.FILL], "page_size": 100}
-            if token:
-                kwargs["page_token"] = token
-            try:
-                batch = list(client.get_account_activities(GetAccountActivitiesRequest(**kwargs)) or [])
-            except TypeError:
-                batch = list(client.get_account_activities(GetAccountActivitiesRequest(
-                    activity_types=[ActivityType.FILL])) or [])
-                yield from batch
-                return
-        else:
-            getter = getattr(client, "get_account_activities", None)
-            if getter is None:
-                return
-            batch = list(getter() or [])
-            yield from batch
-            return
+    seen: set[str] = set()
+    for _page in range(500):
+        params = {"direction": "asc", "page_size": 100}
+        if after:
+            params["after"] = after
+        if token:
+            params["page_token"] = token
+        batch = getter("/account/activities/FILL", params)
+        if isinstance(batch, dict):
+            batch = batch.get("activities") or batch.get("data") or []
+        batch = list(batch or [])
         if not batch:
             return
         yield from batch
-        token = _get(batch[-1], "id")
-        if not token or len(batch) < 100:
+        if len(batch) < 100:
             return
-    log.warning("fill activity pagination stopped at 50 pages")
+        nxt = str(_get(batch[-1], "id", default="") or "")
+        if not nxt or nxt == token or nxt in seen:
+            return
+        seen.add(nxt)
+        token = nxt
+    log.warning("fill activity pagination stopped at 500 pages")
 
 
 def _fills_from_closed_orders(client) -> list[dict]:
@@ -792,17 +931,33 @@ def _fills_from_closed_orders(client) -> list[dict]:
     return fills
 
 
-def fetch_fills(client) -> tuple[list[dict], str]:
+def fetch_fills(client, after: Optional[str] = None) -> tuple[list[dict], str]:
     """(fills, source). Activities first; closed orders only if none came back.
 
-    `source` is 'activities' or 'closed_orders'. Read-only.
+    `source` is 'activities' or 'closed_orders'. Read-only. `after` defaults
+    to 30 days before the ledger's earliest open date. A fallback logs a
+    WARNING and does not include credentials.
     """
     assert_paper_client(client)
-    raw = list(_activity_pages(client))
+    if after is None:
+        after = activity_after_date()
+    reason = ""
+    raw: list = []
+    try:
+        raw = list(_activity_pages(client, after=after))
+    except Exception as exc:
+        reason = redact(str(exc))
     fills = [f for f in (normalize_fill(a) for a in raw) if f]
     if fills:
         fills.sort(key=lambda f: parse_time(f["time"]) or datetime.min.replace(tzinfo=timezone.utc))
         return fills, "activities"
+    if reason:
+        log.warning(
+            "fill activities unavailable (%s) — falling back to closed orders",
+            reason,
+        )
+    else:
+        log.warning("fill activities empty — falling back to closed orders")
     fills = _fills_from_closed_orders(client)
     fills.sort(key=lambda f: parse_time(f["time"]) or datetime.min.replace(tzinfo=timezone.utc))
     return fills, "closed_orders"
@@ -849,10 +1004,20 @@ def make_paper_client():
 
 
 def fetch_round_trips() -> list[RoundTrip]:
-    """Live paper book → round trips. Read-only."""
+    """Live paper book → round trips. Read-only.
+
+    Ledger order ids are applied before FIFO so a sell is not tied to an
+    older lot the broker still holds.
+    """
     client = make_paper_client()
     fills, _source = fetch_fills(client)
-    return build_round_trips(fills)
+    trades: list = []
+    try:
+        import trade_ledger as tl
+        trades = tl.all_trades()
+    except Exception as exc:
+        log.warning("ledger unavailable for order-id match (%s)", type(exc).__name__)
+    return build_round_trips(fills, trades=trades)
 
 
 def redact(message: str) -> str:

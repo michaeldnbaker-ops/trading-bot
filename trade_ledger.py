@@ -19,7 +19,8 @@ CSV schema (one row per trade):
   trade_id, opened_at_et, symbol, side, primary_agent, contributors,
   entry_price, target_price, stop_price, risk_dollar, shares,
   status, exit_price, exit_at_et, exit_reason,
-  realized_pnl, unrealized_pnl, current_price, last_updated_et
+  realized_pnl, unrealized_pnl, current_price, last_updated_et,
+  entry_order_id, exit_order_id
 
 Status values:
   open      — position still active, target & stop not yet hit
@@ -95,6 +96,9 @@ CSV_FIELDS = [
     "risk_dollar", "shares",
     "status", "exit_price", "exit_at_et", "exit_reason",
     "realized_pnl", "unrealized_pnl", "current_price", "last_updated_et",
+    # Added after the original columns. load_ledger tolerates a file
+    # that does not have them yet.
+    "entry_order_id", "exit_order_id",
 ]
 
 
@@ -138,6 +142,8 @@ class Trade:
     unrealized_pnl: float = 0.0
     current_price:  Optional[float] = None
     last_updated_et: str = ""
+    entry_order_id: str = ""
+    exit_order_id:  str = ""
 
     @property
     def is_open(self) -> bool:
@@ -356,6 +362,8 @@ def load_ledger() -> dict[str, Trade]:
                     unrealized_pnl  = float(row.get("unrealized_pnl") or 0),
                     current_price   = float(row["current_price"]) if row.get("current_price") else None,
                     last_updated_et = row.get("last_updated_et", ""),
+                    entry_order_id  = row.get("entry_order_id") or "",
+                    exit_order_id   = row.get("exit_order_id") or "",
                 )
             except (KeyError, ValueError) as e:
                 # tolerate corrupt rows; skip
@@ -463,7 +471,7 @@ def equity_simulation_applies(symbol: str) -> bool:
 
 
 def _resolve_option_ledger_row(trade: Trade, broker_open, broker_fills,
-                               now_iso: str) -> str:
+                               now_iso: str, activities=None) -> str:
     """Keep or close one option ledger row. Returns 'open' or 'closed'.
 
     Equity target/stop/hold-time are not consulted. The row stays open
@@ -479,13 +487,24 @@ def _resolve_option_ledger_row(trade: Trade, broker_open, broker_fills,
         return "open"
     if _recently_opened(trade):
         return "open"
+    hit = closing_fill(trade, activities) if activities else None
     fill = (broker_fills or {}).get(key) or (broker_fills or {}).get(trade.symbol)
-    if fill is not None:
-        px, when = fill
+    if hit is not None:
+        px, when, oid = hit
+        trade.status = "stop" if _pnl_for(trade, px) < 0 else "target"
+        trade.exit_price = px
+        trade.exit_at_et = broker_time_to_et(when)
+        trade.exit_reason = "broker avg fill"
+        if oid:
+            trade.exit_order_id = oid
+    elif fill is not None and not isinstance(fill, list):
+        px, when = fill[0], fill[1]
         trade.status = "stop"
         trade.exit_price = px
         trade.exit_at_et = broker_time_to_et(when)
         trade.exit_reason = "broker fill (protective stop)"
+        if len(fill) > 2 and fill[2]:
+            trade.exit_order_id = str(fill[2])
     else:
         trade.status = "stop"
         trade.exit_price = trade.current_price or trade.entry_price
@@ -545,9 +564,223 @@ def broker_time_to_et(when: str) -> str:
         return raw[:19].replace("T", " ")
 
 
+def _contract_multiplier(symbol: str) -> float:
+    """One option contract is 100 shares of premium. Equities stay 1."""
+    try:
+        from invariants import is_option_symbol
+        if is_option_symbol(symbol):
+            return 100.0
+    except Exception:
+        if len(str(symbol or "").replace("/", "")) > 12:
+            return 100.0
+    return 1.0
+
+
 def _pnl_for(trade: Trade, exit_price: float) -> float:
     sign = 1 if trade.side == "LONG" else -1
-    return round(trade.shares * (exit_price - trade.entry_price) * sign, 2)
+    mult = _contract_multiplier(getattr(trade, "symbol", ""))
+    return round(trade.shares * (exit_price - trade.entry_price) * sign * mult, 2)
+
+
+def _order_attr(order, *names):
+    if isinstance(order, dict):
+        for name in names:
+            if name in order and order[name] not in (None, ""):
+                return order[name]
+        return None
+    for name in names:
+        value = getattr(order, name, None)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _activity_row(raw) -> Optional[dict]:
+    """One FILL print as a plain dict. Quotes and empty prints are dropped."""
+    if not isinstance(raw, dict):
+        raw = {
+            "symbol": _order_attr(raw, "symbol"),
+            "side": _order_attr(raw, "side"),
+            "qty": _order_attr(raw, "qty", "filled_qty"),
+            "price": _order_attr(raw, "price", "filled_avg_price"),
+            "transaction_time": _order_attr(raw, "transaction_time", "filled_at"),
+            "order_id": _order_attr(raw, "order_id", "id"),
+        }
+    symbol = str(raw.get("symbol") or "")
+    if not symbol:
+        return None
+    side = str(raw.get("side") or "").lower().split(".")[-1]
+    if side in {"buy", "long"}:
+        side = "buy"
+    elif side in {"sell", "short"}:
+        side = "sell"
+    else:
+        return None
+    try:
+        qty = float(raw.get("qty") or raw.get("filled_qty") or 0)
+        price = float(raw.get("price") or raw.get("filled_avg_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0 or price <= 0:
+        return None
+    when = raw.get("transaction_time") or raw.get("filled_at") or ""
+    if isinstance(when, datetime):
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        when = when.isoformat()
+    when = str(when or "")
+    if not when:
+        return None
+    return {
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "time": when,
+        "order_id": str(raw.get("order_id") or ""),
+    }
+
+
+def closing_fill(trade: Trade, activities) -> Optional[tuple[float, str, str]]:
+    """(avg price, fill time, order id) of the order that closed `trade`.
+
+    The price is the size-weighted average of that order's prints. It is
+    not the stop or target trigger, and it is not a later quote or a
+    same-side fill. Prefers `exit_order_id` when that order actually
+    printed; otherwise the closing-side order after the open whose size
+    is closest to the position.
+    """
+    close_side = "sell" if trade.side == "LONG" else "buy"
+    key = str(trade.symbol or "").replace("/", "")
+    groups: dict[str, list[dict]] = {}
+    for raw in activities or []:
+        row = raw if isinstance(raw, dict) and raw.get("time") and row_is_norm(raw) else _activity_row(raw)
+        if not row:
+            continue
+        if str(row["symbol"]).replace("/", "") != key:
+            continue
+        if row["side"] != close_side:
+            continue
+        if not _fill_after_open(trade, row["time"]):
+            continue
+        oid = row.get("order_id") or ""
+        if oid and oid == str(getattr(trade, "entry_order_id", "") or ""):
+            continue
+        groups.setdefault(oid or f"print-{row['time']}", []).append(row)
+    if not groups:
+        return None
+    preferred = str(getattr(trade, "exit_order_id", "") or "")
+    if preferred and preferred in groups:
+        chosen = preferred
+    else:
+        target = abs(float(getattr(trade, "shares", 0) or 0))
+
+        def _rank(group_id: str):
+            parts = groups[group_id]
+            qty = sum(p["qty"] for p in parts)
+            miss = abs(qty - target) if target else 0.0
+            last = max(p["time"] for p in parts)
+            return (miss, last)
+
+        chosen = min(groups, key=_rank)
+    parts = groups[chosen]
+    qty = sum(p["qty"] for p in parts)
+    avg = sum(p["price"] * p["qty"] for p in parts) / qty
+    when = max(parts, key=lambda p: p["time"])["time"]
+    oid = "" if str(chosen).startswith("print-") else str(chosen)
+    return round(avg, 4), when, oid
+
+
+def row_is_norm(raw: dict) -> bool:
+    return raw.get("side") in {"buy", "sell"} and "time" in raw and "price" in raw
+
+
+def _fill_after_open(trade: Trade, when: str) -> bool:
+    """True when the print is at or after the ledger open (5 min of slack)."""
+    opened_raw = str(getattr(trade, "opened_at_et", "") or "")[:19]
+    if not opened_raw:
+        return True
+    try:
+        opened = datetime.fromisoformat(opened_raw).replace(tzinfo=ET)
+    except ValueError:
+        return True
+    et = broker_time_to_et(when)
+    try:
+        stamped = datetime.fromisoformat(et[:19]).replace(tzinfo=ET)
+    except ValueError:
+        return True
+    return stamped >= opened - timedelta(minutes=5)
+
+
+def book_broker_close(trade: Trade, order) -> bool:
+    """Book one closing order's average fill. False when `order` is not the exit.
+
+    A buy closes a short and a sell closes a long. The entry order is
+    ignored, even when it is the newest closed order on the symbol.
+    Price is filled_avg_price and the clock is filled_at. A missing fill
+    time does not fall through to wall-clock now, a trigger, or a quote.
+    """
+    if not getattr(trade, "is_open", True) or trade.status != "open":
+        return False
+    side = str(_order_attr(order, "side") or "").lower().split(".")[-1]
+    if side in {"buy", "long"}:
+        closes = "SHORT"
+    elif side in {"sell", "short"}:
+        closes = "LONG"
+    else:
+        return False
+    if trade.side != closes:
+        return False
+    sym = str(_order_attr(order, "symbol") or "")
+    if sym.replace("/", "") != str(trade.symbol or "").replace("/", ""):
+        return False
+    oid = str(_order_attr(order, "id", "order_id") or "")
+    if oid and oid == str(getattr(trade, "entry_order_id", "") or ""):
+        return False
+    try:
+        avg = float(_order_attr(order, "filled_avg_price", "price") or 0)
+    except (TypeError, ValueError):
+        return False
+    if avg <= 0:
+        return False
+    when = _order_attr(order, "filled_at", "transaction_time")
+    if isinstance(when, datetime):
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        when = when.isoformat()
+    when = str(when or "")
+    if not when:
+        return False
+    trade.exit_price = avg
+    trade.exit_at_et = broker_time_to_et(when)
+    trade.exit_order_id = oid or str(getattr(trade, "exit_order_id", "") or "")
+    trade.exit_reason = "broker avg fill"
+    trade.realized_pnl = _pnl_for(trade, avg)
+    trade.unrealized_pnl = 0.0
+    trade.status = "target" if trade.realized_pnl >= 0 else "stop"
+    return True
+
+
+def _book_activity_exit(trade: Trade, activities, *, status: str, reason: str,
+                        fallback_price, fallback_when) -> None:
+    """Close on the broker average when we have one, else the caller's price."""
+    hit = closing_fill(trade, activities) if activities else None
+    if hit is not None:
+        price, when, oid = hit
+        if oid:
+            trade.exit_order_id = oid
+        trade.exit_price = price
+        trade.exit_at_et = broker_time_to_et(when)
+        trade.exit_reason = "broker avg fill"
+        trade.realized_pnl = _pnl_for(trade, price)
+        trade.status = "target" if trade.realized_pnl >= 0 else "stop"
+    else:
+        trade.status = status
+        trade.exit_price = fallback_price
+        trade.exit_at_et = broker_time_to_et(str(fallback_when or ""))
+        trade.exit_reason = reason
+        trade.realized_pnl = _pnl_for(trade, float(trade.exit_price or trade.entry_price))
+    trade.unrealized_pnl = 0.0
 
 
 def sync_from_broker() -> dict:
@@ -645,6 +878,47 @@ def _recently_opened(trade: Trade, seconds: int = 120, now: datetime | None = No
         return False
 
 
+def _recent_fill_activities(days: int = 30) -> list[dict]:
+    """Recent paper FILL rows. Empty when the broker cannot be read.
+
+    Several pages, newest first, so a close can average the exit order
+    instead of keeping whichever print arrived last. Headers stay off
+    the log.
+    """
+    import requests as _rq
+    headers = {
+        "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
+        "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", ""),
+    }
+    after = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows: list[dict] = []
+    token = None
+    try:
+        for _page in range(10):
+            params = {"after": after, "page_size": 100, "direction": "desc"}
+            if token:
+                params["page_token"] = token
+            response = _rq.get(
+                "https://paper-api.alpaca.markets/v2/account/activities/FILL",
+                headers=headers, params=params, timeout=15,
+            )
+            if response.status_code != 200:
+                break
+            batch = response.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            rows.extend(a for a in batch if isinstance(a, dict))
+            if len(batch) < 100:
+                break
+            nxt = str(batch[-1].get("id") or "")
+            if not nxt or nxt == token:
+                break
+            token = nxt
+    except Exception as exc:
+        log.debug("fill history unavailable (%s)", type(exc).__name__)
+    return rows
+
+
 def _fetch_ghost_book() -> dict:
     """Positions, pending symbols, and the latest fill per symbol.
 
@@ -668,24 +942,26 @@ def _fetch_ghost_book() -> dict:
             pending = {o.get("symbol") for o in ords.json() if o.get("symbol")}
     except Exception:
         pass
+    activity_rows = _recent_fill_activities()
     fills: dict[str, tuple[float, str]] = {}
-    try:
-        from datetime import timedelta as _td
-        since = (datetime.now(ET) - _td(days=5)).strftime("%Y-%m-%d")
-        fr = _rq.get("https://paper-api.alpaca.markets/v2/account/activities/FILL",
-                     headers=h, params={"after": since, "page_size": 100},
-                     timeout=15)
-        if fr.status_code == 200:
-            for a in fr.json():
-                sym = a.get("symbol")
-                if not sym:
-                    continue
-                prev = fills.get(sym)
-                if prev is None or a["transaction_time"] > prev[1]:
-                    fills[sym] = (float(a["price"]), a["transaction_time"])
-    except Exception:
-        pass
-    return {"broker_syms": broker_syms, "pending": pending, "fills": fills}
+    for a in activity_rows:
+        sym = a.get("symbol")
+        when = a.get("transaction_time")
+        if not sym or not when:
+            continue
+        try:
+            price = float(a["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        prev = fills.get(sym)
+        if prev is None or str(when) > prev[1]:
+            fills[sym] = (price, str(when))
+    return {
+        "broker_syms": broker_syms,
+        "pending": pending,
+        "fills": fills,
+        "activity_rows": activity_rows,
+    }
 
 
 def close_ghosts(book: dict | None = None, now: datetime | None = None) -> dict:
@@ -715,6 +991,7 @@ def close_ghosts(book: dict | None = None, now: datetime | None = None) -> dict:
     broker_syms = book.get("broker_syms") or set()
     pending = book.get("pending") or set()
     fills = book.get("fills") or {}
+    activity_rows = book.get("activity_rows") or []
 
     trades = load_ledger()
     open_syms = [t.symbol for t in trades.values() if t.is_open]
@@ -736,8 +1013,17 @@ def close_ghosts(book: dict | None = None, now: datetime | None = None) -> dict:
             out["skipped_recent"] += 1
             continue
         fill = fills.get(key) or fills.get(t.symbol)
-        if fill is not None:
-            px, when = fill
+        hit = closing_fill(t, activity_rows) if activity_rows else None
+        if hit is not None:
+            px, when, oid = hit
+            t.status = "target" if _pnl_for(t, px) >= 0 else "stop"
+            t.exit_price = px
+            t.exit_at_et = broker_time_to_et(when)
+            t.exit_reason = "broker avg fill"
+            if oid:
+                t.exit_order_id = oid
+        elif fill is not None:
+            px, when = fill[0], fill[1]
             t.status = "stop"
             t.exit_price = px
             t.exit_at_et = broker_time_to_et(when)
@@ -817,27 +1103,27 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
     # truth was that a tight trail on a runner wins. Mislabelled causes are
     # worse than missing ones: the loop learns confidently in the wrong
     # direction.
+    activity_rows: list[dict] = []
     broker_fills: dict[str, tuple[float, str]] = {}
     try:
-        import os as _os, requests as _rq
-        from datetime import timedelta as _td
-        _h = {"APCA-API-KEY-ID": _os.getenv("ALPACA_API_KEY", ""),
-              "APCA-API-SECRET-KEY": _os.getenv("ALPACA_API_SECRET", "")}
-        _since = (datetime.now(ET) - _td(days=5)).strftime("%Y-%m-%d")
-        _fr = _rq.get("https://paper-api.alpaca.markets/v2/account/activities/FILL",
-                      headers=_h, params={"after": _since, "page_size": 100}, timeout=15)
-        if _fr.status_code == 200:
-            for _a in _fr.json():
-                _sym = _a.get("symbol")
-                if not _sym:
-                    continue
-                # Keep the latest fill per symbol; partial fills of the same
-                # exit arrive seconds apart and any of them dates it fine.
-                _prev = broker_fills.get(_sym)
-                if _prev is None or _a["transaction_time"] > _prev[1]:
-                    broker_fills[_sym] = (float(_a["price"]), _a["transaction_time"])
+        activity_rows = _recent_fill_activities()
+        for _a in activity_rows:
+            _sym = _a.get("symbol")
+            _when = _a.get("transaction_time")
+            if not _sym or not _when:
+                continue
+            try:
+                _px = float(_a["price"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Latest print is only the fallback. The close below prefers
+            # the exit order's size-weighted average.
+            _prev = broker_fills.get(_sym)
+            if _prev is None or str(_when) > _prev[1]:
+                broker_fills[_sym] = (_px, str(_when))
     except Exception as _fe:
-        log.debug(f"fill history unavailable ({_fe}) — exit attribution degrades")
+        log.debug("fill history unavailable (%s) — exit attribution degrades",
+                  type(_fe).__name__)
 
     # Group by symbol so we minimize yfinance calls
     by_symbol: dict[str, list[Trade]] = defaultdict(list)
@@ -865,7 +1151,8 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
         for t in by_symbol[symbol]:
             if not equity_simulation_applies(t.symbol):
                 outcome = _resolve_option_ledger_row(
-                    t, broker_open, broker_fills, now_iso)
+                    t, broker_open, broker_fills, now_iso,
+                    activities=activity_rows)
                 if outcome == "closed":
                     expired += 1
                 else:
@@ -901,7 +1188,16 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     and len(t.symbol) <= 12
                     and not _recently_opened(t)):
                 _fill = broker_fills.get(t.symbol.replace("/", ""))
-                if _fill is not None:
+                _hit = closing_fill(t, activity_rows)
+                if _hit is not None:
+                    _px, _when, _oid = _hit
+                    t.status       = "target" if _pnl_for(t, _px) >= 0 else "stop"
+                    t.exit_price   = _px
+                    t.exit_at_et   = broker_time_to_et(_when)
+                    t.exit_reason  = "broker avg fill"
+                    if _oid:
+                        t.exit_order_id = _oid
+                elif _fill is not None:
                     _px, _when = _fill
                     t.status       = "stop"
                     t.exit_price   = _px
@@ -927,17 +1223,28 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
             if status:
                 # Broker-held names never reach here (the override above
                 # clears status). When the broker is unreachable this is
-                # the simulated target/stop. When a fill is already known
-                # because the broker dropped the position, the ghost-close
-                # branch above booked that fill instead of the signal price.
-                t.status        = status
-                t.exit_price    = exit_price
-                t.exit_at_et    = exit_at
-                t.exit_reason   = "target hit" if status == "target" else "stop hit"
-                t.realized_pnl  = _pnl_for(t, exit_price)
+                # the simulated target/stop. When the exit order printed,
+                # that average is the close — not the trigger that the
+                # bar touched, and not a later quote.
+                _hit = closing_fill(t, activity_rows)
+                if _hit is not None:
+                    _px, _when, _oid = _hit
+                    t.exit_price   = _px
+                    t.exit_at_et   = broker_time_to_et(_when)
+                    t.exit_reason  = "broker avg fill"
+                    if _oid:
+                        t.exit_order_id = _oid
+                    t.realized_pnl = _pnl_for(t, _px)
+                    t.status = "target" if t.realized_pnl >= 0 else "stop"
+                else:
+                    t.status        = status
+                    t.exit_price    = exit_price
+                    t.exit_at_et    = exit_at
+                    t.exit_reason   = "target hit" if status == "target" else "stop hit"
+                    t.realized_pnl  = _pnl_for(t, exit_price)
                 t.unrealized_pnl = 0.0
-                if status == "target": closed_target += 1
-                else:                  closed_stop   += 1
+                if t.status == "target": closed_target += 1
+                else:                    closed_stop   += 1
             else:
                 # Still open — check expiry
                 try:
@@ -970,7 +1277,17 @@ def refresh_open_positions(max_symbols: int = 60) -> dict:
                     # Only a position that left with no fill behind it was
                     # genuinely closed by hold-time expiry.
                     _fill = broker_fills.get(t.symbol.replace("/", ""))
-                    if _fill is not None:
+                    _hit = closing_fill(t, activity_rows)
+                    if _hit is not None:
+                        _px, _when, _oid = _hit
+                        t.exit_price   = _px
+                        t.exit_at_et   = broker_time_to_et(_when)
+                        t.exit_reason  = "broker avg fill"
+                        if _oid:
+                            t.exit_order_id = _oid
+                        t.realized_pnl = _pnl_for(t, _px)
+                        t.status = "target" if t.realized_pnl >= 0 else "stop"
+                    elif _fill is not None:
                         _px, _when = _fill
                         t.status       = "stop"
                         t.exit_price   = _px
@@ -1055,6 +1372,7 @@ def record_trade(
     target_price: float, stop_price: float, risk_dollar: float,
     shares: float, primary_agent: str, contributors: str = "",
     order_id: str = "",
+    exit_order_id: str = "",
 ) -> str:
     """
     Write a new open trade directly to the ledger CSV.
@@ -1083,6 +1401,8 @@ def record_trade(
         risk_dollar     = risk_dollar,
         shares          = shares,
         status          = "open",
+        entry_order_id  = str(order_id or ""),
+        exit_order_id   = str(exit_order_id or ""),
     )
     trades[trade_id] = t
     save_ledger(trades)

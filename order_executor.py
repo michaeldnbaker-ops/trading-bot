@@ -404,11 +404,13 @@ class OrderExecutor:
                          f"({trail_err}); tick backstop will retry")
         else:
             log.info(f"🪤 TRAIL SET: {symbol} exit trails {trail_pct}% behind "
-                     f"high-water mark (order {trail_order.id}) — upside uncapped")
+                     f"high-water mark (order {trail_order.id}) "
+                     f"exit_order_id={trail_order.id} — upside uncapped")
 
         return {
             "status":       "submitted",
             "order_id":     str(entry_order.id),
+            "exit_order_id": str(trail_order.id) if trail_order is not None else "",
             "symbol":       symbol,
             "direction":    direction,
             "qty":          protect_qty,
@@ -578,6 +580,7 @@ class OrderExecutor:
                 primary_agent = signal.get("agent", "MetaAgent"),
                 contributors  = signal.get("contributing_agents", ""),
                 order_id      = order_result.get("order_id", ""),
+                exit_order_id = order_result.get("exit_order_id", ""),
             )
         except Exception as e:
             log.warning(f"Could not record to trade_ledger: {e}")

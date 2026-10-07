@@ -101,7 +101,7 @@ def run(client=None, trades=None, day: str | None = None) -> str:
         for p in positions
         if bf._get(p, "symbol")
     }
-    trips = bf.build_round_trips(fills)
+    trips = bf.build_round_trips(fills, trades=trades)
     rows = bf.compare_ledger(
         trades, trips, broker_open=open_symbols, broker_positions=positions,
     )
