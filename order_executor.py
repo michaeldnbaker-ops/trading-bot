@@ -205,6 +205,15 @@ class OrderExecutor:
             log.info(f"⏭  BLOCKED ENTRY: {symbol} {direction.upper()} — {reason}")
             return {"status": "blocked", "symbol": symbol, "direction": direction, "reason": reason}
 
+        from ensemble import new_entries_disabled_message, new_entries_disabled_reason
+        blocked = new_entries_disabled_reason()
+        if blocked:
+            log.info(new_entries_disabled_message(blocked))
+            return {
+                "status": "blocked", "symbol": symbol, "direction": direction,
+                "reason": blocked,
+            }
+
         if self._client is None:
             return self._log_only(approved_signal)
 
