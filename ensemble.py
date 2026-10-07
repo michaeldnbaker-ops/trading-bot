@@ -130,6 +130,10 @@ MAX_NET_LONG_PCT = float(os.getenv("MAX_NET_LONG_PCT", "1.00"))
 MAX_AVOID_SYMBOLS = int(os.getenv("MAX_AVOID_SYMBOLS", "8"))
 
 AGENT_SUMMARY_PATH = Path(__file__).resolve().parent / "logs" / "agent_summary.json"
+# Ops toggle. Presence of this file stops new entries on the next tick.
+# No deploy and no process restart. Gitignored so a local touch cannot ship.
+NO_NEW_ENTRIES_PATH = Path(__file__).resolve().parent / "data" / "NO_NEW_ENTRIES"
+_NEW_ENTRIES_OFF = frozenset({"0", "false", "no", "off", "disabled"})
 
 # ── Start Alpaca streaming at import time ─────────────────────────────────────
 try:
@@ -254,6 +258,60 @@ def _load_benched_agent_names() -> set[str]:
         return set()
 
 
+def new_entries_enabled() -> bool:
+    """``NEW_ENTRIES_ENABLED`` defaults to on. Read on every call, not at import."""
+    raw = os.getenv("NEW_ENTRIES_ENABLED")
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() not in _NEW_ENTRIES_OFF
+
+
+def active_signal_roster(benched: set[str] | None = None) -> list[str]:
+    """Agents allowed to open a new position this tick.
+
+    The code book is ``ACTIVE_SIGNAL_AGENTS`` (NewsAgent, BreakoutAgent).
+    ``agent_summary.json`` rows with ``active: false`` are benched. Pins
+    (``pinned_reason`` or a far-future ``benched_at``) keep a bench in
+    place only through the rotator; this reader honors ``active: false``,
+    which is what a pin writes. A missing or unreadable summary benches
+    nobody. There is no legacy roster: an empty return stays empty.
+    """
+    from agent_rotator import ACTIVE_SIGNAL_AGENTS, agent_may_signal
+    if benched is None:
+        benched = _load_benched_agent_names()
+    return [
+        name for name in sorted(ACTIVE_SIGNAL_AGENTS)
+        if agent_may_signal(name) and name not in benched
+    ]
+
+
+def new_entries_disabled_reason() -> str | None:
+    """None when new entries may proceed. Otherwise a short stand-down reason.
+
+    Env and the ``data/NO_NEW_ENTRIES`` file are checked every tick. An
+    empty turnaround roster uses the same stand-down and does not
+    substitute Technical, Momentum, or any other retired agent.
+    """
+    parts: list[str] = []
+    if not new_entries_enabled():
+        parts.append("NEW_ENTRIES_ENABLED=false")
+    try:
+        flag_present = NO_NEW_ENTRIES_PATH.exists()
+    except OSError as e:
+        return f"data/NO_NEW_ENTRIES unreadable ({e})"
+    if flag_present:
+        parts.append("data/NO_NEW_ENTRIES")
+    if parts:
+        return ", ".join(parts)
+    if not active_signal_roster():
+        return "empty roster"
+    return None
+
+
+def new_entries_disabled_message(reason: str) -> str:
+    return f"New entries disabled ({reason}) — managing open positions only"
+
+
 class Ensemble:
     """Full 12-agent ensemble. One instance per scheduler tick."""
 
@@ -370,6 +428,16 @@ class Ensemble:
             # on 2026-07-29 it would have frozen the book fully long while
             # the market fell another 1%. Cut the losers on the way out.
             self._derisk_on_halt()
+
+        # New-entry kill switch, after protective exits, ghost close,
+        # option stop ratchet, trail widen, and halt de-risk. Signal
+        # generation and entries do not run. Logged once per tick.
+        _stand_down = new_entries_disabled_reason()
+        if _stand_down:
+            log.info(new_entries_disabled_message(_stand_down))
+            return []
+
+        if risk_status["halt_trading"]:
             return []
         if still_naked:
             return []

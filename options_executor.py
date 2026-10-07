@@ -361,6 +361,14 @@ def select_contract(client, data_client, symbol: str, direction: str,
 def execute_options_trade(signal: dict) -> dict | None:
     """Buy calls/puts for a high-conviction signal. Returns result or None
     (None means the caller should fall back to the equity path)."""
+    # A blocked dict is not None: the equity fallback must not open a
+    # share position when the entry kill switch or an empty roster is on.
+    # Exits and stop sync do not call this.
+    from ensemble import new_entries_disabled_message, new_entries_disabled_reason
+    blocked = new_entries_disabled_reason()
+    if blocked:
+        log.info(new_entries_disabled_message(blocked))
+        return {"status": "blocked", "reason": blocked}
     if not OPTIONS_ENABLED:
         return None
     conf = float(signal.get("raw_confidence") or signal.get("confidence") or 0)

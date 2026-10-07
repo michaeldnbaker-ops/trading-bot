@@ -8,6 +8,8 @@ credentials.json
 
 # ── Logs & data (large/sensitive) ────────────
 logs/
+# Ops kill switch. Presence stops new entries on the next tick.
+data/NO_NEW_ENTRIES
 *.jsonl
 *.log
 
