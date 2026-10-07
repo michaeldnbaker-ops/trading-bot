@@ -15,9 +15,13 @@ closes (period 1W or 1M, timeframe 1D, with 1A/3M filling older days),
 account equity minus the prior history close when today's 1D bar is not
 posted yet, and account equity minus last_equity only when portfolio
 history itself cannot be read. A figure that is not the settled close
-is labeled preliminary. Alpaca positions are the open book, broker-fill
-round trips are the trade stats, and SPY close-to-close uses the same
-dates. The ledger is used only to name a round trip News or Breakout.
+is labeled preliminary. The line under Today is the prior session,
+settled close to the session before it, with SPY close-to-close on
+those same two dates. That line uses portfolio-history closes only, so
+it is never preliminary and it is still shown on the first day of the
+plan. Alpaca positions are the open book, broker-fill round trips are
+the trade stats, and SPY close-to-close uses the same dates. The ledger
+is used only to name a round trip News or Breakout.
 It is never a dollar.
 
 Alpaca's 1D portfolio bars are stamped the next UTC day. A Friday close
@@ -404,10 +408,32 @@ def format_period_line(label: str, stats: PeriodStats | None, *, preliminary: bo
     )
 
 
+def settled_yesterday_line(as_of: date, view: MarketView) -> str:
+    """Prior session versus the session before it, from history closes only.
+
+    Live account equity and last_equity are not read. The line is never
+    labeled preliminary, including on the first day of the plan.
+    """
+    session = previous_trading_day(as_of)
+    if session is None:
+        return "Yesterday (settled): unavailable."
+    label = f"Yesterday (settled) {session.month}/{session.day}"
+    prior = previous_trading_day(session)
+    end_eq = history_close(session, view)
+    start_eq = history_close(prior, view)
+    if end_eq is None or start_eq is None:
+        return f"{label}: unavailable."
+    stats = period_stats(end_eq, start_eq, spy_on(session, view), spy_on(prior, view))
+    return format_period_line(label, stats, preliminary=False)
+
+
 def period_block(cadence: str, as_of: date, view: MarketView) -> str:
     preliminary = is_day_preliminary(as_of, view)
     today = _pair(as_of, None, view, daily=True)
-    lines = [format_period_line("Today", today, preliminary=preliminary)]
+    lines = [
+        format_period_line("Today", today, preliminary=preliminary),
+        settled_yesterday_line(as_of, view),
+    ]
     if cadence == "weekly" or (cadence == "monthly" and shows_week_line(as_of)):
         anchor = previous_trading_day(_week_monday(as_of))
         lines.append(format_period_line(

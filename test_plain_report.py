@@ -47,6 +47,7 @@ from plain_report import (
     spy_from_bars,
     trade_lines,
 )
+from session_gates import CRYPTO_TRADING_ENABLED, PAPER_ONLY
 import weekly_reporter
 
 ET = ZoneInfo("America/New_York")
@@ -831,6 +832,160 @@ class SettledDayPnL(unittest.TestCase):
         self.assertNotIn("DOWN $391", email.subject)
         for section in ("Today:", "Since the new plan", "Today's standing:", "OLD LOSSES", FOOTER):
             self.assertIn(section, email.body)
+
+
+TUE = date(2026, 10, 6)
+# 10/5 close and the 10/2 close that makes that session -$391 (-0.50%).
+MON_CLOSE = 78280.10
+FRI_CLOSE = 78671.10
+SETTLED_YESTERDAY = (
+    "Yesterday (settled) 10/5: the bot was down 0.50% and the S&P was "
+    "up 1.00%, behind by 1.50 pts (down $391)."
+)
+
+
+def _yesterday_line(body: str) -> str:
+    lines = [line for line in body.splitlines() if line.startswith("Yesterday (settled)")]
+    if len(lines) != 1:
+        raise AssertionError(f"expected one settled line, got {lines!r}")
+    return lines[0]
+
+
+class SettledYesterdayLine(unittest.TestCase):
+    """The line under Today is the prior session's settled close-to-close."""
+
+    def test_paper_only_and_crypto_stays_off(self):
+        self.assertIs(PAPER_ONLY, True)
+        self.assertIs(CRYPTO_TRADING_ENABLED, False)
+
+    def _view(self, **overrides) -> MarketView:
+        view = MarketView(
+            equity_by_day={
+                FRI: FRI_CLOSE,
+                MON: MON_CLOSE,
+                TUE: 78400.00,
+            },
+            spy_by_day={
+                FRI: 100.0,
+                MON: 101.0,
+                TUE: 102.0,
+            },
+            positions=[],
+            trades=[],
+            live_equity=True,
+            account_equity=1.0,
+            last_equity=1.0,
+        )
+        for key, value in overrides.items():
+            setattr(view, key, value)
+        return view
+
+    def test_tuesday_line_is_monday_settled_against_friday(self):
+        view = self._view()
+        daily = build_email(TUE, "daily", view)
+        self.assertEqual(
+            daily.subject,
+            "Trading [PAPER] Daily 10/6/2026: UP $120, BEHIND S&P by 0.84 pts",
+        )
+        for cadence in ("daily", "weekly", "monthly"):
+            email = build_email(TUE, cadence, view)
+            self.assertTrue(email.subject.startswith(f"Trading [PAPER] {cadence.title()} 10/6/2026: "))
+            self.assertNotIn("Yesterday", email.subject)
+            self.assertNotIn("settled", email.subject.lower())
+            self.assertNotIn("preliminary", email.subject.lower())
+            self.assertNotIn("preliminary", email.body.lower())
+            line = _yesterday_line(email.body)
+            self.assertEqual(line, SETTLED_YESTERDAY)
+            self.assertIn("down 0.50%", line)
+            self.assertIn("(down $391)", line)
+            body_lines = email.body.splitlines()
+            today_at = body_lines.index(next(row for row in body_lines if row.startswith("Today:")))
+            self.assertEqual(body_lines[today_at + 1], SETTLED_YESTERDAY)
+        self.assertNotIn("This week:", daily.body)
+        self.assertNotIn("This month:", daily.body)
+
+    def test_line_sits_on_every_cadence(self):
+        view = self._view()
+        weekly = build_email(TUE, "weekly", view)
+        rows = weekly.body.splitlines()
+        today_at = next(i for i, row in enumerate(rows) if row.startswith("Today:"))
+        self.assertEqual(rows[today_at + 1], SETTLED_YESTERDAY)
+        self.assertTrue(rows[today_at + 2].startswith("This week:"))
+
+        month_end = date(2026, 10, 30)
+        monthly = build_email(month_end, "monthly", MarketView())
+        rows = monthly.body.splitlines()
+        today_at = next(i for i, row in enumerate(rows) if row.startswith("Today:"))
+        self.assertEqual(rows[today_at + 1], "Yesterday (settled) 10/29: unavailable.")
+        self.assertTrue(rows[today_at + 2].startswith("This week:"))
+        self.assertTrue(rows[today_at + 3].startswith("This month:"))
+
+    def test_missing_prior_bar_is_unavailable(self):
+        # Monday's close is present. Friday's bar is not. Live equity and
+        # last_equity would invent a number; the settled line must not.
+        view = self._view(
+            equity_by_day={MON: MON_CLOSE},
+            account_equity=MON_CLOSE,
+            last_equity=FRI_CLOSE,
+        )
+        line = _yesterday_line(build_email(TUE, "daily", view).body)
+        self.assertEqual(line, "Yesterday (settled) 10/5: unavailable.")
+        self.assertNotIn("391", line)
+        self.assertNotIn("0.50", line)
+        self.assertNotIn("preliminary", line)
+
+        # The other bar missing is the same sentence, even if live equity
+        # matches the settled Monday close.
+        missing_monday = self._view(
+            equity_by_day={FRI: FRI_CLOSE},
+            account_equity=MON_CLOSE,
+            last_equity=FRI_CLOSE,
+        )
+        line = _yesterday_line(build_email(TUE, "daily", missing_monday).body)
+        self.assertEqual(line, "Yesterday (settled) 10/5: unavailable.")
+        self.assertNotIn("preliminary", line)
+
+    def test_settled_line_is_not_preliminary_when_today_is(self):
+        view = self._view(
+            equity_by_day={FRI: FRI_CLOSE, MON: MON_CLOSE},
+            account_equity=77000.0,
+            last_equity=76000.0,
+            live_equity=True,
+        )
+        self.assertTrue(is_day_preliminary(TUE, view))
+        email = build_email(TUE, "daily", view)
+        self.assertIn("(preliminary)", email.subject)
+        self.assertNotIn("Yesterday", email.subject)
+        today = next(row for row in email.body.splitlines() if row.startswith("Today:"))
+        self.assertIn("preliminary", today)
+        line = _yesterday_line(email.body)
+        self.assertEqual(line, SETTLED_YESTERDAY)
+        self.assertNotIn("preliminary", line.lower())
+        self.assertNotIn("77000", line)
+        self.assertNotIn("76,000", line)
+
+    def test_plan_start_still_shows_the_prior_session(self):
+        # 10/5 is the first day of the plan. The prior session is 10/2.
+        view = MarketView(
+            equity_by_day={
+                THU: 100000.0,
+                FRI: 101000.0,
+                MON: 100500.0,
+            },
+            spy_by_day={THU: 100.0, FRI: 99.0, MON: 99.0},
+            positions=[],
+            trades=[],
+            live_equity=False,
+        )
+        email = build_email(MON, "daily", view)
+        self.assertEqual(
+            _yesterday_line(email.body),
+            "Yesterday (settled) 10/2: the bot was up 1.00% and the S&P was "
+            "down 1.00%, ahead by 2.00 pts (up $1,000).",
+        )
+        self.assertNotIn("preliminary", email.body.lower())
+        self.assertIn("Since the new plan (Mon 10/5):", email.body)
+        self.assertNotIn("Yesterday", email.subject)
 
 
 if __name__ == "__main__":
