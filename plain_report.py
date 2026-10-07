@@ -21,7 +21,9 @@ those same two dates. That line uses portfolio-history closes only, so
 it is never preliminary and it is still shown on the first day of the
 plan. Alpaca positions are the open book, broker-fill round trips are
 the trade stats, and SPY close-to-close uses the same dates. The ledger
-is used only to name a round trip News or Breakout.
+is used only to name a round trip News or Breakout. A same-day
+logs/weekly_shutdown_section.md, when present, is inserted verbatim
+under the period block as "Early shutdown decision".
 It is never a dollar.
 
 Alpaca's 1D portfolio bars are stamped the next UTC day. A Friday close
@@ -56,6 +58,9 @@ GO_NO_GO = date(2026, 11, 13)
 TRIPWIRE = 75_000.0
 STARTING_EQUITY = 100_000.0
 NEXT_CHANGES_PATH = Path(__file__).resolve().parent / "logs" / "weekly_next_changes.md"
+SHUTDOWN_SECTION_PATH = Path(__file__).resolve().parent / "logs" / "weekly_shutdown_section.md"
+SHUTDOWN_SECTION_TITLE = "Early shutdown decision"
+SHUTDOWN_SECTION_MAX_CHARS = 4000
 
 PAPER_API = "https://paper-api.alpaca.markets"
 DATA_API = "https://data.alpaca.markets"
@@ -640,13 +645,53 @@ def next_changes_block(cadence: str, as_of: date, path: Path) -> str:
     return "Next changes:\n" + "\n".join(f"- {item}" for item in bullets)
 
 
-def render_body(cadence: str, as_of: date, view: MarketView, path: Path) -> str:
+def read_shutdown_section(path: Path, as_of: date) -> str:
+    """Verbatim text when the file was saved on as_of (ET).
+
+    Missing, stale, blank, or any read error returns "" so the email
+    still sends. This is not the next-changes file: that one keeps two
+    '- ' bullets, titles them "Next changes:", and only on weekly or monthly.
+    """
+    try:
+        if not path.is_file():
+            return ""
+        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=ET).date()
+        if modified != as_of:
+            return ""
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    text = text.strip()
+    if not text:
+        return ""
+    if len(text) > SHUTDOWN_SECTION_MAX_CHARS:
+        text = text[:SHUTDOWN_SECTION_MAX_CHARS].rstrip()
+    return text
+
+
+def shutdown_section_block(as_of: date, path: Path) -> str:
+    text = read_shutdown_section(path, as_of)
+    if not text:
+        return ""
+    return f"{SHUTDOWN_SECTION_TITLE}\n{text}"
+
+
+def render_body(
+    cadence: str,
+    as_of: date,
+    view: MarketView,
+    path: Path,
+    shutdown_path: Path,
+) -> str:
     stats = stats_for(cadence, as_of, view)
     blocks = [
         opening_sentence(cadence, stats, preliminary=is_day_preliminary(as_of, view)),
         period_block(cadence, as_of, view),
-        section_three(as_of, view),
     ]
+    shutdown = shutdown_section_block(as_of, shutdown_path)
+    if shutdown:
+        blocks.append(shutdown)
+    blocks.append(section_three(as_of, view))
     standing = standing_line(as_of, view)
     alert = alerts_line(view.alerts)
     blocks.append(standing if not alert else standing + "\n" + alert)
@@ -674,10 +719,12 @@ def build_email(
     view: MarketView | None = None,
     *,
     next_changes_path: Path | None = None,
+    shutdown_section_path: Path | None = None,
 ) -> Email:
     view = view or MarketView()
     path = NEXT_CHANGES_PATH if next_changes_path is None else next_changes_path
-    body = render_body(cadence, as_of, view, path)
+    shutdown = SHUTDOWN_SECTION_PATH if shutdown_section_path is None else shutdown_section_path
+    body = render_body(cadence, as_of, view, path, shutdown)
     return Email(subject=subject_line(cadence, as_of, view), body=body, html=render_html(body))
 
 

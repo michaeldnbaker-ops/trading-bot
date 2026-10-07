@@ -20,6 +20,7 @@ from plain_report import (
     FOOTER,
     GO_NO_GO,
     NEXT_CHANGES_PATH,
+    SHUTDOWN_SECTION_PATH,
     PLAN_START,
     STARTING_EQUITY,
     TRIPWIRE,
@@ -214,6 +215,7 @@ class PlanAndOldLosses(unittest.TestCase):
         self.assertEqual(TRIPWIRE, 75_000.0)
         self.assertEqual(STARTING_EQUITY, 100_000.0)
         self.assertEqual(NEXT_CHANGES_PATH.name, "weekly_next_changes.md")
+        self.assertEqual(SHUTDOWN_SECTION_PATH.name, "weekly_shutdown_section.md")
 
     def test_before_plan_start_says_the_plan_has_not_started(self):
         view = fixture_view(trades=[
@@ -366,6 +368,89 @@ class NextChanges(unittest.TestCase):
                 raise OSError("unreadable")
 
         self.assertEqual(read_next_changes(Boom(), FRI), [])  # type: ignore[arg-type]
+
+
+class EarlyShutdownSection(unittest.TestCase):
+    """Same-day logs/weekly_shutdown_section.md, verbatim, on any cadence."""
+
+    def _write(self, folder: str, text: str, modified: date) -> Path:
+        path = Path(folder) / "weekly_shutdown_section.md"
+        path.write_text(text, encoding="utf-8")
+        stamp = datetime(modified.year, modified.month, modified.day, 15, 0, tzinfo=ET)
+        os.utime(path, (stamp.timestamp(), stamp.timestamp()))
+        return path
+
+    def test_same_day_file_is_included_under_the_exact_title(self):
+        text = "Hold the book.\n\n  keep indent\n- not dropped"
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, f"\n{text}\n", FRI)
+            for cadence in ("daily", "weekly"):
+                email = build_email(
+                    FRI, cadence, fixture_view(), shutdown_section_path=path,
+                )
+                self.assertIn(f"Early shutdown decision\n{text}", email.body)
+                self.assertNotIn("Early shutdown decision:", email.body)
+                self.assertNotIn("Early shutdown", email.subject)
+                self.assertLess(
+                    email.body.index("Yesterday (settled)"),
+                    email.body.index("Early shutdown decision"),
+                )
+                self.assertLess(
+                    email.body.index("Early shutdown decision"),
+                    email.body.index("New plan starts"),
+                )
+            weekly = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=path)
+            self.assertLess(
+                weekly.body.index("This week:"),
+                weekly.body.index("Early shutdown decision"),
+            )
+            month_end = date(2026, 10, 30)
+            month_path = self._write(folder, text, month_end)
+            monthly = build_email(
+                month_end, "monthly", MarketView(), shutdown_section_path=month_path,
+            )
+            self.assertLess(monthly.body.index("This month:"), monthly.body.index("Early shutdown decision"))
+            self.assertLess(
+                monthly.body.index("Early shutdown decision"),
+                monthly.body.index("Since the new plan"),
+            )
+
+    def test_stale_file_is_ignored(self):
+        text = "Hold the book. SHUTDOWN-STALE"
+        with tempfile.TemporaryDirectory() as folder:
+            stale = self._write(folder, text, THU)
+            email = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=stale)
+        self.assertNotIn("Early shutdown decision", email.body)
+        self.assertNotIn("SHUTDOWN-STALE", email.body)
+        self.assertIn("Today:", email.body)
+
+    def test_missing_file_is_ignored(self):
+        missing = Path(tempfile.gettempdir()) / "does-not-exist-shutdown-section.md"
+        email = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=missing)
+        self.assertNotIn("Early shutdown decision", email.body)
+        self.assertIn("Today:", email.body)
+
+    def test_empty_file_and_read_error_add_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            blank = self._write(folder, " \n\n\t", FRI)
+            email = build_email(FRI, "daily", fixture_view(), shutdown_section_path=blank)
+        self.assertNotIn("Early shutdown decision", email.body)
+
+        class Boom:
+            def is_file(self):
+                raise OSError("unreadable")
+
+        email = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=Boom())  # type: ignore[arg-type]
+        self.assertNotIn("Early shutdown decision", email.body)
+        self.assertIn("Today:", email.body)
+
+    def test_section_is_capped_at_4000_chars(self):
+        blob = "Y" * 4500
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, blob, FRI)
+            email = build_email(FRI, "daily", fixture_view(), shutdown_section_path=path)
+        self.assertIn("Early shutdown decision\n" + ("Y" * 4000), email.body)
+        self.assertNotIn("Y" * 4001, email.body)
 
 
 class AlertsAndStanding(unittest.TestCase):
