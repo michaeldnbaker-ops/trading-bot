@@ -358,6 +358,58 @@ def select_contract(client, data_client, symbol: str, direction: str,
     return None
 
 
+def _record_option_open(signal: dict, contract: dict, qty: float,
+                        premium: float, order_id: str) -> str:
+    """Ledger row for attribution. The symbol is the contract, not the underlying.
+
+    The equity entry gate keys off the underlying, so this row does not
+    change that gate. Scoring and the email name the round trip from the
+    agent and the order ids stored here.
+    """
+    try:
+        import trade_ledger as tl
+        stop = round(max(float(premium) * STOP_LOSS_MULT, 0.01), 4)
+        return tl.record_trade(
+            symbol=contract["symbol"],
+            side="long",
+            entry_price=float(premium),
+            target_price=round(float(premium) * RATCHET_BREAKEVEN_MARK, 4),
+            stop_price=stop,
+            risk_dollar=round(abs(float(qty) * float(premium) * 100.0), 2),
+            shares=float(qty),
+            primary_agent=signal.get("agent") or "MetaAgent",
+            contributors=str(
+                signal.get("contributing_agents") or signal.get("contributors") or ""
+            ),
+            order_id=str(order_id or ""),
+        )
+    except Exception as exc:
+        log.warning("options: ledger row not written (%s)", type(exc).__name__)
+        return ""
+
+
+def _stamp_option_exit_order(symbol: str, order_id: str) -> None:
+    """Remember the resting exit on the open contract row. A later fill wins."""
+    if not symbol or not order_id:
+        return
+    try:
+        import trade_ledger as tl
+        trades = tl.load_ledger()
+        changed = False
+        for trade in trades.values():
+            if not trade.is_open or trade.symbol != symbol:
+                continue
+            if trade.exit_order_id == order_id:
+                return
+            trade.exit_order_id = order_id
+            changed = True
+            break
+        if changed:
+            tl.save_ledger(trades)
+    except Exception as exc:
+        log.warning("options: exit order id not stored (%s)", type(exc).__name__)
+
+
 def execute_options_trade(signal: dict) -> dict | None:
     """Buy calls/puts for a high-conviction signal. Returns result or None
     (None means the caller should fall back to the equity path)."""
@@ -388,13 +440,13 @@ def execute_options_trade(signal: dict) -> dict | None:
         return None
 
     try:
-        # DEDUP — options trades never reach trade_ledger, so the
-        # ensemble's has_open_position() gate cannot see them. On
-        # 2026-07-30 that let WOLF puts stack to 4 contracts across two
-        # strikes (~$2,000 exposure on an $890 budget) and SOFI calls to
-        # 18. The -$2,150 "single" WOLF loss was really four stacked
-        # entries. Check the broker directly for any live option on this
-        # underlying before adding another.
+        # DEDUP — the ledger row below is the contract symbol, so the
+        # ensemble's has_open_position() gate on the underlying still
+        # cannot see it. On 2026-07-30 that let WOLF puts stack to 4
+        # contracts across two strikes (~$2,000 exposure on an $890
+        # budget) and SOFI calls to 18. The -$2,150 "single" WOLF loss
+        # was really four stacked entries. Check the broker directly
+        # for any live option on this underlying before adding another.
         try:
             for _p in client.get_all_positions():
                 _s = str(_p.symbol)
@@ -440,16 +492,31 @@ def execute_options_trade(signal: dict) -> dict | None:
             symbol=contract["symbol"], qty=qty, side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
         ))
+        fill_px = float(contract["ask"])
+        filled_qty = float(qty)
+        try:
+            live = client.get_order_by_id(order.id)
+            px = float(getattr(live, "filled_avg_price", 0) or 0)
+            fq = float(getattr(live, "filled_qty", 0) or 0)
+            if px > 0:
+                fill_px = px
+            if fq > 0:
+                filled_qty = fq
+        except Exception:
+            pass
+        order_id = str(order.id)
         log.info(
-            f"🎯 OPTIONS: {contract['symbol']} x{qty} @ ~${contract['ask']:.2f} "
+            f"🎯 OPTIONS: {contract['symbol']} x{filled_qty:g} @ ~${fill_px:.2f} "
             f"| cost ${cost:,.0f} = MAX LOSS | strike {contract['strike']} "
             f"exp {contract['expiry']} spread {contract['spread_pct']}% "
-            f"| conf {conf:.2f} agent={signal.get('agent','?')}"
+            f"| conf {conf:.2f} | order_id={order_id} "
+            f"| agent={signal.get('agent','?')}"
         )
+        _record_option_open(signal, contract, filled_qty, fill_px, order_id)
         return {"status": "submitted", "instrument": "option",
-                "order_id": str(order.id), "symbol": contract["symbol"],
-                "underlying": symbol, "qty": qty, "premium": contract["ask"],
-                "max_loss": round(cost, 2)}
+                "order_id": order_id, "symbol": contract["symbol"],
+                "underlying": symbol, "qty": filled_qty, "premium": fill_px,
+                "max_loss": round(filled_qty * fill_px * 100.0, 2)}
     except Exception as e:
         log.warning(f"options: execution failed for {symbol}: {e}")
         return None
@@ -510,9 +577,15 @@ def submit_option_protective_stop(client, position, stop_price=None, mark=None) 
                 symbol=sym, qty=qty, side=side,
                 time_in_force=tif, stop_price=stop_px,
             ))
+            oid = str(getattr(order, "id", "") or "")
+            log.info(
+                "options stop %s exit_order_id=%s stop=%s qty=%s",
+                sym, oid, stop_px, qty,
+            )
+            _stamp_option_exit_order(sym, oid)
             return {
                 "placed": True,
-                "order_id": str(getattr(order, "id", "")),
+                "order_id": oid,
                 "stop_price": stop_px,
                 "qty": qty,
                 "tif": str(tif),

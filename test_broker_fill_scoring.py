@@ -9,6 +9,7 @@ import inspect
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -327,7 +328,7 @@ class DiagnosticReadOnly(unittest.TestCase):
         class _Client:
             paper = True
 
-            def get_account_activities(self, *args, **kwargs):
+            def get(self, path, params=None):
                 return _fills_round_trip(
                     "AMGN", "LONG", 10, 100, 110,
                     "2026-09-01T15:00:00Z", "2026-10-01T15:00:00Z",
@@ -470,6 +471,424 @@ class GatesUntouched(unittest.TestCase):
         import order_executor
         src = inspect.getsource(order_executor.OrderExecutor.__init__)
         self.assertIn("paper=True", src)
+
+
+class OrderIdFills(unittest.TestCase):
+    """REST paging, order-id match, close price, option attribution."""
+
+    def test_activity_pages_walk_oldest_first_until_a_short_page(self):
+        from broker_fills import fetch_fills
+
+        class _Client:
+            paper = True
+
+            def __init__(self):
+                self.calls = []
+
+            def get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                token = (params or {}).get("page_token")
+                if not token:
+                    return [
+                        {
+                            "id": f"p{i:03d}",
+                            "symbol": "AMD",
+                            "side": "buy",
+                            "qty": 1,
+                            "price": 10 + i * 0.01,
+                            "transaction_time": f"2026-07-01T14:{i % 60:02d}:{i // 60:02d}Z",
+                            "order_id": f"o{i:03d}",
+                        }
+                        for i in range(100)
+                    ]
+                if token != "p099":
+                    raise AssertionError(token)
+                return [{
+                    "id": "p100",
+                    "symbol": "AMD",
+                    "side": "sell",
+                    "qty": 1,
+                    "price": 12,
+                    "transaction_time": "2026-07-02T15:00:00Z",
+                    "order_id": "o100",
+                }]
+
+            def get_orders(self, *args, **kwargs):
+                raise AssertionError("activities came back; closed orders must not be used")
+
+        client = _Client()
+        fills, source = fetch_fills(client, after="2026-06-01")
+        self.assertEqual(source, "activities")
+        self.assertEqual(len(fills), 101)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0][0], "/account/activities/FILL")
+        self.assertEqual(client.calls[0][1]["direction"], "asc")
+        self.assertEqual(client.calls[0][1]["after"], "2026-06-01")
+        self.assertNotIn("page_token", client.calls[0][1])
+        self.assertEqual(client.calls[1][1]["page_token"], "p099")
+        self.assertEqual(fills[-1]["order_id"], "o100")
+        from broker_fills import activity_after_date
+
+        class _Row:
+            opened_at_et = "2026-07-02 09:31:00"
+
+        self.assertEqual(activity_after_date([_Row()]), "2026-06-02")
+
+    def test_empty_activities_warn_and_fall_back_without_secrets(self):
+        from broker_fills import fetch_fills
+
+        class _Down:
+            paper = True
+
+            def get(self, path, params=None):
+                secret = "SUPERSECRETKEY"
+                raise RuntimeError(f"activities failed {secret}")
+
+            def get_orders(self, *args, **kwargs):
+                return []
+
+        class _Missing:
+            paper = True
+
+            def get_orders(self, *args, **kwargs):
+                return [{
+                    "symbol": "IBM", "side": "buy", "qty": 1, "price": 10,
+                    "filled_at": "2026-08-07T14:00:00Z", "id": "closed-1",
+                }]
+
+        with patch.dict("os.environ", {"ALPACA_API_KEY": "SUPERSECRETKEY"}), \
+             self.assertLogs("BrokerFills", level="WARNING") as logs:
+            fills, source = fetch_fills(_Down(), after="2026-06-01")
+        self.assertEqual(fills, [])
+        self.assertEqual(source, "closed_orders")
+        blob = "\n".join(logs.output)
+        self.assertIn("falling back to closed orders", blob)
+        self.assertNotIn("SUPERSECRETKEY", blob)
+        self.assertIn("***", blob)
+
+        with self.assertLogs("BrokerFills", level="WARNING") as logs:
+            fills, source = fetch_fills(_Missing(), after="2026-06-01")
+        self.assertEqual(source, "closed_orders")
+        self.assertEqual(fills[0]["symbol"], "IBM")
+        self.assertTrue(any("falling back to closed orders" in line for line in logs.output))
+
+    def test_order_id_beats_fifo_when_an_older_lot_is_still_held(self):
+        from broker_fills import assign_round_trips, match_method_counts
+        july = {
+            "symbol": "COIN", "side": "buy", "qty": 10, "price": 250,
+            "time": "2026-07-08T14:00:00Z", "order_id": "july-lot",
+        }
+        opened = {
+            "symbol": "COIN", "side": "buy", "qty": 10, "price": 200,
+            "time": "2026-09-18T14:00:00Z", "order_id": "news-entry",
+        }
+        closed = {
+            "symbol": "COIN", "side": "sell", "qty": 10, "price": 180,
+            "time": "2026-09-18T18:00:00Z", "order_id": "news-exit",
+        }
+        trade = _trade("NewsAgent", 50.0, days_ago=1, symbol="COIN", shares=10, entry=200)
+        trade.trade_id = "coin-news"
+        trade.opened_at_et = "2026-09-18 10:00:00"
+        trade.entry_order_id = "news-entry"
+        trade.exit_order_id = "news-exit"
+        trade.status = "stop"
+        trade.realized_pnl = 50.0
+        fills = [july, opened, closed]
+
+        fifo = build_round_trips(fills)
+        self.assertEqual(len(fifo), 1)
+        self.assertAlmostEqual(fifo[0].entry_price, 250)
+        self.assertAlmostEqual(fifo[0].realized_pnl, -700.0)
+        missed = assign_round_trips([trade], fifo)
+        self.assertEqual(missed["coin-news"], [])
+
+        matched = build_round_trips(fills, trades=[trade])
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0].order_ids, ("news-entry", "news-exit"))
+        self.assertAlmostEqual(matched[0].entry_price, 200)
+        self.assertAlmostEqual(matched[0].exit_price, 180)
+        self.assertAlmostEqual(matched[0].realized_pnl, -200.0)
+        claimed = assign_round_trips([trade], matched)
+        self.assertEqual(len(claimed["coin-news"]), 1)
+        self.assertEqual(match_method_counts(), {"order_id": 1, "fifo": 0, "unmatched": 0})
+
+        ev = AgentEvaluator()
+        with patch("agent_evaluator._today_et_date", return_value=datetime(2026, 10, 7)), \
+             patch("trade_ledger.epoch_trades", return_value=[trade]), \
+             patch("agent_evaluator._agent_active_state", return_value={}):
+            report = ev.evaluate(round_trips=matched)
+        by = {a.name: a for a in report.agents}
+        self.assertAlmostEqual(by["NewsAgent"].pnl_20d, -200.0)
+        self.assertNotAlmostEqual(by["NewsAgent"].pnl_20d, 50.0)
+        self.assertIn("Order-id matches: 1", report.scoring_note)
+        self.assertIn("FIFO fallback: 0", report.scoring_note)
+
+    def test_close_records_avg_fill_not_the_trigger_or_a_later_quote(self):
+        import trade_ledger as tl
+        trade = tl.Trade(
+            trade_id="bdf2554366ee", opened_at_et="2026-10-01 10:00:00",
+            symbol="UAL", side="LONG", primary_agent="BreakoutAgent",
+            contributors="", entry_price=80.0, target_price=93.47, stop_price=70.0,
+            risk_dollar=320.0, shares=10, status="open",
+        )
+        activities = [
+            {"symbol": "UAL", "side": "sell", "qty": 4, "price": 40.0,
+             "transaction_time": "2026-10-06T15:00:00Z", "order_id": "trail"},
+            {"symbol": "UAL", "side": "sell", "qty": 6, "price": 50.0,
+             "transaction_time": "2026-10-06T15:00:02Z", "order_id": "trail"},
+            {"symbol": "UAL", "side": "sell", "qty": 1, "price": 90.0,
+             "transaction_time": "2026-10-06T19:00:00Z", "order_id": "later-print"},
+            {"symbol": "UAL", "side": "buy", "qty": 10, "price": 95.0,
+             "transaction_time": "2026-10-07T14:00:00Z", "order_id": "later-buy"},
+        ]
+        price, when, oid = tl.closing_fill(trade, activities)
+        self.assertAlmostEqual(price, 46.0)
+        self.assertEqual(oid, "trail")
+        self.assertEqual(tl.broker_time_to_et(when), "2026-10-06 11:00:02")
+        self.assertNotAlmostEqual(price, 93.47)
+        self.assertNotAlmostEqual(price, 90.0)
+
+        # The entry buy is not an exit, even when it is the fill someone
+        # would book as a target. The trail's average is the loss.
+        fresh = tl.Trade(
+            trade_id="bdf2554366ee", opened_at_et="2026-10-01 10:00:00",
+            symbol="UAL", side="LONG", primary_agent="BreakoutAgent",
+            contributors="", entry_price=80.0, target_price=93.47, stop_price=70.0,
+            risk_dollar=320.0, shares=10, status="open",
+            entry_order_id="ual-entry",
+        )
+        entry = {
+            "symbol": "UAL", "side": "buy", "id": "ual-entry",
+            "filled_avg_price": 93.47, "filled_at": "2026-10-01T14:00:00Z",
+        }
+        self.assertFalse(tl.book_broker_close(fresh, entry))
+        self.assertTrue(fresh.is_open)
+        self.assertIsNone(fresh.exit_price)
+        exit_order = {
+            "symbol": "UAL", "side": "sell", "id": "trail",
+            "filled_avg_price": 42.739, "filled_at": "2026-10-06T18:05:00Z",
+        }
+        self.assertTrue(tl.book_broker_close(fresh, exit_order))
+        self.assertAlmostEqual(fresh.exit_price, 42.739)
+        self.assertAlmostEqual(fresh.realized_pnl, -372.61)
+        self.assertEqual(fresh.exit_at_et, "2026-10-06 14:05:00")
+        self.assertEqual(fresh.exit_order_id, "trail")
+        self.assertEqual(fresh.status, "stop")
+        self.assertEqual(fresh.exit_reason, "broker avg fill")
+        self.assertNotAlmostEqual(fresh.realized_pnl, 134.70)
+
+    def test_option_round_trip_is_attributed_to_the_agent(self):
+        import inspect
+        import trade_ledger as tl
+        from options_executor import _record_option_open, _stamp_option_exit_order, execute_options_trade
+        from plain_report import closed_trades_from_books, trade_lines
+
+        src = inspect.getsource(execute_options_trade)
+        self.assertIn("_record_option_open", src)
+        self.assertIn("order_id=", src)
+
+        tmp = Path(tempfile.mkdtemp())
+        orig = tl.LEDGER
+        tl.LEDGER = tmp / "paper_trades.csv"
+        try:
+            tid = _record_option_open(
+                {"agent": "MetaAgent(NewsAgent)"},
+                {"symbol": "PTC261120C00195000"},
+                3, 2.0, "opt-buy",
+            )
+            row = tl.load_ledger()[tid]
+            self.assertEqual(row.entry_order_id, "opt-buy")
+            self.assertEqual(row.leaf_agents, ["NewsAgent"])
+            self.assertTrue(row.is_open)
+            _stamp_option_exit_order("PTC261120C00195000", "opt-sell")
+            row = tl.load_ledger()[tid]
+            self.assertEqual(row.exit_order_id, "opt-sell")
+        finally:
+            tl.LEDGER = orig
+
+        symbol = "PTC261120C00195000"
+        trade = _trade("MetaAgent(NewsAgent)", 0.0, days_ago=1, symbol=symbol, shares=3, entry=2.0)
+        trade.trade_id = "ptc-news"
+        trade.opened_at_et = "2026-10-05 10:00:00"
+        trade.status = "stop"
+        trade.entry_order_id = "opt-buy"
+        trade.exit_order_id = "opt-sell"
+        fills = [
+            {"symbol": symbol, "side": "buy", "qty": 3, "price": 2.0,
+             "time": "2026-10-05T14:00:00Z", "order_id": "opt-buy"},
+            {"symbol": symbol, "side": "sell", "qty": 3, "price": 1.2,
+             "time": "2026-10-06T14:00:00Z", "order_id": "opt-sell"},
+        ]
+        trips = build_round_trips(fills, trades=[trade])
+        self.assertEqual(len(trips), 1)
+        self.assertAlmostEqual(trips[0].realized_pnl, -240.0)
+        named = closed_trades_from_books(trips, [trade])
+        self.assertEqual(named[0].strategies, ("News",))
+        lines = trade_lines(named)
+        self.assertFalse(any("not available" in line for line in lines))
+        # plain_report writes losses as "down $240.00", not a signed figure.
+        self.assertTrue(any(
+            line.startswith("News:") and "down $240.00" in line for line in lines
+        ))
+        ev = AgentEvaluator()
+        with patch("agent_evaluator._today_et_date", return_value=datetime(2026, 10, 7)), \
+             patch("trade_ledger.epoch_trades", return_value=[trade]), \
+             patch("agent_evaluator._agent_active_state", return_value={}):
+            report = ev.evaluate(round_trips=trips)
+        by = {a.name: a for a in report.agents}
+        self.assertAlmostEqual(by["NewsAgent"].pnl_20d, -240.0)
+
+    def test_backfill_is_dry_run_until_apply_and_old_csv_loads(self):
+        import importlib.util
+        import trade_ledger as tl
+        spec = importlib.util.spec_from_file_location(
+            "backfill_order_ids",
+            Path(__file__).resolve().parent / "scripts" / "backfill_order_ids.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        tmp = Path(tempfile.mkdtemp())
+        ledger = tmp / "paper_trades.csv"
+        log_path = tmp / "scheduler.log"
+        header = (
+            "trade_id,opened_at_et,symbol,side,primary_agent,contributors,"
+            "entry_price,target_price,stop_price,risk_dollar,shares,status,"
+            "exit_price,exit_at_et,exit_reason,realized_pnl,unrealized_pnl,"
+            "current_price,last_updated_et"
+        )
+        ledger.write_text(
+            header + "\n"
+            "abc,2026-09-18 10:06:09,COIN,LONG,NewsAgent,,200,210,190,320,10,open,,,,,,,\n",
+            encoding="utf-8",
+        )
+        log_path.write_text(
+            "2026-09-18 10:06:09,237 [INFO] ✅ ORDER SUBMITTED: COIN LONG "
+            "$1000 | qty=10 fill=200 | order_id=entry-1 | agent=NewsAgent\n"
+            "2026-09-18 10:06:12,100 [INFO] 🪤 TRAIL SET: COIN exit trails 3.5% "
+            "behind high-water mark (order exit-1) exit_order_id=exit-1 — upside uncapped\n",
+            encoding="utf-8",
+        )
+        orig = tl.LEDGER
+        tl.LEDGER = ledger
+        try:
+            before = ledger.read_text(encoding="utf-8")
+            loaded = tl.load_ledger()
+            self.assertEqual(loaded["abc"].entry_order_id, "")
+            self.assertEqual(loaded["abc"].exit_order_id, "")
+            self.assertEqual(mod.run([], ledger_path=ledger, log_path=log_path), 0)
+            self.assertEqual(ledger.read_text(encoding="utf-8"), before)
+            self.assertFalse(list(tmp.glob("*.bak-*")))
+            self.assertEqual(mod.run(["--apply"], ledger_path=ledger, log_path=log_path), 0)
+            backups = list(tmp.glob("paper_trades.csv.bak-*"))
+            self.assertEqual(len(backups), 1)
+            row = tl.load_ledger()["abc"]
+            self.assertEqual(row.entry_order_id, "entry-1")
+            self.assertEqual(row.exit_order_id, "exit-1")
+            self.assertIn("entry_order_id", ledger.read_text(encoding="utf-8").splitlines()[0])
+        finally:
+            tl.LEDGER = orig
+
+    def test_fixture_dry_run_moves_news_breakout_and_intermarket(self):
+        """Ledger (activities missing) vs order-id on the full fill set."""
+        before, after = _fixture_scoreboard()
+        self.assertEqual(before["NewsAgent"]["20d"], 50.0)
+        self.assertEqual(before["NewsAgent"]["all"], 450.0)
+        self.assertEqual(before["BreakoutAgent"]["20d"], -40.0)
+        self.assertEqual(before["BreakoutAgent"]["all"], -265.0)
+        self.assertEqual(before["IntermarketAgent"]["20d"], -80.0)
+        self.assertEqual(before["IntermarketAgent"]["all"], -380.0)
+        self.assertEqual(after["NewsAgent"]["20d"], -200.0)
+        self.assertEqual(after["NewsAgent"]["all"], -300.0)
+        self.assertEqual(after["BreakoutAgent"]["20d"], 50.0)
+        self.assertEqual(after["BreakoutAgent"]["all"], 850.0)
+        self.assertEqual(after["IntermarketAgent"]["20d"], 50.0)
+        self.assertEqual(after["IntermarketAgent"]["all"], -100.0)
+        self.assertIn("Order-id matches: 6", after["note"])
+
+
+def _closed(agent, pnl, symbol, opened, shares, entry, entry_id, exit_id, trade_id):
+    trade = _trade(agent, pnl, days_ago=1, symbol=symbol, shares=shares, entry=entry)
+    trade.trade_id = trade_id
+    trade.opened_at_et = opened
+    trade.status = "stop"
+    trade.realized_pnl = pnl
+    trade.entry_order_id = entry_id
+    trade.exit_order_id = exit_id
+    return trade
+
+
+def _open(agent, symbol, opened, shares, entry, order_id, trade_id):
+    trade = _trade(agent, 0.0, days_ago=0, symbol=symbol, shares=shares, entry=entry, open_=True)
+    trade.trade_id = trade_id
+    trade.opened_at_et = opened
+    trade.entry_order_id = order_id
+    return trade
+
+
+def _fill(symbol, side, qty, price, when, order_id):
+    return {
+        "symbol": symbol, "side": side, "qty": qty, "price": price,
+        "time": when, "order_id": order_id,
+    }
+
+
+def _fixture_book():
+    trades = [
+        _open("BreakoutAgent", "COIN", "2026-07-08 10:00:00", 10, 250, "july-lot", "july-coin"),
+        _closed("NewsAgent", 50.0, "COIN", "2026-09-18 10:00:00", 10, 200,
+                "news-entry", "news-exit", "coin-news"),
+        _closed("NewsAgent", 400.0, "META", "2026-07-20 10:00:00", 10, 50,
+                "meta-entry", "meta-exit", "meta-news"),
+        _closed("BreakoutAgent", -225.0, "AMD", "2026-07-15 10:00:00", 20, 100,
+                "amd-e", "amd-x", "amd-july"),
+        _closed("BreakoutAgent", -40.0, "AMD", "2026-09-21 10:00:00", 5, 100,
+                "amd2-e", "amd2-x", "amd-sept"),
+        _open("IntermarketAgent", "QQQ", "2026-07-20 10:00:00", 5, 500, "q-old", "qqq-open"),
+        _closed("IntermarketAgent", -80.0, "QQQ", "2026-09-22 10:00:00", 5, 400,
+                "q-e", "q-x", "qqq-sept"),
+        _closed("IntermarketAgent", -300.0, "IWM", "2026-07-10 10:00:00", 4, 200,
+                "iwm-e", "iwm-x", "iwm-july"),
+    ]
+    fills = [
+        _fill("COIN", "buy", 10, 250, "2026-07-08T14:00:00Z", "july-lot"),
+        _fill("COIN", "buy", 10, 200, "2026-09-18T14:00:00Z", "news-entry"),
+        _fill("COIN", "sell", 10, 180, "2026-09-18T18:00:00Z", "news-exit"),
+        _fill("META", "buy", 10, 50, "2026-07-20T14:00:00Z", "meta-entry"),
+        _fill("META", "sell", 10, 40, "2026-07-21T14:00:00Z", "meta-exit"),
+        _fill("AMD", "buy", 20, 100, "2026-07-15T14:00:00Z", "amd-e"),
+        _fill("AMD", "sell", 20, 140, "2026-07-16T14:00:00Z", "amd-x"),
+        _fill("AMD", "buy", 5, 100, "2026-09-21T14:00:00Z", "amd2-e"),
+        _fill("AMD", "sell", 5, 110, "2026-09-22T14:00:00Z", "amd2-x"),
+        _fill("QQQ", "buy", 5, 500, "2026-07-20T14:00:00Z", "q-old"),
+        _fill("QQQ", "buy", 5, 400, "2026-09-22T14:00:00Z", "q-e"),
+        _fill("QQQ", "sell", 5, 410, "2026-09-23T14:00:00Z", "q-x"),
+        _fill("IWM", "buy", 4, 200, "2026-07-10T14:00:00Z", "iwm-e"),
+        _fill("IWM", "sell", 4, 162.5, "2026-07-11T14:00:00Z", "iwm-x"),
+    ]
+    return trades, fills
+
+
+def _board(report) -> dict:
+    out = {}
+    for agent in report.agents:
+        out[agent.name] = {"20d": agent.pnl_20d, "all": agent.pnl_alltime}
+    out["note"] = report.scoring_note
+    return out
+
+
+def _fixture_scoreboard():
+    from datetime import datetime as dt
+    trades, fills = _fixture_book()
+    today = dt(2026, 10, 7)
+    ev = AgentEvaluator()
+    with patch("agent_evaluator._today_et_date", return_value=today), \
+         patch("trade_ledger.epoch_trades", return_value=trades), \
+         patch("agent_evaluator._agent_active_state", return_value={}):
+        before = _board(ev.evaluate())
+        trips = build_round_trips(fills, trades=trades)
+        after = _board(ev.evaluate(round_trips=trips))
+    return before, after
 
 
 if __name__ == "__main__":

@@ -15,10 +15,15 @@ Deploy on Google Cloud VM (see CLOUD_SETUP.md):
 Or run as a systemd service so it auto-starts on VM reboot:
   see cloud_setup_guide.md for the unit file
 
+CHANGE LOG (L-2026-10-07):
+  options_executor writes a ledger row for the contract (agent, entry
+  order id, and the resting exit order id). reconcile still treats a
+  symbol in that open set as not an orphan. The close books the exit
+  order's average fill, not the entry order and not a trigger.
+
 CHANGE LOG (L-2026-10-01b):
-  Option contracts are not ledger rows (options_executor never calls
-  record_trade; sync_from_broker skips len>12). reconcile_orphan_positions
-  therefore classified every contract as an orphan and, at 15:55 ET,
+  Option contracts were not ledger rows, so reconcile_orphan_positions
+  classified every contract as an orphan and, at 15:55 ET,
   _close_losing_orphan market-sold any of them with unrealized P&L <= 0,
   logging "ledger already exited it". That closed CCL261030C00026000 on
   2026-09-30 and NOK261016C00010000 on 2026-09-25. A ledger-tracked option
@@ -658,7 +663,10 @@ def sync_alpaca_positions():
         if not key or not secret:
             return
         client = TradingClient(api_key=key, secret_key=secret, paper=True)
-        req    = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=50)
+        # 50 missed trail fills older than the newest page. 500 is the
+        # closed-order cap; the price is still that order's average, and
+        # a same-side entry is not treated as the exit.
+        req    = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500)
         orders = client.get_orders(req)
         trades = _ledger.load_ledger()
         updated = 0
@@ -666,21 +674,19 @@ def sync_alpaca_positions():
             sym  = str(order.symbol)
             if not _order_may_book_ledger_exit(sym):
                 continue
-            side = "LONG" if str(order.side) == "buy" else "SHORT"
-            for tid, t in trades.items():
-                if t.symbol == sym and t.side == side and t.is_open:
-                    filled = float(order.filled_avg_price or 0)
-                    if filled > 0:
-                        pnl = (filled - t.entry_price) * t.shares
-                        if side == "SHORT":
-                            pnl = -pnl
-                        t.status          = "target" if pnl >= 0 else "stop"
-                        t.exit_price      = filled
-                        t.exit_at_et      = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S")
-                        t.realized_pnl    = round(pnl, 2)
-                        t.unrealized_pnl  = 0.0
-                        updated += 1
-                        break
+            oid = str(getattr(order, "id", "") or "")
+            pool = [
+                t for t in trades.values()
+                if t.is_open and t.symbol.replace("/", "") == sym.replace("/", "")
+            ]
+            pool.sort(key=lambda t: (
+                0 if oid and getattr(t, "exit_order_id", "") == oid else 1,
+                t.opened_at_et,
+            ))
+            for t in pool:
+                if _ledger.book_broker_close(t, order):
+                    updated += 1
+                    break
         if updated:
             _ledger.save_ledger(trades)
             log.info(f"Alpaca sync: updated {updated} closed position(s) in ledger")

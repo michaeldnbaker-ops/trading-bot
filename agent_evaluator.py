@@ -398,10 +398,13 @@ class AgentEvaluator:
             scoreable.append(t)
         assignment: dict[str, list] = {}
         if broker_available:
-            from broker_fills import assign_round_trips
+            from broker_fills import assign_round_trips, match_method_counts
             assignment = assign_round_trips(scoreable, book)
+            counts = match_method_counts()
             scoring_note = (
                 "Scoring: broker-fill realized P&L after costs, co-signed 1/N. "
+                f"Order-id matches: {counts['order_id']}. "
+                f"FIFO fallback: {counts['fifo']}. "
                 "Unmatched closed trades use ledger realized and are logged."
             )
         else:
