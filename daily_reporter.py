@@ -32,7 +32,11 @@ daily, weekly on the last session of the week, monthly on the last
 session of the month). --preview YYYY-MM-DD prints it and does not send.
 Day P&L and equity use Alpaca's settled portfolio-history closes. When
 today's daily bar is not posted yet, the note uses live equity minus the
-prior history close and labels that figure preliminary.
+prior history close and labels that figure preliminary. The next line is
+the prior session's settled close-to-close, which is never preliminary.
+If logs/weekly_shutdown_section.md was saved today (ET), its text is
+included under the period block as "Early shutdown decision". A missing
+or stale file adds nothing.
 """
 
 from __future__ import annotations

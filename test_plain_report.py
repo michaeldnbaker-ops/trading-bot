@@ -20,6 +20,7 @@ from plain_report import (
     FOOTER,
     GO_NO_GO,
     NEXT_CHANGES_PATH,
+    SHUTDOWN_SECTION_PATH,
     PLAN_START,
     STARTING_EQUITY,
     TRIPWIRE,
@@ -47,6 +48,7 @@ from plain_report import (
     spy_from_bars,
     trade_lines,
 )
+from session_gates import CRYPTO_TRADING_ENABLED, PAPER_ONLY
 import weekly_reporter
 
 ET = ZoneInfo("America/New_York")
@@ -213,6 +215,7 @@ class PlanAndOldLosses(unittest.TestCase):
         self.assertEqual(TRIPWIRE, 75_000.0)
         self.assertEqual(STARTING_EQUITY, 100_000.0)
         self.assertEqual(NEXT_CHANGES_PATH.name, "weekly_next_changes.md")
+        self.assertEqual(SHUTDOWN_SECTION_PATH.name, "weekly_shutdown_section.md")
 
     def test_before_plan_start_says_the_plan_has_not_started(self):
         view = fixture_view(trades=[
@@ -365,6 +368,89 @@ class NextChanges(unittest.TestCase):
                 raise OSError("unreadable")
 
         self.assertEqual(read_next_changes(Boom(), FRI), [])  # type: ignore[arg-type]
+
+
+class EarlyShutdownSection(unittest.TestCase):
+    """Same-day logs/weekly_shutdown_section.md, verbatim, on any cadence."""
+
+    def _write(self, folder: str, text: str, modified: date) -> Path:
+        path = Path(folder) / "weekly_shutdown_section.md"
+        path.write_text(text, encoding="utf-8")
+        stamp = datetime(modified.year, modified.month, modified.day, 15, 0, tzinfo=ET)
+        os.utime(path, (stamp.timestamp(), stamp.timestamp()))
+        return path
+
+    def test_same_day_file_is_included_under_the_exact_title(self):
+        text = "Hold the book.\n\n  keep indent\n- not dropped"
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, f"\n{text}\n", FRI)
+            for cadence in ("daily", "weekly"):
+                email = build_email(
+                    FRI, cadence, fixture_view(), shutdown_section_path=path,
+                )
+                self.assertIn(f"Early shutdown decision\n{text}", email.body)
+                self.assertNotIn("Early shutdown decision:", email.body)
+                self.assertNotIn("Early shutdown", email.subject)
+                self.assertLess(
+                    email.body.index("Yesterday (settled)"),
+                    email.body.index("Early shutdown decision"),
+                )
+                self.assertLess(
+                    email.body.index("Early shutdown decision"),
+                    email.body.index("New plan starts"),
+                )
+            weekly = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=path)
+            self.assertLess(
+                weekly.body.index("This week:"),
+                weekly.body.index("Early shutdown decision"),
+            )
+            month_end = date(2026, 10, 30)
+            month_path = self._write(folder, text, month_end)
+            monthly = build_email(
+                month_end, "monthly", MarketView(), shutdown_section_path=month_path,
+            )
+            self.assertLess(monthly.body.index("This month:"), monthly.body.index("Early shutdown decision"))
+            self.assertLess(
+                monthly.body.index("Early shutdown decision"),
+                monthly.body.index("Since the new plan"),
+            )
+
+    def test_stale_file_is_ignored(self):
+        text = "Hold the book. SHUTDOWN-STALE"
+        with tempfile.TemporaryDirectory() as folder:
+            stale = self._write(folder, text, THU)
+            email = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=stale)
+        self.assertNotIn("Early shutdown decision", email.body)
+        self.assertNotIn("SHUTDOWN-STALE", email.body)
+        self.assertIn("Today:", email.body)
+
+    def test_missing_file_is_ignored(self):
+        missing = Path(tempfile.gettempdir()) / "does-not-exist-shutdown-section.md"
+        email = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=missing)
+        self.assertNotIn("Early shutdown decision", email.body)
+        self.assertIn("Today:", email.body)
+
+    def test_empty_file_and_read_error_add_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            blank = self._write(folder, " \n\n\t", FRI)
+            email = build_email(FRI, "daily", fixture_view(), shutdown_section_path=blank)
+        self.assertNotIn("Early shutdown decision", email.body)
+
+        class Boom:
+            def is_file(self):
+                raise OSError("unreadable")
+
+        email = build_email(FRI, "weekly", fixture_view(), shutdown_section_path=Boom())  # type: ignore[arg-type]
+        self.assertNotIn("Early shutdown decision", email.body)
+        self.assertIn("Today:", email.body)
+
+    def test_section_is_capped_at_4000_chars(self):
+        blob = "Y" * 4500
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, blob, FRI)
+            email = build_email(FRI, "daily", fixture_view(), shutdown_section_path=path)
+        self.assertIn("Early shutdown decision\n" + ("Y" * 4000), email.body)
+        self.assertNotIn("Y" * 4001, email.body)
 
 
 class AlertsAndStanding(unittest.TestCase):
@@ -831,6 +917,160 @@ class SettledDayPnL(unittest.TestCase):
         self.assertNotIn("DOWN $391", email.subject)
         for section in ("Today:", "Since the new plan", "Today's standing:", "OLD LOSSES", FOOTER):
             self.assertIn(section, email.body)
+
+
+TUE = date(2026, 10, 6)
+# 10/5 close and the 10/2 close that makes that session -$391 (-0.50%).
+MON_CLOSE = 78280.10
+FRI_CLOSE = 78671.10
+SETTLED_YESTERDAY = (
+    "Yesterday (settled) 10/5: the bot was down 0.50% and the S&P was "
+    "up 1.00%, behind by 1.50 pts (down $391)."
+)
+
+
+def _yesterday_line(body: str) -> str:
+    lines = [line for line in body.splitlines() if line.startswith("Yesterday (settled)")]
+    if len(lines) != 1:
+        raise AssertionError(f"expected one settled line, got {lines!r}")
+    return lines[0]
+
+
+class SettledYesterdayLine(unittest.TestCase):
+    """The line under Today is the prior session's settled close-to-close."""
+
+    def test_paper_only_and_crypto_stays_off(self):
+        self.assertIs(PAPER_ONLY, True)
+        self.assertIs(CRYPTO_TRADING_ENABLED, False)
+
+    def _view(self, **overrides) -> MarketView:
+        view = MarketView(
+            equity_by_day={
+                FRI: FRI_CLOSE,
+                MON: MON_CLOSE,
+                TUE: 78400.00,
+            },
+            spy_by_day={
+                FRI: 100.0,
+                MON: 101.0,
+                TUE: 102.0,
+            },
+            positions=[],
+            trades=[],
+            live_equity=True,
+            account_equity=1.0,
+            last_equity=1.0,
+        )
+        for key, value in overrides.items():
+            setattr(view, key, value)
+        return view
+
+    def test_tuesday_line_is_monday_settled_against_friday(self):
+        view = self._view()
+        daily = build_email(TUE, "daily", view)
+        self.assertEqual(
+            daily.subject,
+            "Trading [PAPER] Daily 10/6/2026: UP $120, BEHIND S&P by 0.84 pts",
+        )
+        for cadence in ("daily", "weekly", "monthly"):
+            email = build_email(TUE, cadence, view)
+            self.assertTrue(email.subject.startswith(f"Trading [PAPER] {cadence.title()} 10/6/2026: "))
+            self.assertNotIn("Yesterday", email.subject)
+            self.assertNotIn("settled", email.subject.lower())
+            self.assertNotIn("preliminary", email.subject.lower())
+            self.assertNotIn("preliminary", email.body.lower())
+            line = _yesterday_line(email.body)
+            self.assertEqual(line, SETTLED_YESTERDAY)
+            self.assertIn("down 0.50%", line)
+            self.assertIn("(down $391)", line)
+            body_lines = email.body.splitlines()
+            today_at = body_lines.index(next(row for row in body_lines if row.startswith("Today:")))
+            self.assertEqual(body_lines[today_at + 1], SETTLED_YESTERDAY)
+        self.assertNotIn("This week:", daily.body)
+        self.assertNotIn("This month:", daily.body)
+
+    def test_line_sits_on_every_cadence(self):
+        view = self._view()
+        weekly = build_email(TUE, "weekly", view)
+        rows = weekly.body.splitlines()
+        today_at = next(i for i, row in enumerate(rows) if row.startswith("Today:"))
+        self.assertEqual(rows[today_at + 1], SETTLED_YESTERDAY)
+        self.assertTrue(rows[today_at + 2].startswith("This week:"))
+
+        month_end = date(2026, 10, 30)
+        monthly = build_email(month_end, "monthly", MarketView())
+        rows = monthly.body.splitlines()
+        today_at = next(i for i, row in enumerate(rows) if row.startswith("Today:"))
+        self.assertEqual(rows[today_at + 1], "Yesterday (settled) 10/29: unavailable.")
+        self.assertTrue(rows[today_at + 2].startswith("This week:"))
+        self.assertTrue(rows[today_at + 3].startswith("This month:"))
+
+    def test_missing_prior_bar_is_unavailable(self):
+        # Monday's close is present. Friday's bar is not. Live equity and
+        # last_equity would invent a number; the settled line must not.
+        view = self._view(
+            equity_by_day={MON: MON_CLOSE},
+            account_equity=MON_CLOSE,
+            last_equity=FRI_CLOSE,
+        )
+        line = _yesterday_line(build_email(TUE, "daily", view).body)
+        self.assertEqual(line, "Yesterday (settled) 10/5: unavailable.")
+        self.assertNotIn("391", line)
+        self.assertNotIn("0.50", line)
+        self.assertNotIn("preliminary", line)
+
+        # The other bar missing is the same sentence, even if live equity
+        # matches the settled Monday close.
+        missing_monday = self._view(
+            equity_by_day={FRI: FRI_CLOSE},
+            account_equity=MON_CLOSE,
+            last_equity=FRI_CLOSE,
+        )
+        line = _yesterday_line(build_email(TUE, "daily", missing_monday).body)
+        self.assertEqual(line, "Yesterday (settled) 10/5: unavailable.")
+        self.assertNotIn("preliminary", line)
+
+    def test_settled_line_is_not_preliminary_when_today_is(self):
+        view = self._view(
+            equity_by_day={FRI: FRI_CLOSE, MON: MON_CLOSE},
+            account_equity=77000.0,
+            last_equity=76000.0,
+            live_equity=True,
+        )
+        self.assertTrue(is_day_preliminary(TUE, view))
+        email = build_email(TUE, "daily", view)
+        self.assertIn("(preliminary)", email.subject)
+        self.assertNotIn("Yesterday", email.subject)
+        today = next(row for row in email.body.splitlines() if row.startswith("Today:"))
+        self.assertIn("preliminary", today)
+        line = _yesterday_line(email.body)
+        self.assertEqual(line, SETTLED_YESTERDAY)
+        self.assertNotIn("preliminary", line.lower())
+        self.assertNotIn("77000", line)
+        self.assertNotIn("76,000", line)
+
+    def test_plan_start_still_shows_the_prior_session(self):
+        # 10/5 is the first day of the plan. The prior session is 10/2.
+        view = MarketView(
+            equity_by_day={
+                THU: 100000.0,
+                FRI: 101000.0,
+                MON: 100500.0,
+            },
+            spy_by_day={THU: 100.0, FRI: 99.0, MON: 99.0},
+            positions=[],
+            trades=[],
+            live_equity=False,
+        )
+        email = build_email(MON, "daily", view)
+        self.assertEqual(
+            _yesterday_line(email.body),
+            "Yesterday (settled) 10/2: the bot was up 1.00% and the S&P was "
+            "down 1.00%, ahead by 2.00 pts (up $1,000).",
+        )
+        self.assertNotIn("preliminary", email.body.lower())
+        self.assertIn("Since the new plan (Mon 10/5):", email.body)
+        self.assertNotIn("Yesterday", email.subject)
 
 
 if __name__ == "__main__":
